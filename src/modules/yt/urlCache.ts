@@ -1,5 +1,8 @@
-// This should only work in background
-if (typeof chrome.extension === 'undefined') throw new Error("YT urlCache can only be accessed from extension windows and service-workers.")
+import { logger } from "../logger"
+// This should only work in extension contexts (pages or service worker)
+if (typeof chrome === 'undefined' || typeof chrome.runtime === 'undefined') {
+    throw new Error("YT urlCache can only be accessed from extension windows and service workers.")
+}
 
 let db = new Promise<IDBDatabase>((resolve, reject) => {
     if (typeof self.indexedDB !== 'undefined') {
@@ -51,14 +54,14 @@ async function put(url: string | null, id: string): Promise<void> {
         if (!store) return resolve()
         const expireAt = !url ? new Date(Date.now() + 1 * 60 * 60 * 1000) : new Date(Date.now() + 15 * 24 * 60 * 60 * 1000)
         const request = store.put({ value: url, expireAt }, id)
-        console.log('caching', id, url, 'until:', expireAt)
+        logger.debug('caching', id, url, 'until:', expireAt)
         request.addEventListener('success', () => resolve())
         request.addEventListener('error', () => reject(request.error))
     })
 }
 
-// string means there is cache of lbrypathname
-// null means there is cache of that id has no lbrypathname
+// string means there is cache of odysee path
+// null means there is cache of that id has no odysee path
 // undefined means there is no cache
 async function get(id: string): Promise<string | null | undefined> {
     const response = (await new Promise(async (resolve, reject) => {
@@ -78,5 +81,5 @@ async function get(id: string): Promise<string | null | undefined> {
     return response.value
 }
 
-export const lbryUrlCache = { put, get, clearAll }
+export const odyseeUrlCache = { put, get, clearAll }
 

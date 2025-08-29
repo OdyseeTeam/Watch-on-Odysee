@@ -9,23 +9,25 @@ export interface ExtensionSettings extends Record<string, string | number | bool
   redirectChannel: boolean,
   redirectVideoPlaylist: boolean,
   buttonVideoSub: boolean
-  buttonVideoPlayer: boolean
+  buttonVideoPlayer: boolean // deprecated (overlay always on when needed)
   buttonChannelSub: boolean
+  buttonOverlay: boolean
 }
 
 export const DEFAULT_SETTINGS: ExtensionSettings = {
   targetPlatform: 'odysee',
   urlResolver: 'odyseeApi',
-  redirectVideo: false,
+  redirectVideo: true,
   redirectChannel: false,
   redirectVideoPlaylist: false,
   buttonVideoSub: true,
   buttonVideoPlayer: true,
   buttonChannelSub: true,
+  buttonOverlay: true,
 }
 
 export function getExtensionSettingsAsync(): Promise<ExtensionSettings> {
-  return new Promise(resolve => chrome.storage.local.get(o => resolve(o as any)))
+  return new Promise(resolve => chrome.storage.local.get(o => resolve({ ...DEFAULT_SETTINGS, ...(o as any) })))
 }
 
 /** Utilty to set a setting in the browser */
@@ -58,7 +60,7 @@ function useSettings(defaultSettings: ExtensionSettings) {
   return state
 }
 
-/** A hook to read watch on lbry settings from local storage */
+/** A hook to read watch on odysee settings from local storage */
 export const useExtensionSettings = () => useSettings(DEFAULT_SETTINGS)
 
 const targetPlatform = (o: {
@@ -87,12 +89,10 @@ export const targetPlatformSettings = {
     theme: 'linear-gradient(130deg, #c63d59, #f77937)',
     button: {
       platformNameText: 'Odysee',
-      icon: chrome.runtime.getURL('assets/icons/lbry/odysee-logo.svg')
+      icon: chrome.runtime.getURL('assets/icons/internal/odysee-logo.svg')
     }
   })
 }
-
-
 
 const sourcePlatform = (o: {
   hostnames: string[]
@@ -120,8 +120,8 @@ export const sourcePlatfromSettings = {
     htmlQueries: {
       mountPoints: {
         mountButtonBefore: {
-          video: 'ytd-video-owner-renderer~#subscribe-button',
-          channel: '#channel-header-container #buttons #subscribe-button'
+          video: '#owner #subscribe-button',
+          channel: 'ytd-c4-tabbed-header-renderer #subscribe-button, #channel-header-container #buttons #subscribe-button, #channel-header #subscribe-button'
         },
         mountPlayerButtonBefore: 'ytd-watch-flexy ytd-player .ytp-right-controls',
       },
@@ -131,7 +131,7 @@ export const sourcePlatfromSettings = {
     }
   }),
   "yewtu.be": sourcePlatform({
-    hostnames: ['yewtu.be', 'vid.puffyan.us', 'invidio.xamh.de', 'invidious.kavin.rocks'],
+    hostnames: ['yewtu.be', 'vid.puffyan.us', 'invidio.xamh.de', 'invidious.kavin.rocks', 'newpipe.net'],
     htmlQueries: {
       mountPoints: {
         mountButtonBefore:

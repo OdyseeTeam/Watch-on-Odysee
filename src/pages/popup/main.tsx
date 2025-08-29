@@ -1,22 +1,19 @@
 import { h, render } from 'preact'
 import { useState } from 'preact/hooks'
-import { createDialogManager, Dialogs } from '../../components/dialogs'
-import { lbryUrlCache } from '../../modules/yt/urlCache'
+import { odyseeUrlCache } from '../../modules/yt/urlCache'
+import { logger } from '../../modules/logger'
 import { setExtensionSetting, targetPlatformSettings, useExtensionSettings } from '../../settings'
 
-function WatchOnLbryPopup(params: {}) {
-  const { redirectChannel, redirectVideo, redirectVideoPlaylist, buttonVideoSub, buttonChannelSub, buttonVideoPlayer } = useExtensionSettings()
+function WatchOnOdyseePopup(params: {}) {
+  const { redirectVideo, redirectChannel, buttonVideoSub, buttonChannelSub, buttonVideoPlayer, buttonOverlay } = useExtensionSettings()
   let [loading, updateLoading] = useState(() => false)
-  let [route, updateRoute] = useState<string>(() => '')
-
-  const dialogManager = createDialogManager()
 
   async function loads<T>(operation: Promise<T>) {
     try {
       updateLoading(true)
       await operation
     } catch (error) {
-      console.error(error)
+      logger.error(error)
     }
     finally {
       updateLoading(false)
@@ -24,7 +21,7 @@ function WatchOnLbryPopup(params: {}) {
   }
 
   return <div id='popup'>
-    <Dialogs manager={dialogManager} />
+    
     {
       <header>
         <img id="logo" src={targetPlatformSettings.odysee.button.icon}></img>
@@ -43,12 +40,6 @@ function WatchOnLbryPopup(params: {}) {
               </a>
             </div>
             <div class="toggle-option">
-              <span>Playing a playlist</span>
-              <a onClick={() => setExtensionSetting('redirectVideoPlaylist', !redirectVideoPlaylist)} className={`button ${redirectVideoPlaylist ? 'active' : ''}`}>
-                {redirectVideoPlaylist ? 'Active' : 'Deactive'}
-              </a>
-            </div>
-            <div class="toggle-option">
               <span>Viewing a channel</span>
               <a onClick={() => setExtensionSetting('redirectChannel', !redirectChannel)} className={`button ${redirectChannel ? 'active' : ''}`}>
                 {redirectChannel ? 'Active' : 'Deactive'}
@@ -57,16 +48,16 @@ function WatchOnLbryPopup(params: {}) {
           </div>
         </section>
         <section>
-          <label>Show redirect button on:</label>
+          <label>Show redirect option for:</label>
           <div className='options'>
             <div className="toggle-option">
-              <span>Video Page</span>
+              <span>Video Pages</span>
               <a onClick={() => setExtensionSetting('buttonVideoSub', !buttonVideoSub)} className={`button ${buttonVideoSub ? 'active' : ''}`}>
                 {buttonVideoSub ? 'Active' : 'Deactive'}
               </a>
             </div>
             <div className="toggle-option">
-              <span>Channel Page</span>
+              <span>Channels</span>
               <a onClick={() => setExtensionSetting('buttonChannelSub', !buttonChannelSub)} className={`button ${buttonChannelSub ? 'active' : ''}`}>
                 {buttonChannelSub ? 'Active' : 'Deactive'}
               </a>
@@ -77,14 +68,17 @@ function WatchOnLbryPopup(params: {}) {
                 {buttonVideoPlayer ? 'Active' : 'Deactive'}
               </a>
             </div>
+            <div className="toggle-option">
+              <span>Video Previews</span>
+              <a onClick={() => setExtensionSetting('buttonOverlay', !buttonOverlay)} className={`button ${buttonOverlay ? 'active' : ''}`}>
+                {buttonOverlay ? 'Active' : 'Deactive'}
+              </a>
+            </div>
           </div>
         </section>
         <section>
           <label>Tools</label>
-          <a target='_blank' href='/pages/YTtoLBRY/index.html' className={`filled`}>
-            Subscription Converter
-          </a>
-          <a onClick={() => loads(lbryUrlCache.clearAll().then(() => dialogManager.alert("Cleared Cache!")))} className={`button active`}>
+          <a onClick={() => loads(odyseeUrlCache.clearAll())} className={`button active`}>
             Clear Resolver Cache
           </a>
         </section>
@@ -97,7 +91,7 @@ function WatchOnLbryPopup(params: {}) {
 }
 
 function renderPopup() {
-  render(<WatchOnLbryPopup />, document.getElementById('root')!)
+  render(<WatchOnOdyseePopup />, document.getElementById('root')!)
 }
 
 renderPopup()
