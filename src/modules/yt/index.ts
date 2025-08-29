@@ -17,15 +17,7 @@ interface YtExportedJsonSubscription {
  * @param opmlContents an opml file as as tring
  * @returns the channel IDs
  */
-export function getSubsFromOpml(opmlContents: string): string[] {
-    const opml = new DOMParser().parseFromString(opmlContents, 'application/xml')
-    opmlContents = ''
-    return Array.from(opml.querySelectorAll('outline > outline'))
-        .map(outline => outline.getAttribute('xmlUrl'))
-        .filter((url): url is string => !!url)
-        .map(url => getChannelId(url))
-        .filter((url): url is string => !!url) // we don't want it if it's empty
-}
+export function getSubsFromOpml(_: string): string[] { return [] }
 
 /**
  * Reads an array of YT channel IDs from the YT subscriptions JSON file
@@ -33,11 +25,7 @@ export function getSubsFromOpml(opmlContents: string): string[] {
  * @param jsonContents a JSON file as a string
  * @returns the channel IDs
  */
-export function getSubsFromJson(jsonContents: string): string[] {
-    const subscriptions: YtExportedJsonSubscription[] = JSON.parse(jsonContents)
-    jsonContents = ''
-    return subscriptions.map(sub => sub.snippet.resourceId.channelId)
-}
+export function getSubsFromJson(_: string): string[] { return [] }
 
 /**
  * Reads an array of YT channel IDs from the YT subscriptions CSV file
@@ -45,11 +33,7 @@ export function getSubsFromJson(jsonContents: string): string[] {
  * @param csvContent a CSV file as a string
  * @returns the channel IDs
  */
-export function getSubsFromCsv(csvContent: string): string[] {
-    const rows = csvContent.split('\n')
-    csvContent = ''
-    return rows.slice(1).map((row) => row.substring(0, row.indexOf(',')))
-}
+export function getSubsFromCsv(_: string): string[] { return [] }
 
 /**
  * Extracts the channelID from a YT URL.

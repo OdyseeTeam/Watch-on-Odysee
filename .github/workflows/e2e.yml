@@ -1,0 +1,128 @@
+name: E2E
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'playwright.config.ts'
+      - 'manifest.*.json'
+      - '.github/workflows/e2e.yml'
+  push:
+    branches: ['**']
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'playwright.config.ts'
+      - 'manifest.*.json'
+      - '.github/workflows/e2e.yml'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *' # daily at 06:00 UTC
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-stubs:
+    name: E2E (stubbed)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install deps
+        run: npm ci
+      - name: Install Playwright (Chromium)
+        run: npx playwright install chromium
+      - name: Ensure Xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+      - name: Run E2E with stubs (headed via Xvfb)
+        env:
+          E2E_USE_STUBS: '1'
+          E2E_HEADLESS: '0'
+          E2E_TRACE: 'on'
+          E2E_VIDEO: 'on'
+          E2E_SCREENSHOT: 'on'
+        run: xvfb-run -a npm run test:e2e:report:stubs
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-stubs
+          path: playwright-report
+          if-no-files-found: ignore
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-stubs
+          path: test-results
+          if-no-files-found: ignore
+      - name: Upload summaries and artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-summaries-stubs
+          path: |
+            build/e2e-summary.md
+            build/e2e-recommendations.md
+            build/e2e-artifacts
+          if-no-files-found: ignore
+
+  e2e-real:
+    name: E2E (real API)
+    runs-on: ubuntu-22.04
+    needs: e2e-stubs
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install deps
+        run: npm ci
+      - name: Install Playwright (Chromium)
+        run: npx playwright install chromium
+      - name: Ensure Xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+      - name: Run E2E (headed via Xvfb)
+        env:
+          E2E_HEADLESS: '0'
+          E2E_TRACE: 'on'
+          E2E_VIDEO: 'on'
+          E2E_SCREENSHOT: 'on'
+        run: xvfb-run -a npm run test:e2e:report
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-real
+          path: playwright-report
+          if-no-files-found: ignore
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-real
+          path: test-results
+          if-no-files-found: ignore
+      - name: Upload summaries and artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-summaries-real
+          path: |
+            build/e2e-summary.md
+            build/e2e-recommendations.md
+            build/e2e-artifacts
+          if-no-files-found: ignore
+

@@ -1,56 +1,43 @@
 {
     "manifest_version": 2,
     "name": "Watch on Odysee",
-    "version": "2.0.1",
+    "version": "2.0.0",
     "icons": {
         "16": "assets/icons/wol/icon16.png",
         "48": "assets/icons/wol/icon48.png",
         "128": "assets/icons/wol/icon128.png"
     },
     "permissions": [
-        "https://www.youtube.com/",
-        "https://yewtu.be/",
-        "https://vid.puffyan.us/",
-        "https://invidio.xamh.de/",
-        "https://invidious.kavin.rocks/",
-        "https://api.odysee.com/",
-        "https://lbry.tv/",
-        "https://odysee.com/",
-        "https://madiator.com/",
-        "https://finder.madiator.com/",
-        "tabs",
+        "https://api.odysee.com/yt/*",
         "storage"
     ],
     "web_accessible_resources": [
-        "pages/popup/index.html",
-        "pages/YTtoLBRY/index.html",
-        "pages/import/index.html",
-        "assets/icons/lbry/lbry-logo.svg",
-        "assets/icons/lbry/odysee-logo.svg",
-        "assets/icons/lbry/madiator-logo.svg"
+        "assets/icons/internal/odysee-logo.svg"
     ],
     "browser_action": {
         "default_title": "Watch on Odysee",
         "default_popup": "pages/popup/index.html"
     },
-    "content_scripts": [
+  "content_scripts": [
         {
             "matches": [
                 "https://www.youtube.com/*",
                 "https://yewtu.be/*",
                 "https://vid.puffyan.us/*",
                 "https://invidio.xamh.de/*",
-                "https://invidious.kavin.rocks/*"
+                "https://invidious.kavin.rocks/*",
+                "https://newpipe.net/*"
             ],
             "js": [
                 "scripts/ytContent.js"
             ]
         }
+  ],
+  "background": {
+    "scripts": [
+      "service-worker-entry-point.js"
     ],
-    "background": {
-        "scripts": [
-            "service-worker-entry-point.js"
-        ],
-        "persistent": true
-    }
+    "persistent": false
+    },
+    "content_security_policy": "default-src 'self'; script-src 'self'; object-src 'none'; connect-src https://api.odysee.com; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-src 'none'; base-uri 'none'"
 }

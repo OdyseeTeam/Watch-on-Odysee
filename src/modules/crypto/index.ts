@@ -1,3 +1,4 @@
+// Profile functionality deprecated; exports kept minimal to avoid breaking imports
 import path from 'path'
 import type { DialogManager } from '../../components/dialogs'
 import { getExtensionSettingsAsync, setExtensionSetting, ytUrlResolversSettings } from "../../settings"
@@ -71,7 +72,7 @@ export function resetProfileSettings() {
 async function apiRequest<T extends object>(method: 'GET' | 'POST', pathname: string, data: T) {
     const settings = await getExtensionSettingsAsync()
 
-    const url = new URL(ytUrlResolversSettings.madiatorFinder.href)
+    const url = new URL(ytUrlResolversSettings.odyseeApi.href)
     url.pathname = path.join(url.pathname, pathname)
     url.searchParams.set('data', JSON.stringify(data))
 
@@ -175,7 +176,7 @@ export async function exportProfileKeysAsFile() {
         privateKey
     })
 
-    download(json, `watch-on-lbry-profile-export-${friendlyPublicKey(publicKey)}.wol-keys.json`, 'application/json')
+    download(json, `watch-on-odysee-profile-export-${friendlyPublicKey(publicKey)}.wol-keys.json`, 'application/json')
 }
 
 export async function importProfileKeysFromFile(dialogManager: DialogManager, file: File) {

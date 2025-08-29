@@ -1,0 +1,45 @@
+*** Begin Patch
+*** Update File: src/scripts/ytContent.tsx
+@@
+-      // 2. Standard thumbnail handling for non-Shorts pages
+-      else if (thumb) {
++      // 2. Standard thumbnail handling for non-Shorts pages
++      else if (thumb) {
+         // For regular pages, use standard logic
+         const thumbnailImg = thumb.querySelector('#thumbnail') as HTMLElement
+         if (thumbnailImg) {
+           host = thumbnailImg
+         } else {
+           host = thumb
+         }
+       }
++
++      // Special case: On /results, prefer anchoring overlays to the full tile container for ytd-video-renderer
++      if (!isShortsTile && videoRenderer && location.pathname === '/results') {
++        host = videoRenderer
++      }
+@@
+-      if (!host) {
+-        // Last-resort fallback for search result items: attach to the anchor itself
+-        host = (a as unknown as HTMLElement)
+-        if (!host) continue
+-      }
++      if (!host) {
++        // Last-resort fallback: prefer the visible tile container rather than the anchor
++        const gridShelfItem = a.closest('[class*="ytGridShelfViewModelGridShelfItem"]') as HTMLElement | null
++        const gridShelf = a.closest('yt-grid-shelf-view-model-wiz') as HTMLElement | null
++        host = (gridShelfItem || gridShelf || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media') as HTMLElement | null) || (a as unknown as HTMLElement))
++        if (!host) continue
++      }
+@@
+-      const logoImg = document.createElement('img')
++      // Ensure empty container (avoid stray text nodes)
++      mount.textContent = ''
++      const logoImg = document.createElement('img')
+       logoImg.src = platform.button.icon
+       logoImg.style.height = '20px'
+       logoImg.style.width = '20px'
+       logoImg.style.filter = 'drop-shadow(0 1px 2px rgba(0,0,0,0.6))'
+       logoImg.style.pointerEvents = 'none'
+       mount.appendChild(logoImg)
+*** End Patch

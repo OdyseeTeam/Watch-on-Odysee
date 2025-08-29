@@ -1,7 +1,7 @@
 import { chunk } from "lodash"
 import path from "path"
 import { getExtensionSettingsAsync, ytUrlResolversSettings } from "../../settings"
-import { lbryUrlCache } from "./urlCache"
+import { odyseeUrlCache } from "./urlCache"
 
 const QUERY_CHUNK_SIZE = 100
 
@@ -27,12 +27,12 @@ export async function resolveById(params: Paramaters, progressCallback?: (progre
         // Check for cache first, add them to the results if there are any cache
         // And remove them from the params, so we dont request for them
         params = (await Promise.all(params.map(async (item) => {
-            const cachedLbryUrl = await lbryUrlCache.get(item.id)
+            const cachedOdyseeUrl = await odyseeUrlCache.get(item.id)
 
-            // Cache can be null, if there is no lbry url yet
-            if (cachedLbryUrl !== undefined) {
+            // Cache can be null, if there is no odysee url yet
+            if (cachedOdyseeUrl !== undefined) {
                 // Null values shouldn't be in the results
-                if (cachedLbryUrl !== null) results[item.id] = { id: cachedLbryUrl, type: item.type }
+                if (cachedOdyseeUrl !== null) results[item.id] = { id: cachedOdyseeUrl, type: item.type }
                 return null
             }
 
@@ -56,11 +56,11 @@ export async function resolveById(params: Paramaters, progressCallback?: (progre
         if (apiResponse.ok) {
             const response: ApiResponse = await apiResponse.json()
             for (const item of params) {
-                const lbryUrl = (item.type === 'channel' ? response.data.channels : response.data.videos)?.[item.id]?.replaceAll('#', ':') ?? null
+                const odyseeUrl = (item.type === 'channel' ? response.data.channels : response.data.videos)?.[item.id]?.replaceAll('#', ':') ?? null
                 // we cache it no matter if its null or not
-                await lbryUrlCache.put(lbryUrl, item.id)
+                await odyseeUrlCache.put(odyseeUrl, item.id)
 
-                if (lbryUrl) results[item.id] = { id: lbryUrl, type: item.type }
+                if (odyseeUrl) results[item.id] = { id: odyseeUrl, type: item.type }
             }
         }
 

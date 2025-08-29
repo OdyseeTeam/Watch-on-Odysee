@@ -2,11 +2,10 @@
 # Watch on Odysee
 ![WOO_marquee promo tile 1400x560](https://user-images.githubusercontent.com/16674412/120082996-48100880-c0c6-11eb-83fe-526847c48026.jpg)
 
-A plugin for web browsers that brings more utility for LBRY Protocol by allowing you to find people you watch on YouTube that are available on Odysee, LBRY Desktop App and other LBRY Protocol based apps/websites, allows you to easly check your subscribtion list and much more!
-
+A plugin that helps you remmeber to watch content on Odysee while you're on YouTube and a few of their open frontends like newpipe,etc. 
 # Privacy
 
-This plugin is using LBRY Inc YouTube Sync API to check if video fot synchronized with LBRY Platform. For more informations read LBRY Inc Privacy Policy [here.](https://lbry.com/privacypolicy)
+This extension does not collect, transmit, sell, or share personal data. Settings are stored locally using the browser's extension storage, and a small IndexedDB cache maps YouTube IDs to Odysee paths to improve performance. You can clear the cache from the popup at any time. See `doc/PRIVACY.md` for full details.
 
 ## Installation
 
@@ -55,7 +54,7 @@ The extension will be installed, and will stay installed until you restart Firef
 
 ## Usage
 
-Go to YouTube in your browser. When you load a video or channel, it will detect if it's also uploaded to the LBRY Network and the it will move you to open.lbry.com so you can watch the video on LBRY (either on the web or in the app)!
+Go to YouTube in your browser. When you load a video or channel, it will detect if it's also uploaded to the Odysee and the it will move you to odysee.com so you can watch the video on Odysee
 
 ## Contributing
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.

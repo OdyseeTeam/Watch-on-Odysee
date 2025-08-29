@@ -6,3 +6,10 @@ web-ext-artifacts
 yarn-error.log
 
 .DS_Store
+.pw-chromium-profile
+playwright-report
+test-results
+dist.pem
+dist.crx
+
+.claude/settings.local.json

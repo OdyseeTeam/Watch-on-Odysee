@@ -1,15 +1,10 @@
 # Changelog
 
-## [1.7.5](https://github.com/LBRYFoundation/Watch-on-LBRY/releases/tag/1.7.5) (2021-12-12)
+## 2.0.0 - IT'S ALIVE AGAIN!
+- Updated extension permissions
+- More redirect options on video overlays, related items, shorts, and results page. 
+- New: Settings toggle “Apply selections to Search Results”
+  - When ON, the /results page shows Watch/Channel pills per your Videos/Channels selections
+  - When OFF, no pills are shown on /results (master switch)
 
-**Closed issues:**
-
-- Subscription Converter feature doesn't seem to work [\#64](https://github.com/LBRYFoundation/Watch-on-LBRY/issues/64)
-- Redirect with timestamp [\#57](https://github.com/LBRYFoundation/Watch-on-LBRY/issues/57)
-- Should default to odysee.com instead of lbry.tv [\#53](https://github.com/LBRYFoundation/Watch-on-LBRY/issues/53)
-- Instead of redirect. Show a popup from the extension icon [\#38](https://github.com/LBRYFoundation/Watch-on-LBRY/issues/38)
-
-**Merged pull requests:**
-
-- Update ytContent.tsx [\#70](https://github.com/LBRYFoundation/Watch-on-LBRY/pull/70) ([Shiba](https://github.com/DeepDoge))
-- Madiator icon added [\#71](https://github.com/LBRYFoundation/Watch-on-LBRY/pull/71) ([Shiba](https://github.com/DeepDoge))
+## [1.x.x] Old Previous versions
