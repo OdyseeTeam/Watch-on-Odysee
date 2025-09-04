@@ -6,7 +6,7 @@ import { logger } from '../modules/logger'
 
 (async () => {
   const sleep = (t: number) => new Promise(resolve => setTimeout(resolve, t))
-  
+
   interface Target {
     platform: TargetPlatform
     odyseePathname: string
@@ -24,6 +24,9 @@ import { logger } from '../modules/logger'
 
   const targetPlatforms = getTargetPlatfromSettingsEntiries()
   const settings = await getExtensionSettingsAsync()
+  // Debug control (set localStorage.wolDebug = '1' to enable verbose logs)
+  const WOL_DEBUG = (() => { try { return localStorage.getItem('wolDebug') === '1' } catch { return false } })()
+  const dbg = (...args: any[]) => { if (WOL_DEBUG) try { logger.log(...args) } catch {} }
   // Debug logging throttles
   let lastLoggedHref: string | null = null
   const resolveLogCache = new Set<string>()
@@ -62,7 +65,25 @@ import { logger } from '../modules/logger'
           position: absolute;
           z-index: 2147483647 !important;
           pointer-events: auto;
+          /* Prevent overlays from being hidden during hover animations */
+          opacity: 1 !important;
+          visibility: visible !important;
         }
+        
+        /* Results page specific - more aggressive positioning */
+        ytd-video-renderer [data-wol-overlay],
+        ytd-grid-video-renderer [data-wol-overlay] {
+          position: absolute !important;
+          z-index: 2147483647 !important;
+          pointer-events: auto !important;
+          opacity: 1 !important;
+          visibility: visible !important;
+        }
+
+        /* Hide other overlays while one is globally pinned to avoid duplicates */
+        [data-wol-overlay][data-wol-hidden="1"] { display: none !important; }
+
+        
       `
       document.head.appendChild(style)
     }
@@ -135,24 +156,44 @@ import { logger } from '../modules/logger'
       settingsDirty = true
 
       // Handle overlay setting changes
+      let needsButtonUpdate = false
+      let needsOverlayUpdate = false
+      
       for (const [key, change] of Object.entries(changes)) {
         if (key === 'buttonOverlay') {
+          needsOverlayUpdate = true
           if (!change.newValue) {
             // Disable mutation observer when overlay setting is turned off
             if (wolMutationObserver) {
               wolMutationObserver.disconnect()
               wolMutationObserver = null
             }
-            // Remove all existing overlays when setting is disabled
-            const existingOverlays = document.querySelectorAll('[data-wol-overlay]')
-            existingOverlays.forEach(overlay => overlay.remove())
-            // Clear enhanced flags so they can be re-enhanced if setting is re-enabled
-            const enhancedAnchors = document.querySelectorAll('a[data-wol-enhanced]')
-            enhancedAnchors.forEach(anchor => anchor.removeAttribute('data-wol-enhanced'))
+            // Use the comprehensive cleanup function
+            logger.log('Watch on Odysee: Overlay setting disabled, cleaning up overlays')
+            cleanupOverlays()
           }
-          // Re-enable mutation observer when overlay setting is turned on
-          // The observer will be recreated on the next page navigation
         }
+        
+        // Handle button setting changes that require immediate UI updates
+        if (key === 'buttonChannelSub' || key === 'buttonVideoSub') {
+          needsButtonUpdate = true
+        }
+        
+        // Handle redirect setting changes that may affect current page
+        if (key === 'redirectVideo' || key === 'redirectChannel') {
+          needsButtonUpdate = true
+        }
+      }
+      
+      // Apply updates immediately
+      if (needsOverlayUpdate && settings.buttonOverlay) {
+        // Re-enable overlays when setting is turned on
+        ensureOverlayEnhancementActive()
+      }
+      
+      if (needsButtonUpdate) {
+        // Force immediate button update by triggering current page processing
+        scheduleProcessCurrentPage(0)
       }
 
       // Try to immediately reflect settings changes without waiting for next loop
@@ -206,17 +247,17 @@ import { logger } from '../modules/logger'
     if (!source || !targets || targets.length === 0) return null
     return <div style={{ display: 'inline-flex' }}>
       {targets.map((target) => {
-        const url = getOdyseeUrlByTarget(target)
+    const url = getOdyseeUrlByTarget(target)
         const isChannel = target.type === 'channel'
         return (
           <div style={{ display: 'flex', height: '36px', alignContent: 'center', minWidth: 'fit-content', marginRight: '6px'}}>
-            <a href={`${url.href}`} target='_blank' role='button'
-              style={{
+      <a href={`${url.href}`} target='_blank' role='button'
+        style={{
                 display: 'flex', alignItems: 'center', gap: compact ? '0' : '6px', borderRadius: '16px', padding: compact ? '0 4px' : '0 12px', height: '100%',
                 fontWeight: 500, border: '0', color: 'whitesmoke', fontSize: compact ? '0' : '13px', textDecoration: 'none',
                 backgroundColor: target.platform.theme, backgroundImage: target.platform.theme,
-                ...target.platform.button.style?.button,
-              }}
+          ...target.platform.button.style?.button,
+        }}
               onClick={(e: any) => { e.preventDefault(); e.stopPropagation(); openNewTab(url, 'user'); findVideoElementAwait(source).then((videoElement) => { videoElement.pause() }) }}
             >
               {isChannel ? (
@@ -292,12 +333,12 @@ import { logger } from '../modules/logger'
           }
         } else {
           const mountPlayerButtonBefore = settings.buttonVideoPlayer ? document.querySelector(params.source.platform.htmlQueries.mountPoints.mountPlayerButtonBefore) : null
-          if (!mountPlayerButtonBefore) render(<WatchOnOdyseePlayerButton />, playerButtonMountPoint)
-          else {
-            if (playerButtonMountPoint.getAttribute('data-id') !== params.source.id) {
-              mountPlayerButtonBefore.parentElement?.insertBefore(playerButtonMountPoint, mountPlayerButtonBefore)
-              playerButtonMountPoint.setAttribute('data-id', params.source.id)
-            }
+      if (!mountPlayerButtonBefore) render(<WatchOnOdyseePlayerButton />, playerButtonMountPoint)
+      else {
+        if (playerButtonMountPoint.getAttribute('data-id') !== params.source.id) {
+          mountPlayerButtonBefore.parentElement?.insertBefore(playerButtonMountPoint, mountPlayerButtonBefore)
+          playerButtonMountPoint.setAttribute('data-id', params.source.id)
+        }
             render(<WatchOnOdyseePlayerButton target={params.playerTarget ?? undefined} source={params.source} />, playerButtonMountPoint)
           }
         }
@@ -390,7 +431,7 @@ import { logger } from '../modules/logger'
           const parent = (mountBefore as HTMLElement).parentElement
           if (parent) {
             if (buttonMountPoint.getAttribute('data-id') !== params.source.id || buttonMountPoint.parentElement !== parent) {
-              buttonMountPoint.setAttribute('data-id', params.source.id)
+          buttonMountPoint.setAttribute('data-id', params.source.id)
               parent.insertBefore(buttonMountPoint, mountBefore)
             }
             // Match Subscribe button height precisely and add small spacing to the right
@@ -496,14 +537,14 @@ import { logger } from '../modules/logger'
     else if (url.pathname.startsWith('/shorts/')) {
       const id = url.pathname.split('/')[2]
       if (id) {
-        return {
+      return {
           id,
-          platform,
-          time: null,
+        platform,
+        time: null,
           type: 'video',
-          url
-        }
+        url
       }
+    }
     }
     else if (url.pathname.startsWith('/c/') || url.pathname.startsWith('/user/') || url.pathname.startsWith('/@')) {
       // Prefer DOM link element with feeds/videos.xml (present on channel pages)
@@ -514,9 +555,9 @@ import { logger } from '../modules/logger'
       }
       // Fallback: fetch page HTML and parse
       if (!id) {
-        const content = await (await fetch(location.href)).text()
-        const prefix = `https://www.youtube.com/feeds/videos.xml?channel_id=`
-        const suffix = `"`
+      const content = await (await fetch(location.href)).text()
+      const prefix = `https://www.youtube.com/feeds/videos.xml?channel_id=`
+      const suffix = `"`
         const startsAt = content.indexOf(prefix)
         if (startsAt >= 0) {
           const after = startsAt + prefix.length
@@ -635,11 +676,11 @@ import { logger } from '../modules/logger'
           }
         })
       })
-      if (response?.startsWith('error:')) {
+    if (response?.startsWith('error:')) {
         logger.error("Background error on:", params)
-        throw new Error(`Background error. ${response ?? ''}`)
-      }
-      return response ? JSON.parse(response) : null
+      throw new Error(`Background error. ${response ?? ''}`)
+    }
+    return response ? JSON.parse(response) : null
     } catch (error) {
       if (error instanceof Error && error.message.includes('Extension context invalidated')) {
         logger.warn('Extension context invalidated - please reload the page to re-enable Watch on Odysee functionality')
@@ -783,6 +824,7 @@ import { logger } from '../modules/logger'
   // Clean up all existing overlays
   function cleanupOverlays() {
     const existingOverlays = document.querySelectorAll('[data-wol-overlay]')
+    dbg('Watch on Odysee: Cleaning up', existingOverlays.length, 'overlays')
     existingOverlays.forEach(overlay => overlay.remove())
     // Clear enhanced flags so they can be re-enhanced if setting is re-enabled
     const enhancedAnchors = document.querySelectorAll('a[data-wol-enhanced]')
@@ -820,8 +862,14 @@ import { logger } from '../modules/logger'
     generation: number,
     observer?: MutationObserver | null
   }>()
+  // Hover-scoped observers (used outside results only)
+  const hoverMoMap = new WeakMap<HTMLElement, MutationObserver>()
+  const hoverMoTimerMap = new WeakMap<HTMLElement, number>()
+  const hoverFloatCleanupMap = new WeakMap<HTMLElement, () => void>()
   // Local resolve cache for listing pages (video/channel -> Target|null)
   const resolvedLocal = new Map<string, Target | null>()
+  // Persist preferred anchor per video id to keep overlay in the same area across re-renders
+  const overlayAnchorPrefs = new Map<string, { anchor: 'top-left' | 'bottom-left', x: number, y: number }>()
 
   // Enhanced cleanup for specific page contexts only
   function cleanupOverlaysByPageContext() {
@@ -891,7 +939,7 @@ import { logger } from '../modules/logger'
         if (currentHref !== lastHref) {
           const previousHref = lastHref
           lastHref = currentHref
-          logger.log('Watch on Odysee: Detected location change from', previousHref, 'to', currentHref)
+          dbg('Watch on Odysee: Detected location change from', previousHref, 'to', currentHref)
           overlayGeneration++
           cleanupOverlaysByPageContext()
           cleanupOverlays()
@@ -925,7 +973,9 @@ import { logger } from '../modules/logger'
     // Throttle calls to prevent excessive processing
     const now = Date.now()
     const currentUrl = window.location.href
-    if (now - lastEnhanceTime < 400 && currentUrl === lastEnhanceUrl) { // Don't run more than once every 500ms for same URL
+    const isResults = location.pathname === '/results'
+    const minGap = isResults ? 800 : 400
+    if (now - lastEnhanceTime < minGap && currentUrl === lastEnhanceUrl) {
       return
     }
     lastEnhanceTime = now
@@ -939,8 +989,8 @@ import { logger } from '../modules/logger'
     }
 
     // Debug logging for search pages
-    if (window.location.pathname === '/results') {
-      logger.log('Watch on Odysee: Processing search results page:', window.location.href)
+    if (WOL_DEBUG && window.location.pathname === '/results') {
+      dbg('Watch on Odysee: Processing search results page:', window.location.href)
     }
 
     // Use intelligent overlay management instead of blind cleanup
@@ -948,6 +998,19 @@ import { logger } from '../modules/logger'
 
     // Clean up any context-inappropriate overlays before creating new ones
     cleanupOverlaysByPageContext()
+
+    // On search results, remove any existing overlays entirely (we only keep channel renderer buttons)
+    if (location.pathname === '/results') {
+      try {
+        document.querySelectorAll('[data-wol-overlay]').forEach(el => el.remove())
+        // Also clear any pinned/hide attributes left over from earlier passes
+        document.querySelectorAll('[data-wol-overlay]').forEach(el => {
+          (el as HTMLElement).removeAttribute('data-wol-pinned')
+          ;(el as HTMLElement).removeAttribute('data-wol-tile-pinned')
+          ;(el as HTMLElement).removeAttribute('data-wol-hidden')
+        })
+      } catch {}
+    }
 
     // Don't add overlays on playlist pages - they don't work well
     if (window.location.pathname.includes('/playlist') || window.location.pathname.includes('/podcasts')) {
@@ -960,14 +1023,14 @@ import { logger } from '../modules/logger'
     }
 
     // Debug logging for Shorts pages (only log once per URL change)
-    if (window.location.pathname.startsWith('/shorts') && currentUrl !== lastLoggedHref) {
-      logger.log('Watch on Odysee: Processing Shorts page for overlays, URL:', window.location.href)
-      logger.log('Watch on Odysee: Pathname:', window.location.pathname)
+    if (WOL_DEBUG && window.location.pathname.startsWith('/shorts') && currentUrl !== lastLoggedHref) {
+      dbg('Watch on Odysee: Processing Shorts page for overlays, URL:', window.location.href)
+      dbg('Watch on Odysee: Pathname:', window.location.pathname)
 
       // Check if this is a specific shorts video page or a shorts listing page
       const isSpecificShortsVideo = window.location.pathname.match(/^\/shorts\/[a-zA-Z0-9_-]+$/)
       if (isSpecificShortsVideo) {
-        logger.log('Watch on Odysee: This is a specific Shorts video page, not a listing page')
+        dbg('Watch on Odysee: This is a specific Shorts video page, not a listing page')
         return // Don't add overlays on the main Shorts player page
       }
     }
@@ -1032,6 +1095,13 @@ import { logger } from '../modules/logger'
       // Additional Shorts shelf selectors
       'ytd-rich-shelf-renderer[is-shorts] a[href*="/shorts/"]', // Rich shelf for Shorts
       'ytd-horizontal-card-list-renderer a[href*="/shorts/"]',  // Horizontal Shorts cards
+      'ytd-horizontal-card-list-renderer ytd-grid-video-renderer a[href*="/shorts/"]',
+      'ytd-horizontal-card-list-renderer ytd-grid-video-renderer a[href*="/watch?v="]',
+      'ytd-item-section-renderer .ytGridShelfViewModelGridShelfRow a[href*="/shorts/"]',
+      'ytd-item-section-renderer .ytGridShelfViewModelGridShelfRow a[href*="/watch?v="]',
+      'ytd-carousel-shelf-renderer a[href*="/watch?v="]',
+      'ytd-carousel-shelf-renderer a[href*="/shorts/"]',
+      'yt-grid-shelf-view-model-wiz a[href*="/watch?v="]',
 
       // Live streams and live content
       'ytd-video-renderer[is-live] a[href*="/watch?v="]', // Live video renderers
@@ -1078,9 +1148,9 @@ import { logger } from '../modules/logger'
     })
 
     // Debug logging for Shorts pages and search pages
-    if (window.location.pathname.startsWith('/shorts') || window.location.pathname === '/results') {
-      logger.log('Watch on Odysee: Found', allAnchors.length, 'total anchors before filtering')
-      logger.log('Watch on Odysee: Selectors that found anchors:', selectors.filter((selector, i) => {
+    if (WOL_DEBUG && (window.location.pathname.startsWith('/shorts') || window.location.pathname === '/results')) {
+      dbg('Watch on Odysee: Found', allAnchors.length, 'total anchors before filtering')
+      dbg('Watch on Odysee: Selectors that found anchors:', selectors.filter((selector, i) => {
         const anchors = Array.from(document.querySelectorAll<HTMLAnchorElement>(selector))
         return anchors.length > 0
       }))
@@ -1088,9 +1158,9 @@ import { logger } from '../modules/logger'
       // For search pages, also log what channel renderers we find
       if (window.location.pathname === '/results') {
         const channelRenderers = document.querySelectorAll('ytd-channel-renderer')
-        logger.log('Watch on Odysee: Found', channelRenderers.length, 'channel renderers on search page')
+        dbg('Watch on Odysee: Found', channelRenderers.length, 'channel renderers on search page')
         const videoRenderers = document.querySelectorAll('ytd-video-renderer')
-        logger.log('Watch on Odysee: Found', videoRenderers.length, 'video renderers on search page')
+        dbg('Watch on Odysee: Found', videoRenderers.length, 'video renderers on search page')
       }
     }
 
@@ -1116,6 +1186,8 @@ import { logger } from '../modules/logger'
 
     const toProcess: { a: HTMLAnchorElement, id: string, type: 'video' | 'channel' }[] = []
     for (const a of uniqueAnchors) {
+      // Skip anchors we already enhanced to avoid duplicate listeners/overlays
+      if ((a as any).dataset && (a as any).dataset.wolEnhanced === 'done') continue
       const href = a.getAttribute('href') || ''
       const u = new URL(href, location.origin)
 
@@ -1172,12 +1244,36 @@ import { logger } from '../modules/logger'
       }
 
       if (!vid) continue
+      // On search results, we only keep channel items; skip video overlays entirely
+      if (location.pathname === '/results' && type === 'video') continue
       toProcess.push({ a, id: vid, type })
     }
 
     if (toProcess.length === 0) return
 
-    logger.log(`Enhancing ${toProcess.length} tiles with Odysee overlays (videos and channels)`)
+    // De-duplicate by resolved id to avoid processing the same video twice (thumbnail + title, etc.)
+    const scoreAnchor = (a: HTMLAnchorElement): number => {
+      let s = 0
+      if (a.matches('a#thumbnail, a#thumbnail.yt-simple-endpoint, a.yt-simple-endpoint.inline-block.style-scope.ytd-thumbnail')) s += 20
+      if (a.closest('ytd-thumbnail')) s += 15
+      if (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-item-renderer')) s += 10
+      if (a.closest('#dismissible')) s += 4
+      return s
+    }
+    const byId = new Map<string, { a: HTMLAnchorElement, id: string, type: 'video' | 'channel' }>()
+    for (const item of toProcess) {
+      const prev = byId.get(item.id)
+      if (!prev) {
+        byId.set(item.id, item)
+      } else {
+        const ns = scoreAnchor(item.a)
+        const ps = scoreAnchor(prev.a)
+        if (ns > ps) byId.set(item.id, item)
+      }
+    }
+    const dedupedToProcess = Array.from(byId.values())
+
+    dbg(`Enhancing ${toProcess.length} tiles with Odysee overlays (videos and channels)`)
 
     // Upgrade channel handles (@...) to UC ids when possible before resolving
     async function upgradeChannelIdFromRenderer(anchor: HTMLAnchorElement, id: string): Promise<string> {
@@ -1202,7 +1298,7 @@ import { logger } from '../modules/logger'
       return id
     }
 
-    let normalizedToProcess = await Promise.all(toProcess.map(async (x) => {
+    let normalizedToProcess = await Promise.all(dedupedToProcess.map(async (x) => {
       if (x.type === 'channel' && x.id && !x.id.startsWith('UC')) {
         const upgraded = await upgradeChannelIdFromRenderer(x.a, x.id)
         return { ...x, id: upgraded }
@@ -1237,14 +1333,21 @@ import { logger } from '../modules/logger'
 
       const url = getOdyseeUrlByTarget(res)
 
+      // On /results we only render the channel redirect (inside channel result cards)
+      if (location.pathname === '/results' && type !== 'channel') {
+        // Mark enhanced to avoid revisiting this anchor
+        ;(a as any).dataset.wolEnhanced = 'done'
+        continue
+      }
+
       // For channels, we need to find a different host element (subscribe button area)
       if (type === 'channel') {
-        logger.log('Watch on Odysee: Processing channel type for', id)
+        dbg('Watch on Odysee: Processing channel type for', id)
         // Case A: channel search result card
         const channelRenderer = a.closest('ytd-channel-renderer') as HTMLElement | null
         // Case B: channel link inside a video result item
         const videoResult = a.closest('ytd-video-renderer') as HTMLElement | null
-        logger.log('Watch on Odysee: Channel renderer found:', !!channelRenderer, 'Inside video result:', !!videoResult)
+        dbg('Watch on Odysee: Channel renderer found:', !!channelRenderer, 'Inside video result:', !!videoResult)
         if (channelRenderer) {
           // De-dupe: only inject one channel button per renderer
           if (channelRenderer.getAttribute('data-wol-channel-button') === '1') {
@@ -1305,7 +1408,7 @@ import { logger } from '../modules/logger'
 
           let injected = false
           if (buttonsContainer && subscribeButton) {
-            logger.log('Watch on Odysee: Taking adaptive styling path')
+            dbg('Watch on Odysee: Taking adaptive styling path')
             if (subscribeButton.parentElement === buttonsContainer) {
               buttonsContainer.insertBefore(channelButton, subscribeButton)
             } else {
@@ -1394,56 +1497,15 @@ import { logger } from '../modules/logger'
           continue
         }
 
-        // Inject compact channel button beside channel name inside video results on search pages
-        if (videoResult && !videoResult.hasAttribute('data-wol-channel-inline')) {
-          try {
-            const nameAnchor = (videoResult.querySelector('#channel-info #channel-name a[href], ytd-channel-name#channel-name a[href]') as HTMLAnchorElement | null)
-            const nameContainer = nameAnchor?.closest('#channel-info') as HTMLElement | null
-              || nameAnchor?.closest('ytd-channel-name#channel-name') as HTMLElement | null
-            if (nameAnchor && (nameContainer || nameAnchor.parentElement)) {
-              const container = nameContainer || (nameAnchor.parentElement as HTMLElement)
-              if (!container.querySelector('[data-wol-inline-channel]')) {
-                const inline = document.createElement('a')
-                inline.setAttribute('data-wol-inline-channel', '1')
-                inline.href = url.href
-                inline.target = '_blank'
-                inline.title = `Open channel on ${platform.button.platformNameText}`
-                inline.style.display = 'inline-flex'
-                inline.style.alignItems = 'center'
-                inline.style.justifyContent = 'center'
-                inline.style.marginLeft = '6px'
-                inline.style.width = '22px'
-                inline.style.height = '22px'
-                inline.style.borderRadius = '11px'
-                inline.style.background = platform.theme
-                inline.style.textDecoration = 'none'
-                inline.style.verticalAlign = 'middle'
-                inline.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); openNewTab(url, 'user') })
-                const icon = document.createElement('img')
-                icon.src = platform.button.icon
-                icon.style.width = '14px'
-                icon.style.height = '14px'
-                icon.style.pointerEvents = 'none'
-                inline.appendChild(icon)
-                nameAnchor.insertAdjacentElement('afterend', inline)
-                try {
-                  const h = Math.max(18, Math.round((nameAnchor.getBoundingClientRect().height || 20)))
-                  inline.style.width = `${h}px`
-                  inline.style.height = `${h}px`
-                  inline.style.borderRadius = `${Math.round(h/2)}px`
-                } catch {}
-                const mo = new MutationObserver(() => {
-                  try { if (!inline.isConnected) nameAnchor.insertAdjacentElement('afterend', inline) } catch {}
-                })
-                mo.observe(container, { childList: true, subtree: true })
-                videoResult.setAttribute('data-wol-channel-inline', '1')
-              }
-            }
-          } catch {}
-          ;(a as any).dataset.wolEnhanced = 'done'
-          continue
-        }
+        // Inline channel icon beside channel name on results page was causing extra DOM churn.
+        // It has been removed to reduce CPU overhead on large result sets.
       }
+
+      // If a pinned overlay for this id is already active anywhere (e.g., during hover), skip
+      try {
+        const pinnedExisting = document.querySelector(`[data-wol-overlay="${id}"][data-wol-pinned="1"]`)
+        if (pinnedExisting) { (a as any).dataset.wolEnhanced = 'done'; continue }
+      } catch {}
 
       // Find the best host element for the overlay - prioritize the actual thumbnail/video area
       const thumb = a.closest('ytd-thumbnail') as HTMLElement | null
@@ -1531,16 +1593,24 @@ import { logger } from '../modules/logger'
         if (!tileContainer) tileContainer = (lockupVm || lockupWiz || lockupAnchor || ytThumbVM || host) as HTMLElement | null
       }
 
-      // Prefer stable thumbnail anchors on /results page for main results
-      if (!host && location.pathname === '/results' && videoRenderer) {
-        const resultsThumbAnchor = (videoRenderer.querySelector('a.yt-simple-endpoint.inline-block.style-scope.ytd-thumbnail') as HTMLElement | null)
-          || (videoRenderer.querySelector('a#thumbnail.yt-simple-endpoint') as HTMLElement | null)
-          || (videoRenderer.querySelector('a#thumbnail') as HTMLElement | null)
-        if (resultsThumbAnchor) {
-          host = resultsThumbAnchor
-          if (!tileContainer) tileContainer = videoRenderer
-        }
-      }
+             // Prefer stable containers on /results page that survive hover autoplay
+       if (!host && location.pathname === '/results' && (videoRenderer || gridVideo)) {
+         const stableContainer = videoRenderer || gridVideo
+         // First try to find a stable thumbnail container
+         const thumbContainer = stableContainer!.querySelector('#dismissible') as HTMLElement | null
+         const resultsThumbAnchor = (stableContainer!.querySelector('a.yt-simple-endpoint.inline-block.style-scope.ytd-thumbnail') as HTMLElement | null)
+           || (stableContainer!.querySelector('a#thumbnail.yt-simple-endpoint') as HTMLElement | null)
+           || (stableContainer!.querySelector('a#thumbnail') as HTMLElement | null)
+         
+         // Prefer dismissible container if available, otherwise use thumbnail anchor
+         if (thumbContainer) {
+           host = thumbContainer
+           if (!tileContainer) tileContainer = stableContainer
+         } else if (resultsThumbAnchor) {
+           host = resultsThumbAnchor
+           if (!tileContainer) tileContainer = stableContainer
+         }
+       }
 
       // 4. For other video containers, find thumbnail
       if (!host && (videoRenderer || gridVideo || richGridMedia || reelItem || shortsLockup)) {
@@ -1563,9 +1633,9 @@ import { logger } from '../modules/logger'
       }
 
       // Debug logging for Shorts positioning
-      if (window.location.pathname.startsWith('/shorts') && currentUrl !== lastLoggedHref) {
-        logger.log('Watch on Odysee: Selected host element for overlay:', host.tagName, host.id, host.className)
-        logger.log('Watch on Odysee: Host element dimensions:', host.offsetWidth, 'x', host.offsetHeight)
+      if (WOL_DEBUG && window.location.pathname.startsWith('/shorts') && currentUrl !== lastLoggedHref) {
+        dbg('Watch on Odysee: Selected host element for overlay:', host.tagName, host.id, host.className)
+        dbg('Watch on Odysee: Host element dimensions:', host.offsetWidth, 'x', host.offsetHeight)
       }
 
       // Create the overlay button (div to avoid nested anchor issues)
@@ -1580,7 +1650,22 @@ import { logger } from '../modules/logger'
       mount.style.pointerEvents = 'auto'
       mount.style.backgroundColor = 'transparent' // No background for cleaner look
       mount.style.borderRadius = '4px'
-      mount.style.padding = '2px'
+      // Keep padding zero on results; use small padding elsewhere (restores prior look)
+      mount.style.padding = (location.pathname === '/results') ? '0' : '2px'
+      // Enlarge hit area only on results; keep default elsewhere
+      try {
+        if (location.pathname === '/results') {
+          const size = 32
+          mount.style.width = `${size}px`
+          mount.style.height = `${size}px`
+          mount.style.display = 'block'
+          mount.style.borderRadius = `${Math.round(size/2)}px`
+        } else {
+          mount.style.removeProperty('width')
+          mount.style.removeProperty('height')
+          mount.style.display = 'inline-block'
+        }
+      } catch { }
       mount.style.transition = 'opacity 0.12s ease'
       mount.style.opacity = '1'
       // Prevent any stray text nodes from rendering alongside the icon
@@ -1590,26 +1675,67 @@ import { logger } from '../modules/logger'
 
       // Adjust positioning based on the type of video container
       const isRelatedContext = !!(a.closest('#secondary') || a.closest('#related') || a.closest('ytd-watch-next-secondary-results-renderer') || a.closest('ytd-compact-video-renderer'))
+      // Try to reuse a saved anchor preference to keep visual position consistent across re-renders
+      const applySavedAnchor = () => {
+        const pref = overlayAnchorPrefs.get(id)
+        if (!pref) return false
+        try {
+          if (pref.anchor === 'top-left') {
+            mount.style.top = `${pref.y}px`
+            mount.style.left = `${pref.x}px`
+            mount.style.bottom = 'auto'
+          } else {
+            mount.style.bottom = `${pref.y}px`
+            mount.style.left = `${pref.x}px`
+            mount.style.top = ''
+          }
+          return true
+        } catch {
+          return false
+        }
+      }
+
       if (isShortsTile) {
         // For Shorts tiles, position inside the thumbnail at top-left
-        mount.style.top = '6px'
-        mount.style.left = '6px'
-        mount.style.bottom = 'auto'
-        // Make the overlay smaller and more compact for Shorts
-        mount.style.transform = 'scale(0.8)'
-        mount.style.transformOrigin = 'top left'
-      } else {
-        // On related/compact tiles, top-left avoids YouTube's time/status overlays
-        if (isRelatedContext) {
+        if (!applySavedAnchor()) {
           mount.style.top = '6px'
           mount.style.left = '6px'
           mount.style.bottom = 'auto'
+          overlayAnchorPrefs.set(id, { anchor: 'top-left', x: 6, y: 6 })
+        }
+        // Keep icon size stable; avoid scaling on results
+        if (location.pathname !== '/results') {
           mount.style.transform = 'scale(0.8)'
           mount.style.transformOrigin = 'top left'
         } else {
-          // Default for non-related tiles
-          mount.style.bottom = '6px'
-          mount.style.left = '6px'
+          mount.style.transform = 'none'
+          mount.style.transformOrigin = ''
+        }
+      } else {
+        // On related/compact tiles, always bottom-left for consistency
+        if (isRelatedContext) {
+          if (!applySavedAnchor()) {
+            mount.style.bottom = '6px'
+            mount.style.left = '6px'
+            mount.style.top = ''
+            overlayAnchorPrefs.set(id, { anchor: 'bottom-left', x: 6, y: 6 })
+          }
+          // Use a slightly smaller icon on related (like Shorts)
+          if (location.pathname !== '/results') {
+            mount.style.transform = 'scale(0.8)'
+            mount.style.transformOrigin = 'bottom left'
+          } else {
+            mount.style.transform = 'none'
+            mount.style.transformOrigin = ''
+          }
+        } else {
+          // Default for non-related tiles (keep bottom-left on results)
+          if (!applySavedAnchor()) {
+            mount.style.bottom = '6px'
+            mount.style.left = '6px'
+            mount.style.top = ''
+            overlayAnchorPrefs.set(id, { anchor: 'bottom-left', x: 6, y: 6 })
+          }
         }
       }
 
@@ -1622,34 +1748,329 @@ import { logger } from '../modules/logger'
 
       // Add hover handling to ensure overlay stays visible during video preview
       const ensureOverlayVisibility = () => {
-        mount.style.opacity = '1'
-        mount.style.zIndex = '2147483647'
-        mount.style.display = 'inline-block'
-        mount.style.visibility = 'visible'
-        mount.style.backgroundColor = 'transparent' // Ensure background stays transparent
+        try { mount.style.setProperty('opacity', '1', 'important') } catch { mount.style.opacity = '1' }
+        try { mount.style.setProperty('z-index', '2147483647', 'important') } catch { mount.style.zIndex = '2147483647' }
+        try { mount.style.setProperty('display', 'inline-block', 'important') } catch { mount.style.display = 'inline-block' }
+        try { mount.style.setProperty('visibility', 'visible', 'important') } catch { mount.style.visibility = 'visible' }
+        try { mount.style.setProperty('background-color', 'transparent', 'important') } catch { mount.style.backgroundColor = 'transparent' }
+        try { mount.style.setProperty('pointer-events', 'auto', 'important') } catch { mount.style.pointerEvents = 'auto' }
       }
 
-      // Minimal hover handling: ensure overlay remains on the stable host
+      // Enhanced hover handling for /results page and general stability
+      const isResultsPage = location.pathname === '/results'
+      
       host.addEventListener('mouseenter', () => {
         if (gen !== overlayGeneration) return
         try {
+          // If already pinned (e.g., user is hovering the button or tile), skip any floating/retargeting logic
+          try { if (mount.getAttribute('data-wol-pinned') === '1' || mount.getAttribute('data-wol-tile-pinned') === '1') { ensureOverlayVisibility(); return } } catch {}
+          // On results, avoid any floating logic here; rely on tile hover pinning below
+          if (isResultsPage) {
+            ensureOverlayVisibility()
+            return
+          }
+          // For other pages, use more aggressive positioning when needed
+          if (!isResultsPage) {
+            // Keep position static on results: attach to the thumbnail host and avoid floating
+            try {
+              const stableContainer = (a.closest('ytd-video-renderer') as HTMLElement | null)
+                || (a.closest('ytd-grid-video-renderer') as HTMLElement | null)
+                || (a.closest('ytd-rich-item-renderer') as HTMLElement | null)
+                || host
+              const preferredHost = (stableContainer && (
+                (stableContainer.querySelector('ytd-thumbnail #thumbnail') as HTMLElement | null)
+                || (stableContainer.querySelector('a#thumbnail.yt-simple-endpoint') as HTMLElement | null)
+                || (stableContainer.querySelector('#thumbnail') as HTMLElement | null)
+              )) || stableContainer || host
+              if (preferredHost && getComputedStyle(preferredHost).position === 'static') {
+                preferredHost.style.position = 'relative'
+              }
+              if (preferredHost && mount.parentElement !== preferredHost) {
+                preferredHost.appendChild(mount)
+              }
+              ensureOverlayVisibility()
+              return
+            } catch {}
+            // Ensure we're positioned relative to a stable container
+            const stableContainer = (a.closest('ytd-video-renderer') as HTMLElement | null)
+              || (a.closest('ytd-grid-video-renderer') as HTMLElement | null)
+              || (a.closest('ytd-rich-item-renderer') as HTMLElement | null)
+              || host
+            if (stableContainer) {
+              // Avoid double-activating the floating logic for this mount
+              if ((mount as any)._wolFloatingActive) { ensureOverlayVisibility(); return }
+              ;(mount as any)._wolFloatingActive = true
+              stableContainer.style.position = stableContainer.style.position || 'relative'
+              if (mount.parentElement !== stableContainer) {
+                try { stableContainer.appendChild(mount) } catch {}
+              }
+              // Setup a short-lived MutationObserver while hovered to keep overlay on top
+              const startHoverObserver = () => {
+                if (hoverMoMap.get(mount)) return
+                let lastEnsure = 0
+                const mo = new MutationObserver(() => {
+                  const now = (window.performance && performance.now) ? performance.now() : Date.now()
+                  if (now - lastEnsure < 60) return
+                  lastEnsure = now
+                  try {
+                    if (mount.parentElement !== stableContainer) stableContainer.appendChild(mount)
+                  } catch {}
+                  ensureOverlayVisibility()
+                })
+                try { mo.observe(stableContainer, { childList: true, subtree: true }) } catch {}
+                hoverMoMap.set(mount, mo)
+                if (WOL_DEBUG) dbg('WOL results hover: observer started for tile')
+                // Auto-stop is scheduled alongside floating overlay below and extended on pointer activity
+              }
+              startHoverObserver()
+
+              // While on results, float the overlay as a fixed element so it stays above
+              // the autoplay preview regardless of DOM reparenting.
+              const preferred = (stableContainer.querySelector('a.yt-simple-endpoint.inline-block.style-scope.ytd-thumbnail, a#thumbnail.yt-simple-endpoint, ytd-thumbnail #thumbnail, #thumbnail') as HTMLElement | null) || host
+              // Compute frozen screen position once to prevent visible shifting during preview animation
+              let frozenTop = 0, frozenLeft = 0
+              const computeFrozen = () => {
+                try {
+                  const baseEl = (preferred && (preferred.offsetWidth || preferred.offsetHeight)) ? preferred : stableContainer
+                  const r = baseEl.getBoundingClientRect()
+                  frozenTop = Math.max(0, r.bottom - 26)
+                  frozenLeft = Math.max(0, r.left + 6)
+                } catch {}
+              }
+              computeFrozen()
+              const reposition = () => {
+                try {
+                  mount.style.setProperty('position', 'fixed', 'important')
+                  mount.style.top = `${frozenTop}px`
+                  mount.style.left = `${frozenLeft}px`
+                  mount.style.bottom = 'auto'
+                } catch {}
+              }
+              if (mount.parentElement !== document.body) document.body.appendChild(mount)
+              reposition()
+              const onScroll = () => updateOnViewportChange()
+              try { window.addEventListener('scroll', onScroll, true) } catch {}
+              try { window.addEventListener('resize', onScroll, true) } catch {}
+              if (WOL_DEBUG) dbg('WOL results hover: floating overlay started')
+              // Keep hover alive while pointer remains over tile; extend timer on activity
+              const scheduleStop = (ms = 5000) => {
+                const existing = hoverMoTimerMap.get(mount)
+                if (existing) { try { clearTimeout(existing) } catch {} }
+                const tid = setTimeout(() => {
+                  try { hoverMoMap.get(mount)?.disconnect() } catch {}
+                  hoverMoMap.delete(mount)
+                  hoverMoTimerMap.delete(mount)
+                  // Also stop floating overlay if still active
+                  try { const fn = hoverFloatCleanupMap.get(mount); if (fn) fn() } catch {}
+                  if (WOL_DEBUG) dbg('WOL results hover: observer auto-stopped')
+                }, ms) as unknown as number
+                hoverMoTimerMap.set(mount, tid)
+              }
+              scheduleStop(5000)
+              // Only recompute on viewport changes (scroll/resize), not every frame
+              const updateOnViewportChange = () => { computeFrozen(); reposition() }
+              const refresh = () => scheduleStop(5000)
+              try { stableContainer.addEventListener('pointerenter', refresh) } catch {}
+              try { stableContainer.addEventListener('pointermove', refresh) } catch {}
+              hoverFloatCleanupMap.set(mount, () => {
+                try { window.removeEventListener('scroll', onScroll, true) } catch {}
+                try { window.removeEventListener('resize', onScroll, true) } catch {}
+                // No RAF to cancel since we freeze position
+                try { stableContainer.removeEventListener('pointerenter', refresh) } catch {}
+                try { stableContainer.removeEventListener('pointermove', refresh) } catch {}
+                // Reattach back to the tile host and restore absolute positioning
+                try {
+                  mount.style.setProperty('position', 'absolute', 'important')
+                  mount.style.top = ''
+                  mount.style.left = ''
+                  mount.style.bottom = isRelatedContext ? 'auto' : '6px'
+                  if (mount.parentElement !== host) host.appendChild(mount)
+                } catch {}
+                ;(mount as any)._wolFloatingActive = false
+                if (WOL_DEBUG) dbg('WOL results hover: floating overlay cleaned')
+              })
+              // Cleanup is driven by the hover end timer above
+            }
+          }
+          
           // Raise stack order during hover previews
           ;(host as HTMLElement).style.zIndex = (host as HTMLElement).style.zIndex || '2147483646'
-          if (mount.parentElement !== host) host.appendChild(mount)
+          if (mount.parentElement !== host && !isResultsPage) host.appendChild(mount)
         } catch {}
         ensureOverlayVisibility()
       })
 
+      // Removed tile-level container listener to avoid double activation
+
       // Ensure empty container (avoid stray text nodes)
       mount.textContent = ''
-      const logoImg = document.createElement('img')
-      logoImg.alt = ''
-      logoImg.src = platform.button.icon
-      logoImg.style.height = '20px'
-      logoImg.style.width = '20px'
-      logoImg.style.filter = 'drop-shadow(0 1px 2px rgba(0,0,0,0.6))'
-      logoImg.style.pointerEvents = 'none'
-      mount.appendChild(logoImg)
+      if (location.pathname === '/results') {
+        // Place the 20px icon at the container's anchored corner explicitly (no flex)
+        const iconWrap = document.createElement('div')
+        iconWrap.style.position = 'absolute'
+        iconWrap.style.width = '20px'
+        iconWrap.style.height = '20px'
+        iconWrap.style.pointerEvents = 'none'
+        const anchorIsTopLeft = !!(mount.style.top && mount.style.top !== '')
+        if (anchorIsTopLeft) {
+          iconWrap.style.top = '0'
+          iconWrap.style.left = '0'
+        } else {
+          iconWrap.style.bottom = '0'
+          iconWrap.style.left = '0'
+        }
+        const logoImg = document.createElement('img')
+        logoImg.alt = ''
+        logoImg.src = platform.button.icon
+        logoImg.style.width = '100%'
+        logoImg.style.height = '100%'
+        logoImg.style.filter = 'drop-shadow(0 1px 2px rgba(0,0,0,0.6))'
+        logoImg.style.pointerEvents = 'none'
+        iconWrap.appendChild(logoImg)
+        mount.appendChild(iconWrap)
+      } else {
+        // Restore prior behavior elsewhere
+        const logoImg = document.createElement('img')
+        logoImg.alt = ''
+        logoImg.src = platform.button.icon
+        logoImg.style.height = '20px'
+        logoImg.style.width = '20px'
+        logoImg.style.filter = 'drop-shadow(0 1px 2px rgba(0,0,0,0.6))'
+        logoImg.style.pointerEvents = 'none'
+        mount.appendChild(logoImg)
+      }
+
+      // When hovering the button itself, pin it in place so it never shifts.
+      // Also support pinning while hovering the entire tile on /results.
+      let wolPinned = false
+      // Shield handlers to stop YouTube's hover-preview event propagation while pinned
+      const stopHoverEvent = (e: Event) => {
+        try { (e as any).stopImmediatePropagation?.() } catch {}
+        try { e.stopPropagation() } catch {}
+      }
+      const shieldEvents = ['pointerover','pointerenter','pointermove','mouseover','mousemove','mouseenter'] as const
+      const addShield = () => {
+        try { shieldEvents.forEach(t => mount.addEventListener(t as unknown as string, stopHoverEvent, { capture: true })) } catch {}
+      }
+      const removeShield = () => {
+        try { shieldEvents.forEach(t => mount.removeEventListener(t as unknown as string, stopHoverEvent, { capture: true } as any)) } catch {}
+      }
+      const pinOverlay = () => {
+        if (wolPinned) return
+        wolPinned = true
+        try {
+          // Cancel any in-flight floating logic/timers/observers for this mount
+          try { const t = hoverMoTimerMap.get(mount); if (t) { clearTimeout(t as any) } } catch {}
+          try { hoverMoTimerMap.delete(mount) } catch {}
+          try { const mo = hoverMoMap.get(mount); mo?.disconnect() } catch {}
+          try { hoverMoMap.delete(mount) } catch {}
+          try { hoverFloatCleanupMap.delete(mount) } catch {}
+
+          const r = mount.getBoundingClientRect()
+          // Reparent to body and freeze exact geometry to avoid any shift
+          if (mount.parentElement !== document.body) document.body.appendChild(mount)
+          mount.style.setProperty('position', 'fixed', 'important')
+          mount.style.setProperty('top', `${r.top.toFixed(2)}px`, 'important')
+          mount.style.setProperty('left', `${r.left.toFixed(2)}px`, 'important')
+          mount.style.setProperty('width', `${r.width.toFixed(2)}px`, 'important')
+          mount.style.setProperty('height', `${r.height.toFixed(2)}px`, 'important')
+          mount.style.setProperty('bottom', 'auto', 'important')
+          mount.style.setProperty('margin', '0', 'important')
+          mount.style.setProperty('box-sizing', 'border-box', 'important')
+          mount.style.setProperty('transform', 'none', 'important')
+          mount.style.setProperty('z-index', '2147483647', 'important')
+          mount.style.setProperty('opacity', '1', 'important')
+          mount.style.setProperty('visibility', 'visible', 'important')
+          mount.style.setProperty('pointer-events', 'auto', 'important')
+          mount.setAttribute('data-wol-pinned', '1')
+          // Mark the tile to suppress inline preview while pinned
+          try {
+            const tileRoot = (a.closest('ytd-video-renderer') as HTMLElement | null)
+              || (a.closest('ytd-grid-video-renderer') as HTMLElement | null)
+              || (a.closest('ytd-rich-item-renderer') as HTMLElement | null)
+              || null
+            if (tileRoot) {
+              tileRoot.setAttribute('data-wol-preview-block', '1')
+              // Also disable pointer events on the tile so :hover and JS hover logic won't trigger
+              const prev = tileRoot.style.pointerEvents || ''
+              tileRoot.setAttribute('data-wol-prev-pe', prev || '__empty__')
+              tileRoot.style.setProperty('pointer-events', 'none', 'important')
+            }
+          } catch {}
+          // Stop hover events from bubbling to YouTube while pinned
+          addShield()
+        } catch {}
+      }
+      const unpinOverlay = () => {
+        if (!wolPinned) return
+        wolPinned = false
+        try {
+          // Remove frozen geometry and reattach to host
+          mount.style.removeProperty('width')
+          mount.style.removeProperty('height')
+          mount.style.removeProperty('top')
+          mount.style.removeProperty('left')
+          mount.style.removeProperty('margin')
+          mount.style.setProperty('position', 'absolute', 'important')
+          if (mount.parentElement !== host) host.appendChild(mount)
+          // Restore default offsets for non-related tiles
+          if (!isRelatedContext) {
+            mount.style.bottom = '6px'
+            mount.style.top = ''
+            mount.style.left = '6px'
+          }
+          mount.removeAttribute('data-wol-pinned')
+          try {
+            const tileRoot = (a.closest('ytd-video-renderer') as HTMLElement | null)
+              || (a.closest('ytd-grid-video-renderer') as HTMLElement | null)
+              || (a.closest('ytd-rich-item-renderer') as HTMLElement | null)
+              || null
+            if (tileRoot) {
+              tileRoot.removeAttribute('data-wol-preview-block')
+              // Restore previous pointer-events
+              const prev = tileRoot.getAttribute('data-wol-prev-pe')
+              if (prev !== null) {
+                if (prev === '__empty__') tileRoot.style.removeProperty('pointer-events')
+                else tileRoot.style.pointerEvents = prev
+                tileRoot.removeAttribute('data-wol-prev-pe')
+              }
+            }
+          } catch {}
+          // Remove event shield
+          removeShield()
+        } catch {}
+      }
+      // Pin when hovering the button itself (results page only)
+      if (location.pathname === '/results') {
+        try { mount.addEventListener('pointerenter', (e) => { try { e.stopPropagation() } catch {} ; pinOverlay() }, { passive: true }) } catch {}
+        try {
+          mount.addEventListener('pointerleave', (e) => {
+            try {
+              const pe = e as PointerEvent
+              const rel = (e as any).relatedTarget as Node | null
+              const tileRoot = (a.closest('ytd-video-renderer') as HTMLElement | null)
+                || (a.closest('ytd-grid-video-renderer') as HTMLElement | null)
+                || (a.closest('ytd-rich-item-renderer') as HTMLElement | null)
+                || (mount.parentElement as HTMLElement | null)
+              const immediateInside = !!(tileRoot && rel && tileRoot.contains(rel))
+              if (immediateInside) return
+              setTimeout(() => {
+                try {
+                  const el = document.elementFromPoint(pe.clientX, pe.clientY)
+                  if (el && (mount.contains(el) || (tileRoot && tileRoot.contains(el as Node)))) return
+                } catch {}
+                try { e.stopPropagation() } catch {}
+                unpinOverlay()
+              }, 80)
+            } catch {
+              try { e.stopPropagation() } catch {}
+              unpinOverlay()
+            }
+          }, { passive: true })
+        } catch {}
+      }
+
+      // No special behavior on /results here; video overlays are disabled for results
 
       // Ensure host has relative positioning
       if (getComputedStyle(host).position === 'static') {
@@ -1667,9 +2088,11 @@ import { logger } from '../modules/logger'
         continue
       }
 
-      // Remove any existing overlays for this video in this specific host
-      const existingOverlays = host.querySelectorAll(`[data-wol-overlay="${id}"]`)
-      existingOverlays.forEach(overlay => overlay.remove())
+      // Avoid removing an existing overlay during hover; only proceed to create if none exists
+      try {
+        const already = host.querySelector(`[data-wol-overlay="${id}"]`)
+        if (already) { (a as any).dataset.wolEnhanced = 'done'; continue }
+      } catch {}
 
       // Add data attribute for identification
       mount.setAttribute('data-wol-overlay', id)
@@ -1683,45 +2106,48 @@ import { logger } from '../modules/logger'
       }
 
       // Store this overlay in our global state, and keep it alive during DOM churn
-      const mo = new MutationObserver(() => {
-        if (gen !== overlayGeneration) { try { mo.disconnect() } catch {} ; return }
-        // Always keep overlay attached to the stable host element
-        try {
-          // If original host is gone or no longer contains mount, try to locate a fresh host within the tile
-          const containerRoot = tileContainer || host.parentElement || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null)
-          if (!host.isConnected || (containerRoot && !containerRoot.contains(host))) {
-            let newHost: HTMLElement | null = null
-            const candidates = [
-              containerRoot?.querySelector('ytd-thumbnail #thumbnail') as HTMLElement | null,
-              containerRoot?.querySelector('#thumbnail') as HTMLElement | null,
-              containerRoot?.querySelector('ytd-thumbnail') as HTMLElement | null,
-              containerRoot?.querySelector('.ytThumbnailViewModelImage') as HTMLElement | null,
-              containerRoot?.querySelector('yt-thumbnail-view-model') as HTMLElement | null,
-              containerRoot?.querySelector('a#thumbnail') as HTMLElement | null,
-              // Results page preferred anchor for stability during hover autoplay
-              (location.pathname === '/results' ? containerRoot?.querySelector('a.yt-simple-endpoint.inline-block.style-scope.ytd-thumbnail') as HTMLElement | null : null),
-            ].filter(Boolean) as HTMLElement[]
-            if (candidates.length > 0) newHost = candidates[0]
-            // Shorts-specific candidates
-            if (!newHost) {
-              newHost = (containerRoot?.querySelector('ytd-reel-item-renderer #thumbnail') as HTMLElement | null)
-                || (containerRoot?.querySelector('ytd-reel-item-renderer a#thumbnail') as HTMLElement | null)
-                || (containerRoot?.querySelector('[id*="thumbnail"], .ytReelItemRendererThumbnail') as HTMLElement | null)
-                || null
+      let mo: MutationObserver | null = null
+      // Skip heavy per-tile observers on search results to prevent CPU spikes
+      if (location.pathname !== '/results') {
+        mo = new MutationObserver(() => {
+          if (gen !== overlayGeneration) { try { mo?.disconnect() } catch {} ; return }
+          // Always keep overlay attached to the stable host element
+          try {
+            // If original host is gone or no longer contains mount, try to locate a fresh host within the tile
+            const containerRoot = tileContainer || host.parentElement || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null)
+            
+            if (!host.isConnected || (containerRoot && !containerRoot.contains(host))) {
+              let newHost: HTMLElement | null = null
+              const candidates = [
+                containerRoot?.querySelector('ytd-thumbnail #thumbnail') as HTMLElement | null,
+                containerRoot?.querySelector('#thumbnail') as HTMLElement | null,
+                containerRoot?.querySelector('ytd-thumbnail') as HTMLElement | null,
+                containerRoot?.querySelector('.ytThumbnailViewModelImage') as HTMLElement | null,
+                containerRoot?.querySelector('yt-thumbnail-view-model') as HTMLElement | null,
+                containerRoot?.querySelector('a#thumbnail') as HTMLElement | null,
+              ].filter(Boolean) as HTMLElement[]
+              if (candidates.length > 0) newHost = candidates[0]
+              // Shorts-specific candidates
+              if (!newHost) {
+                newHost = (containerRoot?.querySelector('ytd-reel-item-renderer #thumbnail') as HTMLElement | null)
+                  || (containerRoot?.querySelector('ytd-reel-item-renderer a#thumbnail') as HTMLElement | null)
+                  || (containerRoot?.querySelector('[id*="thumbnail"], .ytReelItemRendererThumbnail') as HTMLElement | null)
+                  || null
+              }
+              // Fallback: the anchor itself
+              if (!newHost) newHost = a as unknown as HTMLElement
+              if (newHost) host = newHost
             }
-            // Fallback: the anchor itself
-            if (!newHost) newHost = a as unknown as HTMLElement
-            if (newHost) host = newHost
-          }
-          if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
-          if (!host.contains(mount)) host.appendChild(mount)
+            if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
+            if (!host.contains(mount)) host.appendChild(mount)
+          } catch {}
+          ensureOverlayVisibility()
+        })
+        try {
+          if (tileContainer) mo.observe(tileContainer, { childList: true, subtree: true })
+          else mo.observe(host, { childList: true, subtree: true, attributes: true, attributeFilter: ['style','class'] })
         } catch {}
-        ensureOverlayVisibility()
-      })
-      try {
-        if (tileContainer) mo.observe(tileContainer, { childList: true, subtree: true })
-        else mo.observe(host, { childList: true, subtree: true, attributes: true, attributeFilter: ['style','class'] })
-      } catch {}
+      }
 
       overlayState.set(existingOverlayId, {
         videoId: id,
@@ -1736,23 +2162,7 @@ import { logger } from '../modules/logger'
       // Append to thumbnail host to ensure initial placement inside the thumbnail
       if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
       if (mount.parentElement !== host) host.appendChild(mount)
-      // Also listen on the tile container hover to re-assert presence during inline previews
-      try {
-        const hoverRoot = tileContainer || host
-        hoverRoot.addEventListener('mouseenter', () => {
-          if (gen !== overlayGeneration) return
-          try {
-            // On /results, retarget to preferred anchor inside ytd-video-renderer during hover previews
-            if ((hoverRoot as HTMLElement).tagName === 'YTD-VIDEO-RENDERER' && location.pathname === '/results') {
-              const preferred = (hoverRoot as HTMLElement).querySelector('a.yt-simple-endpoint.inline-block.style-scope.ytd-thumbnail, a#thumbnail.yt-simple-endpoint, ytd-thumbnail #thumbnail, #thumbnail') as HTMLElement | null
-              if (preferred) host = preferred
-              if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
-            }
-            if (!host.contains(mount)) host.appendChild(mount)
-          } catch {}
-          ensureOverlayVisibility()
-        })
-      } catch {}
+      // Avoid extra hover listeners on results; rely on host mouseenter handler above
 
       // Watch-page related sidebar: container-level batch reveal
       if (isWatchPageForBatch && isRelatedContext && !relatedBatchRevealed) {
