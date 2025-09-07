@@ -179,23 +179,48 @@ import { logger } from '../modules/logger'
           }
         }
         
-      // Handle button setting changes that require immediate UI updates
+       // Handle button setting changes that require immediate UI updates
         if (key === 'buttonChannelSub' || key === 'buttonVideoSub' || key === 'buttonVideoPlayer') {
           needsButtonUpdate = true
           // Proactively clean or (re)inject inline UI on results when settings flip
           try {
-            if (key === 'buttonVideoSub' && change?.newValue === false) {
-              document.querySelectorAll('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch]').forEach(el => el.remove())
-              // Shorts compact mount cleanup
-              try { render(<WatchOnOdyseeButtons />, shortsSideButtonMountPoint) } catch {}
+            if (key === 'buttonVideoSub') {
+              if (change?.newValue === false) {
+                document.querySelectorAll('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch]').forEach(el => el.remove())
+                // Shorts compact mount cleanup
+                try { render(<WatchOnOdyseeButtons />, shortsSideButtonMountPoint) } catch {}
+              } else {
+                // Re-enabled: first clean up any existing buttons to prevent duplicates
+                document.querySelectorAll('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch]').forEach(el => el.remove())
+                
+                // Then clear enhanced flags so videos get re-processed
+                document.querySelectorAll('ytd-video-renderer a[data-wol-enhanced="done"]')
+                  .forEach(el => (el as any).dataset.wolEnhanced = '')
+                document.querySelectorAll('.ytGridShelfViewModelGridShelfItem a[data-wol-enhanced="done"]')
+                  .forEach(el => (el as any).dataset.wolEnhanced = '')
+              }
             }
-            if (key === 'buttonChannelSub' && change?.newValue === false) {
-              document.querySelectorAll('a[data-wol-inline-channel]').forEach(el => el.remove())
-              document.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove())
-              document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
-                .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
-              // Shorts subscribe mount cleanup
-              try { render(<WatchOnOdyseeButtons />, shortsSubscribeMountPoint) } catch {}
+            if (key === 'buttonChannelSub') {
+              if (change?.newValue === false) {
+                document.querySelectorAll('a[data-wol-inline-channel]').forEach(el => el.remove())
+                document.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove())
+                document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
+                  .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
+                // Shorts subscribe mount cleanup
+                try { render(<WatchOnOdyseeButtons />, shortsSubscribeMountPoint) } catch {}
+              } else {
+                // Re-enabled: first clean up any existing buttons to prevent duplicates
+                document.querySelectorAll('a[data-wol-inline-channel]').forEach(el => el.remove())
+                document.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove())
+                document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
+                  .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
+                
+                // Then clear enhanced flags so channels get re-processed
+                document.querySelectorAll('ytd-channel-renderer a[data-wol-enhanced="done"]')
+                  .forEach(el => (el as any).dataset.wolEnhanced = '')
+                document.querySelectorAll('ytd-video-renderer a[data-wol-enhanced="done"]')
+                  .forEach(el => (el as any).dataset.wolEnhanced = '')
+              }
             }
             if (key === 'buttonVideoPlayer' && change?.newValue === false) {
               try { render(<WatchOnOdyseePlayerButton />, playerButtonMountPoint) } catch {}
@@ -219,10 +244,17 @@ import { logger } from '../modules/logger'
         ensureOverlayEnhancementActive()
       }
       
-      if (needsButtonUpdate) {
-        // Force immediate button update by triggering current page processing
-        scheduleProcessCurrentPage(0)
-      }
+       if (needsButtonUpdate) {
+         // Force immediate button update by triggering current page processing
+         scheduleProcessCurrentPage(0)
+         // Also trigger immediate overlay enhancement to re-process /results page inline buttons
+         if (location.pathname === '/results') {
+           try {
+             // Force a slightly longer delay to ensure cleanup is complete first
+             setTimeout(() => enhanceVideoTilesOnListings().catch(e => logger.error(e)), 100)
+           } catch {}
+         }
+       }
 
       // Try to immediately reflect settings changes without waiting for next loop
       if (lastRenderContext) {
@@ -346,14 +378,32 @@ import { logger } from '../modules/logger'
       if (settings.buttonVideoPlayer && params.playerTarget) {
         const isShorts = params.source.url.pathname.startsWith('/shorts/')
         if (isShorts) {
-          const overlay = (document.querySelector('ytd-reel-player-overlay-renderer') as HTMLElement | null)
-            || (document.querySelector('#player.skeleton.shorts #player-wrap') as HTMLElement | null)
-          if (overlay) {
-            overlay.style.position = overlay.style.position || 'relative'
-            Object.assign(playerButtonMountPoint.style, { position: 'absolute', right: '12px', bottom: '12px', display: 'inline-flex', alignItems: 'center', zIndex: '1002', pointerEvents: 'auto' })
-            if (playerButtonMountPoint.getAttribute('data-id') !== params.source.id || playerButtonMountPoint.parentElement !== overlay) {
+          // Prefer anchoring directly to the Shorts video container, bottom-right inside the video
+          const playerHost = (
+            document.querySelector('ytd-reel-video-renderer #player-container') as HTMLElement | null
+          ) || (
+            document.querySelector('ytd-reel-player-overlay-renderer #player-container') as HTMLElement | null
+          ) || (
+            document.querySelector('ytd-reel-player-overlay-renderer #player') as HTMLElement | null
+          ) || (
+            document.querySelector('#player.skeleton.shorts #player-wrap') as HTMLElement | null
+          )
+
+          if (playerHost) {
+            const cs = getComputedStyle(playerHost)
+            if (cs.position === 'static') playerHost.style.position = 'relative'
+            Object.assign(playerButtonMountPoint.style, {
+              position: 'absolute',
+              right: '12px',
+              bottom: '12px',
+              display: 'inline-flex',
+              alignItems: 'center',
+              zIndex: '1002',
+              pointerEvents: 'auto'
+            })
+            if (playerButtonMountPoint.getAttribute('data-id') !== params.source.id || playerButtonMountPoint.parentElement !== playerHost) {
               playerButtonMountPoint.setAttribute('data-id', params.source.id)
-              overlay.appendChild(playerButtonMountPoint)
+              playerHost.appendChild(playerButtonMountPoint)
             }
             render(<WatchOnOdyseePlayerButton minimized target={params.playerTarget ?? undefined} source={params.source} />, playerButtonMountPoint)
           } else {
@@ -961,22 +1011,26 @@ import { logger } from '../modules/logger'
         overlayState.delete(key)
       }
     }
-    // Throttle calls to prevent excessive processing
-    const now = Date.now()
-    const currentUrl = window.location.href
-    const isResults = location.pathname === '/results'
-    const minGap = isResults ? 800 : 400
-    if (now - lastEnhanceTime < minGap && currentUrl === lastEnhanceUrl) {
-      return
-    }
+     // Throttle calls to prevent excessive processing
+     const now = Date.now()
+     const currentUrl = window.location.href
+     const isResults = location.pathname === '/results'
+     const minGap = isResults ? 800 : 400
+     // Allow immediate re-processing if URL changed or if it's been too soon since last enhancement
+     if (now - lastEnhanceTime < minGap && currentUrl === lastEnhanceUrl) {
+       return
+     }
     lastEnhanceTime = now
     lastEnhanceUrl = currentUrl
 
-    // Check if overlay buttons are enabled
+    // Check if overlay buttons are enabled - clean up overlays if disabled but continue for inline buttons
     if (!settings.buttonOverlay) {
       // Clean up any existing overlays when setting is disabled
       cleanupOverlays()
-      return
+      // But continue processing for /results page inline buttons which are controlled by other settings
+      if (location.pathname !== '/results') {
+        return
+      }
     }
 
     // Debug logging for search pages
@@ -1264,28 +1318,59 @@ import { logger } from '../modules/logger'
 
     dbg(`Enhancing ${toProcess.length} tiles with Odysee overlays (videos and channels)`)
 
-    // Upgrade channel handles (@...) to UC ids when possible before resolving
-    async function upgradeChannelIdFromRenderer(anchor: HTMLAnchorElement, id: string): Promise<string> {
-      if (id.startsWith('UC')) return id
-      const channelRenderer = anchor.closest('ytd-channel-renderer') as HTMLElement | null
-      const chAnchor = channelRenderer?.querySelector('a[href^="/channel/"]') as HTMLAnchorElement | null
-      if (chAnchor) {
-        try {
-          const cu = new URL(chAnchor.getAttribute('href') || chAnchor.href, location.origin)
-          const ucid = cu.pathname.split('/')[2]
-          if (ucid && ucid.startsWith('UC')) return ucid
-        } catch { }
-      }
-      try {
-        const href = anchor.getAttribute('href') || anchor.href
-        if (href && href.startsWith('/@')) {
-          const html = await (await fetch(href, { credentials: 'same-origin' })).text()
-          const m = html.match(/\"channelId\"\s*:\s*\"([^\"]+)\"/) || html.match(/feeds\/videos\.xml\?channel_id=([A-Za-z0-9_-]+)/)
-          if (m?.[1]?.startsWith('UC')) return m[1]
-        }
-      } catch { }
-      return id
-    }
+     // Upgrade channel handles (@...) to UC ids when possible before resolving
+     async function upgradeChannelIdFromRenderer(anchor: HTMLAnchorElement, id: string): Promise<string> {
+       if (id.startsWith('UC')) return id
+       const channelRenderer = anchor.closest('ytd-channel-renderer') as HTMLElement | null
+       const chAnchor = channelRenderer?.querySelector('a[href^="/channel/"]') as HTMLAnchorElement | null
+       if (chAnchor) {
+         try {
+           const cu = new URL(chAnchor.getAttribute('href') || chAnchor.href, location.origin)
+           const ucid = cu.pathname.split('/')[2]
+           if (ucid && ucid.startsWith('UC')) return ucid
+         } catch { }
+       }
+       
+       // For results page, be more aggressive about finding UC IDs from existing DOM before fetching
+       if (location.pathname === '/results' && channelRenderer) {
+         try {
+           // Look for serialized endpoints or other DOM hints first
+           const endpoints = channelRenderer.querySelectorAll('[data-serialized-endpoint]')
+           for (const ep of Array.from(endpoints)) {
+             try {
+               const data = JSON.parse((ep as HTMLElement).getAttribute('data-serialized-endpoint') || '{}')
+               const browseId = data?.browseEndpoint?.browseId
+               if (browseId && browseId.startsWith('UC')) return browseId
+             } catch {}
+           }
+           
+           // Look for any UC channel IDs in text content or data attributes
+           const allText = channelRenderer.textContent || ''
+           const ucMatch = allText.match(/UC[a-zA-Z0-9_-]{22}/)
+           if (ucMatch) return ucMatch[0]
+         } catch {}
+       }
+       
+       // Only fetch as last resort, and with timeout
+       try {
+         const href = anchor.getAttribute('href') || anchor.href
+         if (href && href.startsWith('/@')) {
+           const controller = new AbortController()
+           const timeoutId = setTimeout(() => controller.abort(), 2000) // 2 second timeout
+           
+           const response = await fetch(href, { 
+             credentials: 'same-origin',
+             signal: controller.signal
+           })
+           clearTimeout(timeoutId)
+           
+           const html = await response.text()
+           const m = html.match(/\"channelId\"\s*:\s*\"([^\"]+)\"/) || html.match(/feeds\/videos\.xml\?channel_id=([A-Za-z0-9_-]+)/)
+           if (m?.[1]?.startsWith('UC')) return m[1]
+         }
+       } catch { }
+       return id
+     }
 
     let normalizedToProcess = await Promise.all(dedupedToProcess.map(async (x) => {
       if (x.type === 'channel' && x.id && !x.id.startsWith('UC')) {
@@ -1820,13 +1905,19 @@ import { logger } from '../modules/logger'
         // It has been removed to reduce CPU overhead on large result sets.
       }
 
-      // If a pinned overlay for this id is already active anywhere (e.g., during hover), skip
-      try {
-        const pinnedExisting = document.querySelector(`[data-wol-overlay="${id}"][data-wol-pinned="1"]`)
-        if (pinnedExisting) { (a as any).dataset.wolEnhanced = 'done'; continue }
-      } catch {}
+       // Only create overlays if buttonOverlay setting is enabled
+       if (!settings.buttonOverlay) {
+         ; (a as any).dataset.wolEnhanced = 'done'
+         continue
+       }
 
-      // Find the best host element for the overlay - prioritize the actual thumbnail/video area
+       // If a pinned overlay for this id is already active anywhere (e.g., during hover), skip
+       try {
+         const pinnedExisting = document.querySelector(`[data-wol-overlay="${id}"][data-wol-pinned="1"]`)
+         if (pinnedExisting) { (a as any).dataset.wolEnhanced = 'done'; continue }
+       } catch {}
+
+       // Find the best host element for the overlay - prioritize the actual thumbnail/video area
       const thumb = a.closest('ytd-thumbnail') as HTMLElement | null
       const compactVideo = a.closest('ytd-compact-video-renderer') as HTMLElement | null
       const richItem = a.closest('ytd-rich-item-renderer') as HTMLElement | null
@@ -1942,14 +2033,14 @@ import { logger } from '../modules/logger'
         }
       }
 
-      // 5. No safe host found; skip to avoid misplacement (e.g., Play All)
-      if (!host) {
-        // Last-resort fallback: prefer visible tile container vs. anchor to avoid text spill
-        const gridShelfItem = a.closest('[class*="ytGridShelfViewModelGridShelfItem"]') as HTMLElement | null
-        const gridShelf = a.closest('yt-grid-shelf-view-model-wiz') as HTMLElement | null
-        host = (gridShelfItem || gridShelf || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media') as HTMLElement | null) || (a as unknown as HTMLElement))
-        if (!host) continue
-      }
+       // 5. No safe host found; skip to avoid misplacement (e.g., Play All)
+       if (!host) {
+         // Last-resort fallback: prefer visible tile container vs. anchor to avoid text spill
+         const gridShelfItem = a.closest('[class*="ytGridShelfViewModelGridShelfItem"]') as HTMLElement | null
+         const gridShelf = a.closest('yt-grid-shelf-view-model-wiz') as HTMLElement | null
+         host = gridShelfItem || gridShelf || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media') as HTMLElement | null) || (a as unknown as HTMLElement)
+         if (!host) continue
+       }
 
       // Debug logging for Shorts positioning
       if (WOL_DEBUG && window.location.pathname.startsWith('/shorts') && currentUrl !== lastLoggedHref) {
@@ -2572,9 +2663,12 @@ import { logger } from '../modules/logger'
         }
       }
 
-      const source = await getSourceByUrl(urlNow)
-      lastLoggedHref = urlNow.href
-      if (!source) { updateButtons(null); return }
+       const source = await getSourceByUrl(urlNow)
+       lastLoggedHref = urlNow.href
+       if (!source) { 
+         updateButtons(null)
+         return 
+       }
 
       // Compute targets: resolve both the primary item and (if video) the channel in a single call
       let subscribeTargets: Target[] = []
@@ -2697,7 +2791,7 @@ import { logger } from '../modules/logger'
           redirectedUrls.add(currentUrl)
           lastRedirectTime = now
           setTimeout(() => { redirectedUrls.delete(currentUrl) }, 120000)
-          if (source.type === 'video') findVideoElementAwait(source).then(v => v.pause())
+           if (source && source.type === 'video') findVideoElementAwait(source).then(v => v.pause())
           logger.log('Watch on Odysee: Redirecting to:', odyseeURL.href)
           openNewTab(odyseeURL, 'auto')
           if (window.history.length === 1) window.close(); else window.history.back()

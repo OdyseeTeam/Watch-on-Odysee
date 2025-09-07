@@ -431,7 +431,7 @@ test('results page: inline Watch/Channel pills toggle without refresh', async ()
   await ensurePopupToggle('Videos', true)
   await ensurePopupToggle('Channels', true)
 
-  await page.goto('https://www.youtube.com/results?search_query=WhiteHouse')
+  await page.goto('https://www.youtube.com/results?search_query=the+White+House')
   await dismissYouTubeConsentIfPresent(page)
 
   const watchPills = page.locator('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch]')
@@ -516,15 +516,20 @@ test('video/channel button visibility follows settings', async () => {
 
   // Back to watch page: expect no inline Watch/Channel buttons
   await page.goto('https://www.youtube.com/watch?v=qn2K3UyIsEo')
-  await expect(page.locator('a[role="button"][href^="https://odysee.com/"]')).toHaveCount(0)
+  // Scope to subscribe/owner header to avoid picking the in-player anchor
+  const ownerBtns = page.locator('#owner a[role="button"][href^="https://odysee.com/"]').filter({ hasNotText: ' ' })
+  await expect(page.locator('#owner a[role="button"][href^="https://odysee.com/"]')).toHaveCount(0)
 
   // Re-enable video button; expect it to appear
   await ensurePopupToggle('Videos', true)
-  await expect(page.locator('a[role="button"][href^="https://odysee.com/"]')).toBeVisible()
+  const ownerWatch = page.locator('#owner a[role="button"][href^="https://odysee.com/"]').filter({ hasText: 'Watch' }).first()
+  await expect(ownerWatch).toBeVisible()
 
   // Re-enable channel button; expect a second button without page refresh
   await ensurePopupToggle('Channels', true)
-  await expect(page.locator('a[role="button"][href^="https://odysee.com/"]')).toHaveCount(2)
+  const ownerChannel = page.locator('#owner a[role="button"][href^="https://odysee.com/"]').filter({ hasText: 'Channel' }).first()
+  await expect(ownerChannel).toBeVisible()
+  await expect(page.locator('#owner a[role="button"][href^="https://odysee.com/"]')).toHaveCount(2)
   ensureArtifactsDir()
   const buf = await page.screenshot()
   await test.info().attach('watch_buttons_2.png', { body: buf, contentType: 'image/png' })
@@ -580,18 +585,18 @@ test('watch page buttons toggle on/off without refresh', async () => {
   // Ensure both off
   await ensurePopupToggle('Videos', false)
   await ensurePopupToggle('Channels', false)
-  await expect(page.locator('a[role="button"][href^="https://odysee.com/"]')).toHaveCount(0)
+  await expect(page.locator('#owner a[role="button"][href^="https://odysee.com/"]')).toHaveCount(0)
 
   // Turn on Videos -> expect a Watch button
   await ensurePopupToggle('Videos', true)
-  const watchBtn = page.locator('a[role="button"][href^="https://odysee.com/"] >> text=Watch').first()
+  const watchBtn = page.locator('#owner a[role="button"][href^="https://odysee.com/"] >> text=Watch').first()
   await expect(watchBtn).toBeVisible({ timeout: 30_000 })
 
   // Turn on Channels -> expect a Channel button; total 2
   await ensurePopupToggle('Channels', true)
-  const channelBtn = page.locator('a[role="button"][href^="https://odysee.com/"] >> text=Channel').first()
+  const channelBtn = page.locator('#owner a[role="button"][href^="https://odysee.com/"] >> text=Channel').first()
   await expect(channelBtn).toBeVisible({ timeout: 30_000 })
-  await expect(page.locator('a[role="button"][href^="https://odysee.com/"]')).toHaveCount(2)
+  await expect(page.locator('#owner a[role="button"][href^="https://odysee.com/"]')).toHaveCount(2)
   const buf2 = await page.screenshot()
   await test.info().attach('watch_buttons_toggle_on.png', { body: buf2, contentType: 'image/png' })
   fs.writeFileSync(path.join(artifactsDir, 'watch_buttons_toggle_on.png'), buf2)
@@ -628,8 +633,11 @@ test('shorts page: buttons toggle without refresh (specific ID)', async () => {
   await expect(overlay.locator('a[role="button"][href^="https://odysee.com/"]')).toHaveCount(0)
 
   // Enable Videos -> expect Watch button in overlay actions
-  await ensurePopupToggle('Videos', true)
-  await expect(overlay.locator('a[role="button"][href^="https://odysee.com/"] >> text=Watch').first()).toBeVisible({ timeout: 30_000 })
+  await ensurePopupToggle('Video Player', true)
+  // Accept either the inline Watch pill in overlay, or the player control button anchored to the video
+  const shortsWatchAnchor = overlay.locator('a[role="button"][href^="https://odysee.com/"] >> text=Watch').first()
+  const shortsPlayerBtn = page.locator('#player-container .ytp-button[title^="Watch on "], .ytp-chrome-bottom .ytp-button[title^="Watch on "]').first()
+  await expect(shortsWatchAnchor.or(shortsPlayerBtn)).toBeVisible({ timeout: 30_000 })
   ensureArtifactsDir()
   const shortsOn = await page.screenshot()
   await test.info().attach('shorts_buttons_on.png', { body: shortsOn, contentType: 'image/png' })
