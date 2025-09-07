@@ -44,9 +44,8 @@ import { logger } from '../modules/logger'
 
   // Global mutation observer for video tile enhancement
   let wolMutationObserver: MutationObserver | null = null
-  // Suppress auto-redirects briefly after extension (content script) boot
+  // Extension boot tracking (for debugging)
   const EXT_BOOT_AT = Date.now()
-  const AUTO_BOOT_SUPPRESS_MS = 30000
   // Batch state for watch-page related sidebar overlays (container-gated)
   let relatedBatchStartAt: number | null = null
   let relatedBatchRevealTimer: number | null = null
@@ -83,7 +82,13 @@ import { logger } from '../modules/logger'
         /* Hide other overlays while one is globally pinned to avoid duplicates */
         [data-wol-overlay][data-wol-hidden="1"] { display: none !important; }
 
-        
+        /* Ensure channel name row can host an inline icon on results */
+        ytd-video-renderer ytd-channel-name#channel-name #container {
+          display: inline-flex !important;
+          align-items: center !important;
+          gap: 6px !important;
+        }
+        ytd-video-renderer ytd-channel-name#channel-name #text-container { display: inline-flex !important; }
       `
       document.head.appendChild(style)
     }
@@ -174,14 +179,37 @@ import { logger } from '../modules/logger'
           }
         }
         
-        // Handle button setting changes that require immediate UI updates
-        if (key === 'buttonChannelSub' || key === 'buttonVideoSub') {
+      // Handle button setting changes that require immediate UI updates
+        if (key === 'buttonChannelSub' || key === 'buttonVideoSub' || key === 'buttonVideoPlayer') {
           needsButtonUpdate = true
+          // Proactively clean or (re)inject inline UI on results when settings flip
+          try {
+            if (key === 'buttonVideoSub' && change?.newValue === false) {
+              document.querySelectorAll('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch]').forEach(el => el.remove())
+              // Shorts compact mount cleanup
+              try { render(<WatchOnOdyseeButtons />, shortsSideButtonMountPoint) } catch {}
+            }
+            if (key === 'buttonChannelSub' && change?.newValue === false) {
+              document.querySelectorAll('a[data-wol-inline-channel]').forEach(el => el.remove())
+              document.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove())
+              document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
+                .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
+              // Shorts subscribe mount cleanup
+              try { render(<WatchOnOdyseeButtons />, shortsSubscribeMountPoint) } catch {}
+            }
+            if (key === 'buttonVideoPlayer' && change?.newValue === false) {
+              try { render(<WatchOnOdyseePlayerButton />, playerButtonMountPoint) } catch {}
+            }
+          } catch {}
         }
         
         // Handle redirect setting changes that may affect current page
         if (key === 'redirectVideo' || key === 'redirectChannel') {
           needsButtonUpdate = true
+          // Clear redirect tracking when settings are enabled to allow immediate redirect
+          if ((change as any)?.newValue === true) {
+            try { lastRedirectTime = 0; redirectedUrls.clear() } catch {}
+          }
         }
       }
       
@@ -699,38 +727,10 @@ import { logger } from '../modules/logger'
   const OPEN_DEBOUNCE_MS = 1200
   const autoRedirectSuppressByUrl = new Map<string, number>() // youtubeHref -> suppressUntilTs
 
-  function getDomAutoSuppressUntil(): number {
-    const v = document.documentElement.getAttribute('data-wol-suppress-auto-until')
-    const n = v ? parseInt(v, 10) : 0
-    return Number.isFinite(n) ? n : 0
-  }
-  function setDomAutoSuppress(msFromNow: number) {
-    try { document.documentElement.setAttribute('data-wol-suppress-auto-until', String(Date.now() + msFromNow)) } catch {}
-  }
-
-  function getLocalAutoSuppressUntil(): number {
-    try {
-      const v = localStorage.getItem('wol-suppress-auto-until')
-      const n = v ? parseInt(v, 10) : 0
-      return Number.isFinite(n) ? n : 0
-    } catch { return 0 }
-  }
-  function setLocalAutoSuppress(msFromNow: number) {
-    try { localStorage.setItem('wol-suppress-auto-until', String(Date.now() + msFromNow)) } catch {}
-  }
-
-  async function getGlobalAutoSuppressUntil(): Promise<number> {
-    try {
-      return await new Promise<number>((resolve) => {
-        chrome.storage.local.get(['wolSuppressAllAutoUntil'], (o) => {
-          const n = Number(o?.wolSuppressAllAutoUntil || 0)
-          resolve(Number.isFinite(n) ? n : 0)
-        })
-      })
-    } catch { return 0 }
-  }
-  function setGlobalAutoSuppress(msFromNow: number) {
-    try { chrome.storage.local.set({ wolSuppressAllAutoUntil: Date.now() + msFromNow }) } catch {}
+  // Helper to clear redirect tracking when settings are toggled
+  async function resetAutoRedirectSuppress() {
+    try { lastRedirectTime = 0 } catch {}
+    try { redirectedUrls.clear() } catch {}
   }
 
   async function openNewTab(url: URL, reason: 'user' | 'auto' = 'user') {
@@ -743,23 +743,14 @@ import { logger } from '../modules/logger'
       openedOdyseeGuard.set(url.href, now)
       setTimeout(() => { openedOdyseeGuard.delete(url.href) }, Math.max(OPEN_DEBOUNCE_MS * 5, 8000))
 
-      // Suppress any auto-redirects for the current YouTube page for a bit
+      // Suppress any auto-redirects for the current YouTube page for a bit to prevent immediate re-redirect
       try { autoRedirectSuppressByUrl.set(location.href, now + SUPPRESS_AUTO_MS) } catch {}
-      // Also set a DOM-based suppress that survives extension reload within the same page lifecycle
-      setDomAutoSuppress(5 * 60 * 1000) // 5 minutes
-      // And persist at origin-level to survive extension reload across tabs
-      setLocalAutoSuppress(5 * 60 * 1000)
-      // And persist in extension storage across contexts
-      setGlobalAutoSuppress(5 * 60 * 1000)
 
       // Do not record here; background will mark successful opens
     } else {
-      // Auto: honor user suppression window for this page
+      // Auto: honor basic suppression window for this page to prevent rapid redirects
       const supMem = autoRedirectSuppressByUrl.get(location.href) || 0
-      const supDom = getDomAutoSuppressUntil()
-      const supLocal = getLocalAutoSuppressUntil()
-      const sup = Math.max(supMem, supDom, supLocal)
-      if (now < sup) return
+      if (now < supMem) return
     }
 
     try {
@@ -1244,8 +1235,6 @@ import { logger } from '../modules/logger'
       }
 
       if (!vid) continue
-      // On search results, we only keep channel items; skip video overlays entirely
-      if (location.pathname === '/results' && type === 'video') continue
       toProcess.push({ a, id: vid, type })
     }
 
@@ -1333,11 +1322,327 @@ import { logger } from '../modules/logger'
 
       const url = getOdyseeUrlByTarget(res)
 
-      // On /results we only render the channel redirect (inside channel result cards)
-      if (location.pathname === '/results' && type !== 'channel') {
-        // Mark enhanced to avoid revisiting this anchor
-        ;(a as any).dataset.wolEnhanced = 'done'
-        continue
+      // On /results, render inline buttons instead of overlays for video tiles
+      if (location.pathname === '/results') {
+        if (type === 'video') {
+          try {
+            const videoRenderer = a.closest('ytd-video-renderer') as HTMLElement | null
+            if (videoRenderer) {
+              // 1) Inline "Watch on Odysee" pill to the right of the title/menu
+              if (settings.buttonVideoSub && !videoRenderer.querySelector('[data-wol-inline-watch]')) {
+                const titleWrapper = (videoRenderer.querySelector('#title-wrapper') as HTMLElement | null) || (videoRenderer.querySelector('#meta') as HTMLElement | null) || videoRenderer
+                const menu = videoRenderer.querySelector('#menu') as HTMLElement | null
+                const btn = document.createElement('a')
+                btn.setAttribute('data-wol-inline-watch', '1')
+                btn.href = url.href
+                btn.target = '_blank'
+                btn.title = `Watch on ${platform.button.platformNameText}`
+                btn.style.display = 'inline-flex'
+                btn.style.alignItems = 'center'
+                btn.style.justifyContent = 'center'
+                btn.style.gap = '6px'
+                // Keep a small gap from the title; align with menu
+                btn.style.marginLeft = '8px'
+                // Uniform size similar to channel pill
+                btn.style.height = '28px'
+                btn.style.lineHeight = '28px'
+                btn.style.padding = '0 10px'
+                btn.style.borderRadius = '14px'
+                btn.style.fontSize = '12px'
+                btn.style.fontWeight = '500'
+                btn.style.boxSizing = 'border-box'
+                btn.style.letterSpacing = '0.2px'
+                // Align with title/menu row
+                btn.style.alignSelf = 'center'
+                btn.style.verticalAlign = 'middle'
+                btn.style.border = '0'
+                // Slight nudge down to align with 3‑dot menu
+                btn.style.marginTop = '3px'
+                btn.style.whiteSpace = 'nowrap'
+                btn.style.textDecoration = 'none'
+                btn.style.color = 'whitesmoke'
+                btn.style.background = platform.theme
+                const i = document.createElement('img')
+                i.src = platform.button.icon
+                i.style.width = '14px'
+                i.style.height = '14px'
+                i.style.pointerEvents = 'none'
+                const t = document.createElement('span')
+                t.textContent = 'Watch'
+                btn.appendChild(i)
+                btn.appendChild(t)
+                btn.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(url, 'user') })
+                // Prefer to mount inside the right-side menu so it stays flush-right
+                const menuRenderer = (videoRenderer.querySelector('#menu ytd-menu-renderer') as HTMLElement | null)
+                const menuButtons = (menuRenderer?.querySelector('#flexible-item-buttons') as HTMLElement | null)
+                  || (menuRenderer?.querySelector('#top-level-buttons-computed') as HTMLElement | null)
+                const threeDots = (menuRenderer?.querySelector('yt-icon-button#button') as HTMLElement | null)
+                let mounted = false
+                try {
+                  if (menuButtons) { menuButtons.insertAdjacentElement('afterbegin', btn); mounted = true }
+                  else if (menuRenderer && threeDots) { menuRenderer.insertBefore(btn, threeDots); mounted = true }
+                } catch {}
+                if (!mounted) {
+                  const parent = (menu && menu.parentElement) || titleWrapper
+                  if (parent) {
+                    if (menu && menu.parentElement === parent) parent.insertBefore(btn, menu)
+                    else parent.appendChild(btn)
+                  }
+                }
+                if (WOL_DEBUG) dbg('WOL results inline watch injected', { videoId: id })
+
+                // Insert compact channel icon to the left of the channel avatar (in channel-info)
+                try {
+                  if (!videoRenderer.querySelector('[data-wol-inline-channel]')) {
+                    // Try to extract channel id from anchors in this renderer
+                    let chId: string | null = null
+                    const nameA = videoRenderer.querySelector('#channel-info #channel-name a[href], ytd-channel-name#channel-name a[href]') as HTMLAnchorElement | null
+                    try {
+                      const href = nameA?.getAttribute('href') || nameA?.href || ''
+                      if (href) {
+                        const cu = new URL(href, location.origin)
+                        if (cu.pathname.startsWith('/channel/')) chId = cu.pathname.split('/')[2] || null
+                        else if (cu.pathname.startsWith('/@')) chId = await upgradeChannelIdFromRenderer(nameA!, cu.pathname.substring(1))
+                      }
+                    } catch {}
+                    if (!chId) {
+                      const fb = videoRenderer.querySelector('a[href^="/channel/"]') as HTMLAnchorElement | null
+                      if (fb) {
+                        try { const u = new URL(fb.getAttribute('href') || fb.href, location.origin); const uc = u.pathname.split('/')[2]; if (uc) chId = uc } catch {}
+                      }
+                    }
+                    if (chId) {
+                      const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
+                      const chRes = await getTargetsBySources({ platform: srcPlatform, id: chId, type: 'channel', url: new URL(location.href), time: null })
+                      const chTarget = chRes[chId] || null
+                      let chUrl: URL | null = null
+                      if (chTarget) chUrl = getOdyseeUrlByTarget(chTarget)
+                      else if (nameA?.href?.includes('/@')) {
+                        try { const handle = (new URL(nameA.href, location.origin)).pathname.substring(1); chUrl = new URL(`${platform.domainPrefix}/@${handle}`.replace('/@/@','/@')) } catch {}
+                      }
+                      if (!chUrl) {
+                        const q = encodeURIComponent(nameA?.textContent?.trim() || chId)
+                        try { chUrl = new URL(`${platform.domainPrefix}/$/search?q=${q}`) } catch {}
+                      }
+                      if (chUrl) {
+                        const chInfo = videoRenderer.querySelector('#channel-info') as HTMLElement | null
+                        const thumbA = chInfo?.querySelector('#channel-thumbnail') as HTMLElement | null
+                        const chBtn = document.createElement('a')
+                        chBtn.setAttribute('data-wol-inline-channel', '1')
+                        chBtn.href = chUrl.href
+                        chBtn.target = '_blank'
+                        chBtn.title = `Open channel on ${platform.button.platformNameText}`
+                        chBtn.style.display = 'inline-flex'
+                        chBtn.style.alignItems = 'center'
+                        chBtn.style.justifyContent = 'center'
+                        chBtn.style.flex = '0 0 auto'
+                        chBtn.style.marginRight = '6px'
+                        // Slight nudge up to align vertically with avatar (top felt short)
+                        chBtn.style.marginTop = '-2px'
+                        chBtn.style.width = '22px'
+                        chBtn.style.height = '22px'
+                        chBtn.style.borderRadius = '11px'
+                        // Use full-bleed icon instead of a filled circle background
+                        chBtn.style.background = 'transparent'
+                        chBtn.style.overflow = 'hidden'
+                        const icon = document.createElement('img')
+                        icon.src = platform.button.icon
+                        icon.style.width = '22px'
+                        icon.style.height = '22px'
+                        icon.style.pointerEvents = 'none'
+                        chBtn.appendChild(icon)
+                        chBtn.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+                        if (chInfo && thumbA && chInfo.contains(thumbA)) {
+                          try {
+                            const cs = window.getComputedStyle(chInfo)
+                            if (cs.display !== 'flex' && cs.display !== 'inline-flex') chInfo.style.display = 'flex'
+                            chInfo.style.alignItems = 'center'
+                            chInfo.insertBefore(chBtn, thumbA)
+                            if (WOL_DEBUG) dbg('WOL results inline channel placed before avatar', { videoId: id, channelId: chId })
+                          } catch {
+                            chInfo.insertBefore(chBtn, thumbA)
+                          }
+                        } else {
+                          // Fallback: keep next to Watch pill if channel-info missing
+                          if (btn.parentElement) btn.parentElement.insertBefore(chBtn, btn)
+                          else if (menu && menu.parentElement === titleWrapper) titleWrapper.insertBefore(chBtn, menu)
+                          else titleWrapper?.appendChild(chBtn)
+                          if (WOL_DEBUG) dbg('WOL results inline channel fallback near watch', { videoId: id, channelId: chId })
+                        }
+                      }
+                    } else if (WOL_DEBUG) dbg('WOL results could not derive channel id for next-to-watch injection')
+                  }
+                } catch (e) { if (WOL_DEBUG) dbg('WOL results inline channel next-to-watch error', e) }
+              }
+
+              // 2) Channel inline icon (results)
+              if (settings.buttonChannelSub && !videoRenderer.querySelector('[data-wol-inline-channel]')) {
+                const nameAnchor = (videoRenderer.querySelector('#channel-info #channel-name a[href], ytd-channel-name#channel-name a[href]') as HTMLAnchorElement | null)
+                const nameContainer = nameAnchor?.closest('#channel-info') as HTMLElement | null
+                  || nameAnchor?.closest('ytd-channel-name#channel-name') as HTMLElement | null
+                if (nameAnchor && (nameContainer || nameAnchor.parentElement)) {
+                  // Resolve channel to target
+                  let channelId: string | null = null
+                  try {
+                    const cu = new URL(nameAnchor.getAttribute('href') || nameAnchor.href, location.origin)
+                    if (cu.pathname.startsWith('/channel/')) channelId = cu.pathname.split('/')[2] || null
+                    else if (cu.pathname.startsWith('/@')) channelId = await upgradeChannelIdFromRenderer(nameAnchor, cu.pathname.substring(1))
+                    else {
+                      const fallback = videoRenderer.querySelector('a[href^="/channel/"]') as HTMLAnchorElement | null
+                      if (fallback) {
+                        try { const fu = new URL(fallback.getAttribute('href') || fallback.href, location.origin); const uc = fu.pathname.split('/')[2]; if (uc) channelId = uc } catch {}
+                      }
+                    }
+                  } catch {}
+                  if (channelId) {
+                    const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
+                    const chRes = await getTargetsBySources({ platform: srcPlatform, id: channelId, type: 'channel', url: new URL(location.href), time: null })
+                    const chTarget = chRes[channelId] || null
+                    // Choose best available target: direct resolve -> handle URL -> search URL
+                    let chUrl: URL | null = null
+                    if (chTarget) {
+                      chUrl = getOdyseeUrlByTarget(chTarget)
+                      if (WOL_DEBUG) dbg('WOL results inline channel target: direct', { channelId, url: chUrl.href })
+                    } else {
+                      // Try handle-based URL
+                      let handle: string | null = null
+                      try {
+                        const cu = new URL(nameAnchor.getAttribute('href') || nameAnchor.href, location.origin)
+                        if (cu.pathname.startsWith('/@')) handle = cu.pathname.substring(1)
+                      } catch {}
+                      if (handle) {
+                        try { chUrl = new URL(`${platform.domainPrefix}/@${handle}`.replace('/@/@','/@')) } catch {}
+                        if (WOL_DEBUG) dbg('WOL results inline channel target: handle', { handle, url: chUrl?.href })
+                      }
+                      // Fallback: Odysee search
+                      if (!chUrl) {
+                        const q = encodeURIComponent(nameAnchor.textContent?.trim() || handle || channelId)
+                        try { chUrl = new URL(`${platform.domainPrefix}/$/search?q=${q}`) } catch {}
+                        if (WOL_DEBUG) dbg('WOL results inline channel target: search', { q, url: chUrl?.href })
+                      }
+                    }
+                    if (chUrl) {
+                      const channelNameEl = (videoRenderer.querySelector('ytd-channel-name#channel-name') as HTMLElement | null)
+                      const container = (videoRenderer.querySelector('ytd-channel-name#channel-name #container') as HTMLElement | null)
+                        || channelNameEl
+                        || (nameAnchor.parentElement as HTMLElement)
+                      const ensureInline = () => {
+                        try {
+                          if (!container) return
+                          if (container.querySelector('[data-wol-inline-channel]')) return
+                          // Make sure the row can accommodate an inline control
+                          try {
+                            const cs = window.getComputedStyle(container)
+                            if (cs.display !== 'flex' && cs.display !== 'inline-flex') container.style.display = 'inline-flex'
+                            container.style.alignItems = 'center'
+                            ;(container as HTMLElement).style.gap = (cs.columnGap && cs.columnGap !== 'normal') ? cs.columnGap : '6px'
+                            container.style.overflow = 'visible'
+                          } catch {}
+                          const inline = document.createElement('a')
+                          inline.setAttribute('data-wol-inline-channel', '1')
+                          inline.href = chUrl!.href
+                          inline.target = '_blank'
+                          inline.title = `Open channel on ${platform.button.platformNameText}`
+                          inline.style.display = 'inline-flex'
+                          inline.style.alignItems = 'center'
+                          inline.style.justifyContent = 'center'
+                          inline.style.marginLeft = '6px'
+                          inline.style.flex = '0 0 auto'
+                          inline.style.alignSelf = 'center'
+                          inline.style.verticalAlign = 'middle'
+                          inline.style.width = '22px'
+                          inline.style.height = '22px'
+                          inline.style.borderRadius = '11px'
+                          inline.style.background = platform.theme
+                          inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+                          const icon = document.createElement('img')
+                          icon.src = platform.button.icon
+                          icon.style.width = '14px'
+                          icon.style.height = '14px'
+                          icon.style.pointerEvents = 'none'
+                          inline.appendChild(icon)
+                          const textContainer = container.querySelector('#text-container') as HTMLElement | null
+                          if (textContainer && textContainer.parentElement === container) {
+                            textContainer.insertAdjacentElement('afterend', inline)
+                          } else {
+                            container.appendChild(inline)
+                          }
+                          // If still not visible inside #container, fall back to placing after the channel-name element (before badges)
+                          setTimeout(() => {
+                            try {
+                              const r = inline.getBoundingClientRect()
+                              const hidden = (r.width < 8 || r.height < 8 || getComputedStyle(inline).display === 'none')
+                              if (hidden && channelNameEl && channelNameEl.parentElement) {
+                                const siblingBadge = channelNameEl.parentElement.querySelector('ytd-badge-supported-renderer') as HTMLElement | null
+                                if (siblingBadge) channelNameEl.parentElement.insertBefore(inline, siblingBadge)
+                                else channelNameEl.insertAdjacentElement('afterend', inline)
+                                if (WOL_DEBUG) dbg('WOL results inline channel fallback after channel-name', { videoId: id, channelId })
+                              }
+                            } catch {}
+                          }, 50)
+                          if (WOL_DEBUG) dbg('WOL results inline channel injected', { videoId: id, channelId, url: chUrl!.href })
+                        } catch (err) { if (WOL_DEBUG) dbg('WOL results inline channel inject error', err) }
+                      }
+                      ensureInline()
+                      try { const mo = new MutationObserver(() => ensureInline()); mo.observe(container!, { childList: true, subtree: true }) } catch {}
+                    }
+                    else if (WOL_DEBUG) dbg('WOL results inline channel resolve failed', { channelId })
+                  }
+                  else if (WOL_DEBUG) dbg('WOL results could not determine channel id from nameAnchor', { href: nameAnchor?.href })
+                }
+                else if (WOL_DEBUG) dbg('WOL results channel name anchor not found inside videoRenderer')
+              }
+            }
+            // Handle Shorts in grid shelf rows: add a bottom-right Watch pill
+            // Shorts grid shelf tiles: place pill inside the larger tile container (not the anchor) to avoid autoplay overlap
+            const gridItem = a.closest('.ytGridShelfViewModelGridShelfItem') as HTMLElement | null
+            if (settings.buttonVideoSub && gridItem && !gridItem.querySelector('[data-wol-inline-shorts-watch]')) {
+              try {
+                // Ensure grid item can host an absolute child
+                const hostEl = gridItem
+                const cs = window.getComputedStyle(hostEl)
+                if (cs.position === 'static') hostEl.style.position = 'relative'
+                const sbtn = document.createElement('a')
+                sbtn.setAttribute('data-wol-inline-shorts-watch', '1')
+                sbtn.href = url.href
+                sbtn.target = '_blank'
+                sbtn.title = `Watch on ${platform.button.platformNameText}`
+                sbtn.style.position = 'absolute'
+                sbtn.style.right = '8px'
+                sbtn.style.bottom = '8px'
+                sbtn.style.zIndex = '5'
+                sbtn.style.display = 'inline-flex'
+                sbtn.style.alignItems = 'center'
+                sbtn.style.justifyContent = 'center'
+                sbtn.style.gap = '4px'
+                sbtn.style.height = '22px'
+                sbtn.style.lineHeight = '22px'
+                sbtn.style.padding = '0 8px'
+                sbtn.style.borderRadius = '11px'
+                sbtn.style.fontSize = '11px'
+                sbtn.style.fontWeight = '500'
+                sbtn.style.color = 'whitesmoke'
+                sbtn.style.textDecoration = 'none'
+                sbtn.style.background = platform.theme
+                const si = document.createElement('img')
+                si.src = platform.button.icon
+                si.style.width = '12px'
+                si.style.height = '12px'
+                si.style.pointerEvents = 'none'
+                const st = document.createElement('span')
+                st.textContent = 'Watch'
+                sbtn.appendChild(si)
+                sbtn.appendChild(st)
+                sbtn.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(url, 'user') })
+                hostEl.appendChild(sbtn)
+                if (WOL_DEBUG) dbg('WOL results shorts shelf watch added (grid item container)', { videoId: id })
+              } catch (e) { if (WOL_DEBUG) dbg('WOL results shorts shelf watch error', e) }
+            }
+          } catch (e) { logger.warn('WOL results inline inject failed', e) }
+          ;(a as any).dataset.wolEnhanced = 'done'
+          continue
+        }
+        // For channel items on results we keep existing channel renderer injection below
       }
 
       // For channels, we need to find a different host element (subscribe button area)
@@ -1349,6 +1654,14 @@ import { logger } from '../modules/logger'
         const videoResult = a.closest('ytd-video-renderer') as HTMLElement | null
         dbg('Watch on Odysee: Channel renderer found:', !!channelRenderer, 'Inside video result:', !!videoResult)
         if (channelRenderer) {
+          if (!settings.buttonChannelSub) {
+            // If disabled, ensure any injected channel buttons are removed
+            try {
+              channelRenderer.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove())
+              channelRenderer.removeAttribute('data-wol-channel-button')
+            } catch {}
+            continue
+          }
           // De-dupe: only inject one channel button per renderer
           if (channelRenderer.getAttribute('data-wol-channel-button') === '1') {
             continue
@@ -1362,6 +1675,7 @@ import { logger } from '../modules/logger'
 
                      // Create channel redirect button (compact)
            const channelButton = document.createElement('div')
+           channelButton.setAttribute('data-wol-results-channel-btn','1')
            channelButton.style.display = 'inline-flex'
            channelButton.style.alignItems = 'center'
            channelButton.style.marginRight = '6px'
@@ -1476,6 +1790,11 @@ import { logger } from '../modules/logger'
             // Keep the button present through renderer DOM churn (hover, dynamic updates)
             try {
               const ensurePresent = () => {
+                // Respect current setting; do not re-insert when channel buttons are disabled
+                if (!settings.buttonChannelSub) {
+                  try { channelButton.remove() } catch {}
+                  return
+                }
                 const stillThere = channelButton.isConnected && channelRenderer.contains(channelButton)
                 const subBtn = channelRenderer.querySelector('#subscribe-button') as HTMLElement | null
                 const btns = (channelRenderer.querySelector('#buttons') as HTMLElement | null)
@@ -2222,6 +2541,7 @@ import { logger } from '../modules/logger'
 
   async function processCurrentPage() {
     if (extensionContextInvalidated) return
+    logger.log('Watch on Odysee: processCurrentPage() called for URL:', location.href)
     try {
       const urlNow = new URL(location.href)
 
@@ -2337,7 +2657,11 @@ import { logger } from '../modules/logger'
         }
       }
 
-      if (subscribeTargets.length === 0 && !playerTarget) { updateButtons(null); ensureOverlayEnhancementActive(); return }
+      if (subscribeTargets.length === 0 && !playerTarget) {
+        updateButtons(null)
+        ensureOverlayEnhancementActive()
+        // do not return; allow redirect assessment to run
+      }
 
       updateButtons(null)
       if (playerTarget?.type === 'video') {
@@ -2350,24 +2674,25 @@ import { logger } from '../modules/logger'
       // Redirect (guarded)
       let shouldRedirect = false
       let redirectTarget: Target | null = null
-      if (settings.redirectVideo && source.type === 'video' && !source.url.searchParams.has('list') && playerTarget) { shouldRedirect = true; redirectTarget = playerTarget }
+      // Prefer resolved video target; do not require playerTarget (timestamp optional)
+      logger.log('Watch on Odysee: Checking redirect conditions - redirectVideo:', settings.redirectVideo, 'redirectChannel:', settings.redirectChannel, 'source.type:', source.type, 'source.id:', source.id)
+      
+      if (settings.redirectVideo && source.type === 'video' && !source.url.searchParams.has('list')) {
+        const vidTarget = resolved[source.id] ?? null
+        logger.log('Watch on Odysee: Video redirect check - vidTarget:', vidTarget)
+        if (vidTarget?.type === 'video') { shouldRedirect = true; redirectTarget = vidTarget }
+      }
       if (!shouldRedirect && settings.redirectChannel && source.type === 'channel') {
         const channelRedirect = resolved[source.id] ?? null
+        logger.log('Watch on Odysee: Channel redirect check - channelRedirect:', channelRedirect)
         if (channelRedirect) { shouldRedirect = true; redirectTarget = channelRedirect }
       }
+      
+      logger.log('Watch on Odysee: Redirect decision - shouldRedirect:', shouldRedirect, 'redirectTarget:', redirectTarget)
       if (shouldRedirect && redirectTarget) {
-        // Global boot-time suppression to avoid burst opens after extension reload
-        if (Date.now() - EXT_BOOT_AT < AUTO_BOOT_SUPPRESS_MS) return
-        // Check DOM-based suppression that persists across extension reloads
-        const supDom = getDomAutoSuppressUntil()
-        if (Date.now() < supDom) return
-        // Also honor page localStorage suppression (persists across extension reloads per-origin)
-        const supLocal = getLocalAutoSuppressUntil()
-        if (Date.now() < supLocal) return
-        // Check extension storage-based suppression across contexts
-        try { const supGlobal = await getGlobalAutoSuppressUntil(); if (Date.now() < supGlobal) return } catch {}
         const now = Date.now()
-        if (!redirectedUrls.has(currentUrl) && (now - lastRedirectTime >= 5000)) {
+        logger.log('Watch on Odysee: Final redirect check - currentUrl:', currentUrl, 'redirectedUrls.has(currentUrl):', redirectedUrls.has(currentUrl), 'time since last redirect:', now - lastRedirectTime)
+        if (!redirectedUrls.has(currentUrl) && (now - lastRedirectTime >= 3000)) {
           const odyseeURL = getOdyseeUrlByTarget(redirectTarget)
           redirectedUrls.add(currentUrl)
           lastRedirectTime = now
@@ -2550,11 +2875,10 @@ import { logger } from '../modules/logger'
       }
 
       if (subscribeTargets.length === 0 && !playerTarget) {
-        // Even if there is no player/subscribe target (e.g., current video not resolvable),
-        // we still want overlays on related/listing items.
+        // No buttons to render now; keep overlays, but still assess redirect below
         updateButtons(null)
         ensureOverlayEnhancementActive()
-        continue
+        // do not continue; allow redirect
       }
 
       // Update Buttons
@@ -2574,9 +2898,9 @@ import { logger } from '../modules/logger'
       // Redirect
       let shouldRedirect = false
       let redirectTarget: Target | null = null
-      if (settings.redirectVideo && source.type === 'video' && !source.url.searchParams.has('list') && playerTarget) {
-        shouldRedirect = true
-        redirectTarget = playerTarget
+      if (settings.redirectVideo && source.type === 'video' && !source.url.searchParams.has('list')) {
+        const vidTarget = resolved[source.id] ?? null
+        if (vidTarget?.type === 'video') { shouldRedirect = true; redirectTarget = vidTarget }
       }
       if (!shouldRedirect && settings.redirectChannel && source.type === 'channel') {
         const channelRedirect = resolved[source.id] ?? null

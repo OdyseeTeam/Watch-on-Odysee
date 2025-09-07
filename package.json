@@ -21,7 +21,13 @@
     "start:chrome": "web-ext run -t chromium --source-dir ./dist",
     "start:brave": "web-ext run --target=chromium --chromium-binary=/usr/bin/brave --source-dir=./dist",
     "start:firefox": "web-ext run --source-dir ./dist",
-    "test": "jest"
+    "test": "jest",
+    "test:e2e": "npm run test:e2e:install && npm run build:v3 && playwright test",
+    "test:e2e:headless": "cross-env E2E_HEADLESS=1 npm run test:e2e",
+    "test:e2e:install": "node scripts/pw-install.js",
+    "test:e2e:report": "(npm run test:e2e || true) && node scripts/analyze-e2e.js",
+    "test:e2e:report:stubs": "cross-env E2E_USE_STUBS=1 npm run test:e2e:report",
+    "ci:e2e": "node scripts/ci-e2e.js"
   },
   "browserslist": [
     ">1%",
@@ -45,6 +51,7 @@
     "parcel-bundler": "^1.12.4",
     "preact": "^10.5.4",
     "typescript": "^4.0.3",
-    "web-ext": "^5.2.0"
+    "web-ext": "^5.2.0",
+    "@playwright/test": "^1.47.2"
   }
 }

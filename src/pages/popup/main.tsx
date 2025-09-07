@@ -51,7 +51,7 @@ function WatchOnOdyseePopup(params: {}) {
           <label>Show redirect option for:</label>
           <div className='options'>
             <div className="toggle-option">
-              <span>Video Pages</span>
+              <span>Videos</span>
               <a onClick={() => setExtensionSetting('buttonVideoSub', !buttonVideoSub)} className={`button ${buttonVideoSub ? 'active' : ''}`}>
                 {buttonVideoSub ? 'Active' : 'Deactive'}
               </a>
