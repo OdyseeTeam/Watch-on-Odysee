@@ -462,6 +462,30 @@ test('results page: inline Watch/Channel pills toggle without refresh', async ()
   await ensurePopupToggle('Channels', true)
 })
 
+test('results page: master switch hides all pills regardless of Videos/Channels', async () => {
+  // Ensure Videos and Channels are enabled
+  await ensurePopupToggle('Videos', true)
+  await ensurePopupToggle('Channels', true)
+
+  await page.goto('https://www.youtube.com/results?search_query=the+White+House')
+  await dismissYouTubeConsentIfPresent(page)
+
+  // Wait for any pill to appear first
+  const anyPill = page.locator('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch], a[data-wol-inline-channel], [data-wol-results-channel-btn]')
+  await expect(anyPill.first()).toBeVisible({ timeout: 60_000 })
+
+  // Open popup and toggle master switch OFF
+  // Map the new label to a storage key helper is not present; do storage flip directly
+  await page.evaluate(() => new Promise<void>(resolve => chrome.storage.local.set({ resultsApplySelections: false }, () => resolve())))
+
+  // All pills should disappear
+  await expect(anyPill).toHaveCount(0)
+
+  // Flip it back ON and ensure some pill re-appears
+  await page.evaluate(() => new Promise<void>(resolve => chrome.storage.local.set({ resultsApplySelections: true }, () => resolve())))
+  await expect(anyPill.first()).toBeVisible({ timeout: 60_000 })
+})
+
 test('redirects to Odysee when redirectVideo is enabled', async () => {
   // Pre-check with real API to avoid false negatives when not mirrored
   if (process.env.E2E_USE_STUBS !== '1') {

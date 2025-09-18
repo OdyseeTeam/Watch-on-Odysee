@@ -8,7 +8,7 @@ export interface ExtensionSettings extends Record<string, string | number | bool
   redirectVideo: boolean,
   redirectChannel: boolean,
   buttonVideoSub: boolean
-  buttonVideoPlayer: boolean // deprecated (overlay always on when needed)
+  buttonVideoPlayer: boolean
   buttonChannelSub: boolean
   buttonOverlay: boolean
   resultsApplySelections: boolean
