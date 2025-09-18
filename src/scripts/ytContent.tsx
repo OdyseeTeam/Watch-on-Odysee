@@ -94,6 +94,34 @@ import { logger } from '../modules/logger'
     }
   }
 
+  // Ensure results page pills visibility follows resultsApplySelections immediately
+  function ensureResultsPillsVisibility() {
+    const id = 'wol-results-pills-visibility'
+    const existing = document.getElementById(id)
+    // Only relevant on search results page
+    if (location.pathname !== '/results') {
+      if (existing) try { existing.remove() } catch {}
+      return
+    }
+    if (!settings.resultsApplySelections) {
+      if (!existing) {
+        const style = document.createElement('style')
+        style.id = id
+        style.textContent = `
+          a[data-wol-inline-watch],
+          a[data-wol-inline-shorts-watch],
+          a[data-wol-inline-channel],
+          [data-wol-results-channel-btn] {
+            display: none !important;
+          }
+        `
+        try { document.documentElement.appendChild(style) } catch {}
+      }
+    } else {
+      if (existing) try { existing.remove() } catch {}
+    }
+  }
+
   function ensureRelatedBatchCssInjected() {
     const id = 'wol-related-batch-style'
     if (!document.getElementById(id)) {
@@ -148,6 +176,8 @@ import { logger } from '../modules/logger'
       setTimeout(() => enhanceVideoTilesOnListings().catch(e => logger.error(e)), 600)
       // Also refresh page-level buttons/redirects once per navigation
       scheduleProcessCurrentPage(100)
+      // Ensure results pills visibility reflects current setting on navigation
+      try { ensureResultsPillsVisibility() } catch {}
     }
     document.addEventListener('yt-navigate-finish', bumpGen as EventListener)
     document.addEventListener('yt-page-data-updated', bumpGen as EventListener)
@@ -164,6 +194,7 @@ import { logger } from '../modules/logger'
       let needsButtonUpdate = false
       let needsOverlayUpdate = false
       
+      let needsResultsEnforcementUpdate = false
       for (const [key, change] of Object.entries(changes)) {
         if (key === 'buttonOverlay') {
           needsOverlayUpdate = true
@@ -176,6 +207,26 @@ import { logger } from '../modules/logger'
             // Use the comprehensive cleanup function
             logger.log('Watch on Odysee: Overlay setting disabled, cleaning up overlays')
             cleanupOverlays()
+          }
+        }
+        // Apply/unapply results filtering immediately on relevant toggle flips
+        if (key === 'resultsApplySelections' || key === 'buttonVideoSub' || key === 'buttonChannelSub') {
+          if (location.pathname === '/results') {
+            try {
+              // First, unhide anything previously hidden so we re-evaluate cleanly
+              document.querySelectorAll('ytd-video-renderer[data-wol-hidden], .ytGridShelfViewModelGridShelfItem[data-wol-hidden], ytd-channel-renderer[data-wol-hidden]')
+                .forEach(el => { try { el.removeAttribute('data-wol-hidden'); (el as HTMLElement).style.removeProperty('display') } catch {} })
+              // If results application disabled, remove any existing inline pills immediately
+              if (key === 'resultsApplySelections' && (change as any)?.newValue === false) {
+                document.querySelectorAll('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch]').forEach(el => el.remove())
+                document.querySelectorAll('a[data-wol-inline-channel], [data-wol-results-channel-btn]').forEach(el => el.remove())
+                document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
+                  .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
+              }
+              // Update CSS guard
+              try { ensureResultsPillsVisibility() } catch {}
+            } catch {}
+            needsResultsEnforcementUpdate = true
           }
         }
         
@@ -255,6 +306,12 @@ import { logger } from '../modules/logger'
            } catch {}
          }
        }
+
+      // If only resultsApplySelections changed (and no button toggles), still re-run processing on /results
+      if (needsResultsEnforcementUpdate && location.pathname === '/results' && !needsButtonUpdate) {
+        scheduleProcessCurrentPage(0)
+        try { setTimeout(() => enhanceVideoTilesOnListings().catch(e => logger.error(e)), 100) } catch {}
+      }
 
       // Try to immediately reflect settings changes without waiting for next loop
       if (lastRenderContext) {
@@ -970,7 +1027,10 @@ import { logger } from '../modules/logger'
             }
           }
         }
-        if (shouldEnhance) enhanceVideoTilesOnListings().catch((e) => logger.error(e))
+        if (shouldEnhance) {
+          try { ensureResultsPillsVisibility() } catch {}
+          enhanceVideoTilesOnListings().catch((e) => logger.error(e))
+        }
       })
 
       // Also poll for SPA navigation changes (tabs/filters)
@@ -987,6 +1047,7 @@ import { logger } from '../modules/logger'
           lastEnhanceTime = 0; lastEnhanceUrl = ''
           enhanceVideoTilesOnListings().catch((e) => logger.error(e))
           scheduleProcessCurrentPage(50)
+          try { ensureResultsPillsVisibility() } catch {}
           // A single immediate pass is enough; observers will catch late content
         }
       }, 1000)
@@ -1033,10 +1094,24 @@ import { logger } from '../modules/logger'
       }
     }
 
+    // If on results and the setting is disabled, remove any inline UI and stop
+    if (location.pathname === '/results' && !settings.resultsApplySelections) {
+      try {
+        document.querySelectorAll('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch]').forEach(el => el.remove())
+        document.querySelectorAll('a[data-wol-inline-channel], [data-wol-results-channel-btn]').forEach(el => el.remove())
+        document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
+          .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
+        document.querySelectorAll('[data-wol-overlay]').forEach(el => el.remove())
+      } catch {}
+      return
+    }
+
     // Debug logging for search pages
     if (WOL_DEBUG && window.location.pathname === '/results') {
       dbg('Watch on Odysee: Processing search results page:', window.location.href)
     }
+    // CSS guard for results pills visibility
+    try { ensureResultsPillsVisibility() } catch {}
 
     // Use intelligent overlay management instead of blind cleanup
     manageOverlaysIntelligently()
@@ -1054,6 +1129,15 @@ import { logger } from '../modules/logger'
           ;(el as HTMLElement).removeAttribute('data-wol-tile-pinned')
           ;(el as HTMLElement).removeAttribute('data-wol-hidden')
         })
+        // Enforce current toggles by cleaning up inline pills when disabled or results application disabled
+        if (!settings.resultsApplySelections || !settings.buttonVideoSub) {
+          document.querySelectorAll('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch]').forEach(el => el.remove())
+        }
+        if (!settings.resultsApplySelections || !settings.buttonChannelSub) {
+          document.querySelectorAll('a[data-wol-inline-channel], [data-wol-results-channel-btn]').forEach(el => el.remove())
+          document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
+            .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
+        }
       } catch {}
     }
 
@@ -1401,6 +1485,36 @@ import { logger } from '../modules/logger'
     for (const { a, id, type } of normalizedToProcess) {
       if (gen !== overlayGeneration) break
       const res = resolvedLocal.get(`${type}:${id}`) ?? null
+      // Results page filtering/enforcement: hide or show result tiles based on toggles
+      if (location.pathname === '/results' && settings.resultsApplySelections) {
+        try {
+          if (type === 'video') {
+            const videoRenderer = a.closest('ytd-video-renderer') as HTMLElement | null
+            const gridShelfItem = a.closest('.ytGridShelfViewModelGridShelfItem') as HTMLElement | null
+            const container = (videoRenderer || gridShelfItem) as HTMLElement | null
+            if (container) {
+              const shouldShow = !!settings.buttonVideoSub
+              if (!shouldShow) {
+                try { container.setAttribute('data-wol-hidden', '1'); container.style.display = 'none' } catch {}
+                continue
+              } else {
+                try { container.removeAttribute('data-wol-hidden'); container.style.removeProperty('display') } catch {}
+              }
+            }
+          } else if (type === 'channel') {
+            const channelRenderer = a.closest('ytd-channel-renderer') as HTMLElement | null
+            if (channelRenderer) {
+              const shouldShow = !!settings.buttonChannelSub
+              if (!shouldShow) {
+                try { channelRenderer.setAttribute('data-wol-hidden', '1'); channelRenderer.style.display = 'none' } catch {}
+                continue
+              } else {
+                try { channelRenderer.removeAttribute('data-wol-hidden'); channelRenderer.style.removeProperty('display') } catch {}
+              }
+            }
+          }
+        } catch {}
+      }
       if (!res) { 
         continue 
       }
@@ -1409,6 +1523,11 @@ import { logger } from '../modules/logger'
 
       // On /results, render inline buttons instead of overlays for video tiles
       if (location.pathname === '/results') {
+        // If results application is disabled, never inject any pills on results
+        if (!settings.resultsApplySelections) {
+          ;(a as any).dataset.wolEnhanced = 'done'
+          continue
+        }
         if (type === 'video') {
           try {
             const videoRenderer = a.closest('ytd-video-renderer') as HTMLElement | null
@@ -1478,7 +1597,9 @@ import { logger } from '../modules/logger'
 
                 // Insert compact channel icon to the left of the channel avatar (in channel-info)
                 try {
-                  if (!videoRenderer.querySelector('[data-wol-inline-channel]')) {
+                  if (!settings.resultsApplySelections || !settings.buttonChannelSub) {
+                    // Respect toggles: do not insert when disabled
+                  } else if (!videoRenderer.querySelector('[data-wol-inline-channel]')) {
                     // Try to extract channel id from anchors in this renderer
                     let chId: string | null = null
                     const nameA = videoRenderer.querySelector('#channel-info #channel-name a[href], ytd-channel-name#channel-name a[href]') as HTMLAnchorElement | null
@@ -1561,7 +1682,7 @@ import { logger } from '../modules/logger'
               }
 
               // 2) Channel inline icon (results)
-              if (settings.buttonChannelSub && !videoRenderer.querySelector('[data-wol-inline-channel]')) {
+              if (settings.resultsApplySelections && settings.buttonChannelSub && !videoRenderer.querySelector('[data-wol-inline-channel]')) {
                 const nameAnchor = (videoRenderer.querySelector('#channel-info #channel-name a[href], ytd-channel-name#channel-name a[href]') as HTMLAnchorElement | null)
                 const nameContainer = nameAnchor?.closest('#channel-info') as HTMLElement | null
                   || nameAnchor?.closest('ytd-channel-name#channel-name') as HTMLElement | null
@@ -1611,7 +1732,9 @@ import { logger } from '../modules/logger'
                       const container = (videoRenderer.querySelector('ytd-channel-name#channel-name #container') as HTMLElement | null)
                         || channelNameEl
                         || (nameAnchor.parentElement as HTMLElement)
-                      const ensureInline = () => {
+                  const ensureInline = () => {
+                    // Respect live setting: do not (re)insert when toggles are off or results app disabled
+                    if (!settings.resultsApplySelections || !settings.buttonChannelSub) return
                         try {
                           if (!container) return
                           if (container.querySelector('[data-wol-inline-channel]')) return
@@ -1694,7 +1817,9 @@ import { logger } from '../modules/logger'
                 sbtn.title = `Watch on ${platform.button.platformNameText}`
                 sbtn.style.position = 'absolute'
                 sbtn.style.right = '8px'
-                sbtn.style.bottom = '8px'
+                // Place at bottom-right of the OUTER tile (grid item), opposite the view count
+                // Avoid aligning to the thumbnail to prevent drifting into the autoplay region
+                sbtn.style.bottom = '4px'
                 sbtn.style.zIndex = '5'
                 sbtn.style.display = 'inline-flex'
                 sbtn.style.alignItems = 'center'
@@ -1739,7 +1864,7 @@ import { logger } from '../modules/logger'
         const videoResult = a.closest('ytd-video-renderer') as HTMLElement | null
         dbg('Watch on Odysee: Channel renderer found:', !!channelRenderer, 'Inside video result:', !!videoResult)
         if (channelRenderer) {
-          if (!settings.buttonChannelSub) {
+          if (!settings.resultsApplySelections || !settings.buttonChannelSub) {
             // If disabled, ensure any injected channel buttons are removed
             try {
               channelRenderer.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove())

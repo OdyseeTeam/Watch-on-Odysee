@@ -5,7 +5,7 @@ import { logger } from '../../modules/logger'
 import { setExtensionSetting, targetPlatformSettings, useExtensionSettings } from '../../settings'
 
 function WatchOnOdyseePopup(params: {}) {
-  const { redirectVideo, redirectChannel, buttonVideoSub, buttonChannelSub, buttonVideoPlayer, buttonOverlay } = useExtensionSettings()
+  const { redirectVideo, redirectChannel, buttonVideoSub, buttonChannelSub, buttonVideoPlayer, buttonOverlay, resultsApplySelections } = useExtensionSettings()
   let [loading, updateLoading] = useState(() => false)
 
   async function loads<T>(operation: Promise<T>) {
@@ -72,6 +72,17 @@ function WatchOnOdyseePopup(params: {}) {
               <span>Video Previews</span>
               <a onClick={() => setExtensionSetting('buttonOverlay', !buttonOverlay)} className={`button ${buttonOverlay ? 'active' : ''}`}>
                 {buttonOverlay ? 'Active' : 'Deactive'}
+              </a>
+            </div>
+          </div>
+        </section>
+        <section>
+          <label>Search Results</label>
+          <div className='options'>
+            <div className="toggle-option">
+              <span>Apply selections to Search Results</span>
+              <a onClick={() => setExtensionSetting('resultsApplySelections', !resultsApplySelections)} className={`button ${resultsApplySelections ? 'active' : ''}`}>
+                {resultsApplySelections ? 'Active' : 'Deactive'}
               </a>
             </div>
           </div>

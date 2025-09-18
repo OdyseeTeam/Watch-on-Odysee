@@ -7,23 +7,23 @@ export interface ExtensionSettings extends Record<string, string | number | bool
   urlResolver: YTUrlResolverName,
   redirectVideo: boolean,
   redirectChannel: boolean,
-  redirectVideoPlaylist: boolean,
   buttonVideoSub: boolean
   buttonVideoPlayer: boolean // deprecated (overlay always on when needed)
   buttonChannelSub: boolean
   buttonOverlay: boolean
+  resultsApplySelections: boolean
 }
 
 export const DEFAULT_SETTINGS: ExtensionSettings = {
   targetPlatform: 'odysee',
   urlResolver: 'odyseeApi',
-  redirectVideo: true,
+  redirectVideo: false,
   redirectChannel: false,
-  redirectVideoPlaylist: false,
   buttonVideoSub: true,
   buttonVideoPlayer: true,
   buttonChannelSub: true,
   buttonOverlay: true,
+  resultsApplySelections: true,
 }
 
 export function getExtensionSettingsAsync(): Promise<ExtensionSettings> {
