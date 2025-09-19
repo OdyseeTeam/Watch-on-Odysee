@@ -15,7 +15,7 @@
     "pick:manifest:v3": "cp -b ./manifest.v3.json ./dist/manifest.json",
     "build:v2": "npm run clear:dist ; npm run build:base && npm run pick:manifest:v2",
     "build:v3": "npm run clear:dist ; npm run build:base && npm run pick:manifest:v3",
-    "build": "rm -r ./build ; mkdir ./build && npm run build:v2 && zip -r ./build/manifest-v2.zip ./dist && npm run build:v3 && zip -r ./build/manifest-v3.zip ./dist",
+    "build": "rm -r ./build ; mkdir ./build && npm run build:v2 && bestzip ./build/manifest-v2.zip ./dist/* && npm run build:v3 && bestzip ./build/manifest-v3.zip ./dist/*",
     "watch:v2": "npm run clear:dist ; npm run pick:manifest:v2 && npm-run-all -l -p watch:parcel watch:assets",
     "watch:v3": "npm run clear:dist ; npm run pick:manifest:v3 && npm-run-all -l -p watch:parcel watch:assets",
     "watch": "npm run watch:v3",
@@ -36,10 +36,12 @@
   ],
   "devDependencies": {
     "@babel/preset-typescript": "^7.10.4",
+    "@playwright/test": "^1.47.2",
     "@types/chrome": "0.0.124",
     "@types/classnames": "^2.2.10",
     "@types/jest": "^26.0.14",
     "@types/lodash": "^4.14.162",
+    "bestzip": "^2.2.1",
     "braces": "^3.0.3",
     "classnames": "^2.2.6",
     "cpx": "^1.5.0",
@@ -52,7 +54,6 @@
     "parcel-bundler": "^1.12.4",
     "preact": "^10.5.4",
     "typescript": "^4.0.3",
-    "web-ext": "^5.2.0",
-    "@playwright/test": "^1.47.2"
+    "web-ext": "^5.2.0"
   }
 }
