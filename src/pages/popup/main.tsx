@@ -35,15 +35,15 @@ function WatchOnOdyseePopup(params: {}) {
           <div className='options'>
             <div class="toggle-option">
               <span>Playing a video</span>
-              <a onClick={() => setExtensionSetting('redirectVideo', !redirectVideo)} className={`button ${redirectVideo ? 'active' : ''}`}>
+              <button type='button' onClick={() => setExtensionSetting('redirectVideo', !redirectVideo)} className={`button ${redirectVideo ? 'active' : ''}`} aria-pressed={redirectVideo}>
                 {redirectVideo ? 'Active' : 'Deactive'}
-              </a>
+              </button>
             </div>
             <div class="toggle-option">
               <span>Viewing a channel</span>
-              <a onClick={() => setExtensionSetting('redirectChannel', !redirectChannel)} className={`button ${redirectChannel ? 'active' : ''}`}>
+              <button type='button' onClick={() => setExtensionSetting('redirectChannel', !redirectChannel)} className={`button ${redirectChannel ? 'active' : ''}`} aria-pressed={redirectChannel}>
                 {redirectChannel ? 'Active' : 'Deactive'}
-              </a>
+              </button>
             </div>
           </div>
         </section>
@@ -52,27 +52,27 @@ function WatchOnOdyseePopup(params: {}) {
           <div className='options'>
             <div className="toggle-option">
               <span>Videos</span>
-              <a onClick={() => setExtensionSetting('buttonVideoSub', !buttonVideoSub)} className={`button ${buttonVideoSub ? 'active' : ''}`}>
+              <button type='button' onClick={() => setExtensionSetting('buttonVideoSub', !buttonVideoSub)} className={`button ${buttonVideoSub ? 'active' : ''}`} aria-pressed={buttonVideoSub}>
                 {buttonVideoSub ? 'Active' : 'Deactive'}
-              </a>
+              </button>
             </div>
             <div className="toggle-option">
               <span>Channels</span>
-              <a onClick={() => setExtensionSetting('buttonChannelSub', !buttonChannelSub)} className={`button ${buttonChannelSub ? 'active' : ''}`}>
+              <button type='button' onClick={() => setExtensionSetting('buttonChannelSub', !buttonChannelSub)} className={`button ${buttonChannelSub ? 'active' : ''}`} aria-pressed={buttonChannelSub}>
                 {buttonChannelSub ? 'Active' : 'Deactive'}
-              </a>
+              </button>
             </div>
             <div className="toggle-option">
               <span>Video Player</span>
-              <a onClick={() => setExtensionSetting('buttonVideoPlayer', !buttonVideoPlayer)} className={`button ${buttonVideoPlayer ? 'active' : ''}`}>
+              <button type='button' onClick={() => setExtensionSetting('buttonVideoPlayer', !buttonVideoPlayer)} className={`button ${buttonVideoPlayer ? 'active' : ''}`} aria-pressed={buttonVideoPlayer}>
                 {buttonVideoPlayer ? 'Active' : 'Deactive'}
-              </a>
+              </button>
             </div>
             <div className="toggle-option">
               <span>Video Previews</span>
-              <a onClick={() => setExtensionSetting('buttonOverlay', !buttonOverlay)} className={`button ${buttonOverlay ? 'active' : ''}`}>
+              <button type='button' onClick={() => setExtensionSetting('buttonOverlay', !buttonOverlay)} className={`button ${buttonOverlay ? 'active' : ''}`} aria-pressed={buttonOverlay}>
                 {buttonOverlay ? 'Active' : 'Deactive'}
-              </a>
+              </button>
             </div>
           </div>
         </section>
@@ -81,17 +81,17 @@ function WatchOnOdyseePopup(params: {}) {
           <div className='options'>
             <div className="toggle-option">
               <span>Apply selections to Search Results</span>
-              <a onClick={() => setExtensionSetting('resultsApplySelections', !resultsApplySelections)} className={`button ${resultsApplySelections ? 'active' : ''}`}>
+              <button type='button' onClick={() => setExtensionSetting('resultsApplySelections', !resultsApplySelections)} className={`button ${resultsApplySelections ? 'active' : ''}`} aria-pressed={resultsApplySelections}>
                 {resultsApplySelections ? 'Active' : 'Deactive'}
-              </a>
+              </button>
             </div>
           </div>
         </section>
         <section>
           <label>Tools</label>
-          <a onClick={() => loads(odyseeUrlCache.clearAll())} className={`button active`}>
+          <button type='button' onClick={() => loads(odyseeUrlCache.clearAll())} className={`button active`}>
             Clear Resolver Cache
-          </a>
+          </button>
         </section>
       </main>
     }

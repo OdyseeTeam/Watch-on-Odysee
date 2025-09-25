@@ -170,10 +170,14 @@ import { logger } from '../modules/logger'
     const bumpGen = () => {
       overlayGeneration++
       cleanupOverlays()
+      // Also clear any managed channel buttons on results to avoid stale observers/elements
+      try { cleanupResultsChannelButtons() } catch {}
+      try { cleanupResultsVideoChips({ disconnectOnly: true }) } catch {}
       resetRelatedBatch()
       lastEnhanceTime = 0; lastEnhanceUrl = ''
       // Slight delay to allow related tiles to populate so more get overlays at once
       setTimeout(() => enhanceVideoTilesOnListings().catch(e => logger.error(e)), 600)
+      setTimeout(() => { try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {} }, 700)
       // Also refresh page-level buttons/redirects once per navigation
       scheduleProcessCurrentPage(100)
       // Ensure results pills visibility reflects current setting on navigation
@@ -209,11 +213,11 @@ import { logger } from '../modules/logger'
             cleanupOverlays()
           }
         }
-        // Apply/unapply results filtering immediately on relevant toggle flips
+        // Apply/unapply results inline UI immediately on relevant toggle flips
         if (key === 'resultsApplySelections' || key === 'buttonVideoSub' || key === 'buttonChannelSub') {
           if (location.pathname === '/results') {
             try {
-              // First, unhide anything previously hidden so we re-evaluate cleanly
+              // Ensure nothing is hidden by our extension; we no longer hide result tiles
               document.querySelectorAll('ytd-video-renderer[data-wol-hidden], .ytGridShelfViewModelGridShelfItem[data-wol-hidden], ytd-channel-renderer[data-wol-hidden]')
                 .forEach(el => { try { el.removeAttribute('data-wol-hidden'); (el as HTMLElement).style.removeProperty('display') } catch {} })
               // If results application disabled, remove any existing inline pills immediately
@@ -222,6 +226,25 @@ import { logger } from '../modules/logger'
                 document.querySelectorAll('a[data-wol-inline-channel], [data-wol-results-channel-btn]').forEach(el => el.remove())
                 document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
                   .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
+                // Disconnect per-renderer observers and clear state to prevent reinsertion from old observers
+                cleanupResultsChannelButtons()
+                cleanupResultsVideoChips()
+              }
+              // Enforce on every toggle flip
+              enforceResultsChannelChipVisibility()
+              // If results application was turned on, clear enhanced flags so reinjection can occur
+              if (key === 'resultsApplySelections' && (change as any)?.newValue === true) {
+                try {
+                  document.querySelectorAll('ytd-video-renderer a[data-wol-enhanced], ytd-channel-renderer a[data-wol-enhanced], .ytGridShelfViewModelGridShelfItem a[data-wol-enhanced]')
+                    .forEach(el => el.removeAttribute('data-wol-enhanced'))
+                  // Also clear any per-renderer state and disconnect stale observers before reinjecting
+                  cleanupResultsChannelButtons()
+                  cleanupResultsVideoChips({ disconnectOnly: true })
+                } catch {}
+                // Immediately re-run chip refresher; then run again shortly to catch late DOM
+                try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
+                try { setTimeout(() => refreshResultsVideoChannelChips().catch(e => logger.error(e)), 120) } catch {}
+                try { setTimeout(() => refreshResultsChannelRendererButtons().catch(e => logger.error(e)), 150) } catch {}
               }
               // Update CSS guard
               try { ensureResultsPillsVisibility() } catch {}
@@ -231,7 +254,7 @@ import { logger } from '../modules/logger'
         }
         
        // Handle button setting changes that require immediate UI updates
-        if (key === 'buttonChannelSub' || key === 'buttonVideoSub' || key === 'buttonVideoPlayer') {
+       if (key === 'buttonChannelSub' || key === 'buttonVideoSub' || key === 'buttonVideoPlayer') {
           needsButtonUpdate = true
           // Proactively clean or (re)inject inline UI on results when settings flip
           try {
@@ -249,6 +272,11 @@ import { logger } from '../modules/logger'
                   .forEach(el => (el as any).dataset.wolEnhanced = '')
                 document.querySelectorAll('.ytGridShelfViewModelGridShelfItem a[data-wol-enhanced="done"]')
                   .forEach(el => (el as any).dataset.wolEnhanced = '')
+                // Bypass enhancement throttling and immediately re-run for results
+                try { lastEnhanceTime = 0; lastEnhanceUrl = '' } catch {}
+                if (location.pathname === '/results') {
+                  setTimeout(() => enhanceVideoTilesOnListings().catch(e => logger.error(e)), 50)
+                }
               }
             }
             if (key === 'buttonChannelSub') {
@@ -257,20 +285,39 @@ import { logger } from '../modules/logger'
                 document.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove())
                 document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
                   .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
+                // Disconnect any observers tied to channel renderers; clear state
+                cleanupResultsChannelButtons()
+                cleanupResultsVideoChips()
                 // Shorts subscribe mount cleanup
                 try { render(<WatchOnOdyseeButtons />, shortsSubscribeMountPoint) } catch {}
+                // Strict enforcement: remove any stray chips
+                enforceResultsChannelChipVisibility()
               } else {
+                // Ensure results pills are not hidden by a lingering CSS guard
+                try { ensureResultsPillsVisibility() } catch {}
                 // Re-enabled: first clean up any existing buttons to prevent duplicates
                 document.querySelectorAll('a[data-wol-inline-channel]').forEach(el => el.remove())
                 document.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove())
                 document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
                   .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
+                // Disconnect old observers so they don't reinsert stale buttons
+                cleanupResultsChannelButtons({ disconnectOnly: true })
+                cleanupResultsVideoChips({ disconnectOnly: true })
                 
                 // Then clear enhanced flags so channels get re-processed
                 document.querySelectorAll('ytd-channel-renderer a[data-wol-enhanced="done"]')
                   .forEach(el => (el as any).dataset.wolEnhanced = '')
                 document.querySelectorAll('ytd-video-renderer a[data-wol-enhanced="done"]')
                   .forEach(el => (el as any).dataset.wolEnhanced = '')
+                // Bypass enhancement throttling and immediately re-run for results
+                try { lastEnhanceTime = 0; lastEnhanceUrl = '' } catch {}
+                if (location.pathname === '/results') {
+                  setTimeout(() => {
+                    // Run both the regular enhance pass and the direct channel-chip refresh
+                    try { enhanceVideoTilesOnListings().catch(e => logger.error(e)) } catch {}
+                    try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
+                  }, 50)
+                }
               }
             }
             if (key === 'buttonVideoPlayer' && change?.newValue === false) {
@@ -286,6 +333,8 @@ import { logger } from '../modules/logger'
           if ((change as any)?.newValue === true) {
             try { lastRedirectTime = 0; redirectedUrls.clear() } catch {}
           }
+          // Force next enhancement pass to run immediately (bypass throttling)
+          try { lastEnhanceTime = 0; lastEnhanceUrl = '' } catch {}
         }
       }
       
@@ -302,15 +351,24 @@ import { logger } from '../modules/logger'
          if (location.pathname === '/results') {
            try {
              // Force a slightly longer delay to ensure cleanup is complete first
-             setTimeout(() => enhanceVideoTilesOnListings().catch(e => logger.error(e)), 100)
+             setTimeout(() => {
+               try { enhanceVideoTilesOnListings().catch(e => logger.error(e)) } catch {}
+               try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
+               try { refreshResultsChannelRendererButtons().catch(e => logger.error(e)) } catch {}
+             }, 100)
            } catch {}
          }
-       }
+      }
 
       // If only resultsApplySelections changed (and no button toggles), still re-run processing on /results
       if (needsResultsEnforcementUpdate && location.pathname === '/results' && !needsButtonUpdate) {
+        // Reset throttling and force an immediate pass
+        try { lastEnhanceTime = 0; lastEnhanceUrl = '' } catch {}
         scheduleProcessCurrentPage(0)
-        try { setTimeout(() => enhanceVideoTilesOnListings().catch(e => logger.error(e)), 100) } catch {}
+        try { setTimeout(() => {
+          try { enhanceVideoTilesOnListings().catch(e => logger.error(e)) } catch {}
+          try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
+        }, 50) } catch {}
       }
 
       // Try to immediately reflect settings changes without waiting for next loop
@@ -367,7 +425,7 @@ import { logger } from '../modules/logger'
     const url = getOdyseeUrlByTarget(target)
         const isChannel = target.type === 'channel'
         return (
-          <div style={{ display: 'flex', height: '36px', alignContent: 'center', minWidth: 'fit-content', marginRight: '6px'}}>
+          <div style={{ display: 'flex', height: '100%', alignItems: 'center', alignContent: 'center', minWidth: 'fit-content', marginRight: '6px'}}>
       <a href={`${url.href}`} target='_blank' role='button'
         style={{
                 display: 'flex', alignItems: 'center', gap: compact ? '0' : '6px', borderRadius: '16px', padding: compact ? '0 4px' : '0 12px', height: '100%',
@@ -379,13 +437,13 @@ import { logger } from '../modules/logger'
             >
               {isChannel ? (
                 h(Fragment, null,
-                  h('img', { src: target.platform.button.icon, height: 18, style: { ...(target.platform.button.style?.icon || {}) } } as any),
+                  h('img', { src: target.platform.button.icon, height: 20, style: { ...(target.platform.button.style?.icon || {}) } } as any),
                   !compact && h('span', { style: { minWidth: 'fit-content', whiteSpace: 'nowrap' } as any }, 'Channel')
                 )
               ) : (
                 h(Fragment, null,
                   !compact && h('span', { style: { minWidth: 'fit-content', whiteSpace: 'nowrap' } as any }, 'Watch'),
-                  h('img', { src: target.platform.button.icon, height: 18, style: { ...(target.platform.button.style?.icon || {}) } } as any)
+                  h('img', { src: target.platform.button.icon, height: 20, style: { ...(target.platform.button.style?.icon || {}) } } as any)
                 )
               )}
             </a>
@@ -561,25 +619,123 @@ import { logger } from '../modules/logger'
           // Done with shorts subscribe handling
           return
         }
-        // Video page: place our buttons to the LEFT of Subscribe with minimal spacing
+        // Video page: place our buttons in a right-aligned action wrapper so the channel name keeps space
         if (params.source.type === 'video') {
-          const parent = (mountBefore as HTMLElement).parentElement
-          if (parent) {
-            if (buttonMountPoint.getAttribute('data-id') !== params.source.id || buttonMountPoint.parentElement !== parent) {
-          buttonMountPoint.setAttribute('data-id', params.source.id)
-              parent.insertBefore(buttonMountPoint, mountBefore)
+          const subscribeAction = (mountBefore.closest('.yt-flexible-actions-view-model-wiz__action') as HTMLElement | null) || (mountBefore.parentElement as HTMLElement | null)
+          const actionsContainer = subscribeAction?.parentElement as HTMLElement | null
+          if (actionsContainer) {
+            // Use a dedicated right-aligned action wrapper so we don't compete with the channel name area
+            let rightWrapper = actionsContainer.querySelector('div[data-wol-action-wrapper-right="1"]') as HTMLElement | null
+            if (!rightWrapper) {
+              rightWrapper = document.createElement('div')
+              rightWrapper.setAttribute('data-wol-action-wrapper-right', '1')
+              // Match YouTube action item class for consistent spacing
+              rightWrapper.className = 'yt-flexible-actions-view-model-wiz__action'
+              rightWrapper.style.display = 'inline-flex'
+              rightWrapper.style.alignItems = 'center'
+              rightWrapper.style.margin = '0'
+              // Key trick: push this wrapper to the far right of the row
+              rightWrapper.style.marginLeft = 'auto'
+              // Ensure our wrapper doesn't flex-grow and eat channel-name width
+              rightWrapper.style.flex = '0 0 auto'
             }
-            // Match Subscribe button height precisely and add small spacing to the right
+            if (!rightWrapper.contains(buttonMountPoint)) rightWrapper.appendChild(buttonMountPoint)
+            if (rightWrapper.parentElement !== actionsContainer) actionsContainer.appendChild(rightWrapper)
+
+            // Height sync with Subscribe for visual alignment
             try {
               const hb = (mountBefore as HTMLElement)
               const hpx = hb.offsetHeight || hb.clientHeight
               if (hpx) buttonMountPoint.style.height = `${hpx}px`
-            } catch { }
+            } catch {}
             buttonMountPoint.style.display = 'inline-flex'
             buttonMountPoint.style.alignItems = 'center'
-            buttonMountPoint.style.marginRight = '6px'
-            buttonMountPoint.style.marginLeft = '0'
+            buttonMountPoint.style.alignSelf = 'center'
+            buttonMountPoint.style.marginLeft = '12px'
+            buttonMountPoint.style.marginRight = '0'
+            buttonMountPoint.style.marginTop = '0'
+            buttonMountPoint.style.flex = '0 0 auto'
+            ;(buttonMountPoint.style as any).order = '1000'
+            buttonMountPoint.setAttribute('data-id', params.source.id)
             render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
+
+            // Precise vertical alignment: match the visual center of the first action icon
+            const alignToRow = () => {
+              try {
+                // Prefer the primary actions row in watch metadata
+                const row = document.querySelector('#actions #top-level-buttons-computed') as HTMLElement | null
+                const refBtn = (row?.querySelector('button, a, yt-button-shape button, yt-button-shape a, ytd-toggle-button-renderer button, segmented-like-dislike-button-view-model button, ytd-segmented-like-dislike-button-renderer button') as HTMLElement | null)
+                  || (actionsContainer.querySelector('button, a') as HTMLElement | null)
+                if (!refBtn) return
+                const refRect = refBtn.getBoundingClientRect()
+                const ourRect = buttonMountPoint.getBoundingClientRect()
+                if (refRect.height > 0 && ourRect.height > 0) {
+                  const h = Math.round(refRect.height)
+                  // Set group and chip heights to exactly match the row
+                  buttonMountPoint.style.height = `${h}px`
+                  const anchors = buttonMountPoint.querySelectorAll('a[role="button"], a') as unknown as HTMLElement[]
+                  anchors.forEach(a => {
+                    a.style.height = `${h}px`
+                    a.style.lineHeight = 'normal'
+                    a.style.display = 'inline-flex'
+                    a.style.alignItems = 'center'
+                  })
+                  // Rely on flex centering and add a tiny downward bias for perfect baseline alignment
+                  buttonMountPoint.style.position = ''
+                  buttonMountPoint.style.top = ''
+                  buttonMountPoint.style.alignSelf = 'center'
+                  buttonMountPoint.style.transform = 'translateY(5px)'
+                }
+              } catch {}
+            }
+            try { setTimeout(alignToRow, 0); setTimeout(alignToRow, 120) } catch {}
+          } else {
+            // Fallback: keep after Subscribe but still avoid shrinking
+            const parent = (mountBefore as HTMLElement).parentElement
+            if (parent) {
+              if (buttonMountPoint.getAttribute('data-id') !== params.source.id || buttonMountPoint.parentElement !== parent) {
+                buttonMountPoint.setAttribute('data-id', params.source.id)
+                ;(mountBefore as HTMLElement).insertAdjacentElement('afterend', buttonMountPoint)
+              }
+              try {
+                const hb = (mountBefore as HTMLElement)
+                const hpx = hb.offsetHeight || hb.clientHeight
+                if (hpx) buttonMountPoint.style.height = `${hpx}px`
+              } catch {}
+              buttonMountPoint.style.display = 'inline-flex'
+              buttonMountPoint.style.alignItems = 'center'
+              buttonMountPoint.style.alignSelf = 'center'
+              buttonMountPoint.style.marginLeft = '12px'
+              buttonMountPoint.style.marginRight = '0'
+              buttonMountPoint.style.marginTop = '0'
+              buttonMountPoint.style.flex = '0 0 auto'
+              ;(buttonMountPoint.style as any).order = '1000'
+              render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
+
+              // Fallback alignment relative to Subscribe element
+              const alignToSub = () => {
+                try {
+                  const refRect = (mountBefore as HTMLElement).getBoundingClientRect()
+                  const ourRect = buttonMountPoint.getBoundingClientRect()
+                  if (refRect.height > 0 && ourRect.height > 0) {
+                    const h = Math.round(refRect.height)
+                    buttonMountPoint.style.height = `${h}px`
+                    const anchors = buttonMountPoint.querySelectorAll('a[role="button"], a') as unknown as HTMLElement[]
+                    anchors.forEach(a => {
+                      a.style.height = `${h}px`
+                      a.style.lineHeight = 'normal'
+                      a.style.display = 'inline-flex'
+                      a.style.alignItems = 'center'
+                    })
+                    buttonMountPoint.style.position = ''
+                    buttonMountPoint.style.top = ''
+                    buttonMountPoint.style.alignSelf = 'center'
+                    buttonMountPoint.style.transform = 'translateY(5px)'
+                  }
+                } catch {}
+              }
+              try { setTimeout(alignToSub, 0); setTimeout(alignToSub, 120) } catch {}
+            }
           }
         } else {
           // Channel and other pages: keep right-of-Subscribe placement
@@ -601,8 +757,16 @@ import { logger } from '../modules/logger'
             }
             buttonMountPoint.setAttribute('data-id', params.source.id)
           } else {
-            if (buttonMountPoint.getAttribute('data-id') !== params.source.id || buttonMountPoint.parentElement !== mountBefore.parentElement) {
-              mountBefore.insertAdjacentElement('afterend', buttonMountPoint)
+            // Watch page fallback: insert strictly after the actual Subscribe button element
+            const subscribeEl = (
+              mountBefore.closest('ytd-subscribe-button-renderer') as Element | null
+            ) || (
+              document.querySelector('#owner ytd-subscribe-button-renderer') as Element | null
+            ) || (
+              document.querySelector('yt-subscribe-button-view-model') as Element | null
+            ) || mountBefore
+            if (buttonMountPoint.getAttribute('data-id') !== params.source.id || buttonMountPoint.parentElement !== subscribeEl.parentElement) {
+              subscribeEl.insertAdjacentElement('afterend', buttonMountPoint)
               buttonMountPoint.setAttribute('data-id', params.source.id)
             }
           }
@@ -613,8 +777,11 @@ import { logger } from '../modules/logger'
           } catch { }
           buttonMountPoint.style.display = 'inline-flex'
           buttonMountPoint.style.alignItems = 'center'
-          buttonMountPoint.style.marginLeft = '3px'
+          // Give the channel name more room and keep our buttons to the far right
+          buttonMountPoint.style.marginLeft = '12px'
           buttonMountPoint.style.marginRight = '0'
+          ;(buttonMountPoint.style as any).order = '1000'
+          buttonMountPoint.style.flex = '0 0 auto'
           render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
         }
       }
@@ -964,6 +1131,12 @@ import { logger } from '../modules/logger'
   const hoverMoMap = new WeakMap<HTMLElement, MutationObserver>()
   const hoverMoTimerMap = new WeakMap<HTMLElement, number>()
   const hoverFloatCleanupMap = new WeakMap<HTMLElement, () => void>()
+  // Results page: track channel renderer button + observer to avoid duplicates across toggles
+  const channelRendererState = new WeakMap<HTMLElement, { btn: HTMLElement, mo: MutationObserver | null }>()
+  // Version counter to invalidate old observers for channel renderers (prevents duplicate reinserts)
+  let channelRendererButtonVersion = 0
+  // Results page: track per-video renderer compact channel chip + observer
+  const resultsVideoChipState = new WeakMap<HTMLElement, { chip: HTMLElement, mo: MutationObserver | null }>()
   // Local resolve cache for listing pages (video/channel -> Target|null)
   const resolvedLocal = new Map<string, Target | null>()
   // Persist preferred anchor per video id to keep overlay in the same area across re-renders
@@ -976,6 +1149,478 @@ import { logger } from '../modules/logger'
     if ((currentPath.startsWith('/shorts/') && currentPath.split('/').length === 3)) {
       cleanupOverlays()
     }
+  }
+
+  // Cleanup helper for channel buttons on results page to avoid duplicate reinsertion
+  function cleanupResultsChannelButtons(options?: { disconnectOnly?: boolean }) {
+    try {
+      // Remove all injected channel buttons and disconnect observers when asked
+      const nodes = Array.from(document.querySelectorAll('ytd-channel-renderer')) as HTMLElement[]
+      for (const cr of nodes) {
+        const st = channelRendererState.get(cr)
+        if (st?.mo) {
+          try { st.mo.disconnect() } catch {}
+        }
+        if (!options?.disconnectOnly) {
+          try { st?.btn.remove() } catch {}
+          try { cr.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove()) } catch {}
+          try { cr.removeAttribute('data-wol-channel-button') } catch {}
+        }
+        // Always clear state to avoid stale reinserts
+        try { channelRendererState.delete(cr) } catch {}
+      }
+    } catch {}
+  }
+
+  // Cleanup helper for inline channel chips in video results to avoid stale observers
+  function cleanupResultsVideoChips(options?: { disconnectOnly?: boolean }) {
+    try {
+      const vrs = Array.from(document.querySelectorAll('ytd-video-renderer')) as HTMLElement[]
+      for (const vr of vrs) {
+        const st = resultsVideoChipState.get(vr)
+        if (st?.mo) { try { st.mo.disconnect() } catch {} }
+        if (!options?.disconnectOnly) {
+          try { st?.chip.remove() } catch {}
+          try { vr.querySelectorAll('[data-wol-inline-channel]').forEach(el => el.remove()) } catch {}
+        }
+        try { resultsVideoChipState.delete(vr) } catch {}
+      }
+    } catch {}
+  }
+
+  // Strict visibility enforcement for results channel chips
+  function enforceResultsChannelChipVisibility() {
+    try {
+      const allow = (location.pathname === '/results') && !!settings.resultsApplySelections && !!settings.buttonChannelSub
+      if (!allow) {
+        cleanupResultsVideoChips()
+      }
+    } catch {}
+  }
+
+  // Ensure channel renderer buttons (top channel section on results) are present
+  async function refreshResultsChannelRendererButtons() {
+    try {
+      if (location.pathname !== '/results') return
+      if (!settings.resultsApplySelections || !settings.buttonChannelSub) return
+
+      const platform = targetPlatformSettings[settings.targetPlatform]
+      const renderers = Array.from(document.querySelectorAll('ytd-channel-renderer')) as HTMLElement[]
+      for (const cr of renderers) {
+        // Bump version to invalidate any old observers tied to this renderer
+        const ver = String(++channelRendererButtonVersion)
+        cr.setAttribute('data-wol-channel-btn-ver', ver)
+        // Skip if already injected
+        // First, hard de-dupe any existing wrappers (keep first)
+        try {
+          const all = Array.from(cr.querySelectorAll('[data-wol-results-channel-btn]')) as HTMLElement[]
+          if (all.length > 1) all.slice(1).forEach(x => x.remove())
+          if (all.length === 1) {
+            cr.setAttribute('data-wol-channel-button','1')
+            // Update href on existing link and re-size to match Subscribe
+            const link = all[0].querySelector('a') as HTMLAnchorElement | null
+            // Derive channel URL below and then update link if present
+          }
+        } catch {}
+
+        if (cr.getAttribute('data-wol-channel-button') === '1' && cr.querySelector('[data-wol-results-channel-btn]')) {
+          // Already present; ensure size/href are updated below and continue sizing
+        } else if (cr.getAttribute('data-wol-channel-button-pending') === '1') {
+          // Another pass is injecting; skip to avoid duplicates
+          continue
+        } else {
+          // Mark pending to prevent concurrent duplicate injections
+          cr.setAttribute('data-wol-channel-button-pending','1')
+        }
+        // Derive URL: prefer /channel/UC..., else /@handle, else search by name
+        let chUrl: URL | null = null
+        let handle: string | null = null
+        let ucid: string | null = null
+        try {
+          const chA = cr.querySelector('a[href^="/channel/"]') as HTMLAnchorElement | null
+          const hA = cr.querySelector('a[href^="/@"]') as HTMLAnchorElement | null
+          if (chA) {
+            const u = new URL(chA.getAttribute('href') || chA.href, location.origin)
+            const id = u.pathname.split('/')[2]
+            if (id && id.startsWith('UC')) ucid = id
+          }
+          if (!ucid && hA) {
+            try { const u = new URL(hA.getAttribute('href') || hA.href, location.origin); handle = u.pathname.substring(1) } catch {}
+          }
+        } catch {}
+        if (ucid) {
+          try {
+            const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
+            const res = await getTargetsBySources({ platform: srcPlatform, id: ucid, type: 'channel', url: new URL(location.href), time: null })
+            const t = res[ucid] || null
+            if (t) chUrl = getOdyseeUrlByTarget(t)
+          } catch {}
+        }
+        if (!chUrl && handle) {
+          try { chUrl = new URL(`${platform.domainPrefix}/@${handle}`.replace('/@/@','/@')) } catch {}
+        }
+        if (!chUrl) {
+          const nameText = (cr.querySelector('#channel-title')?.textContent || cr.textContent || '').trim()
+          const q = encodeURIComponent(nameText)
+          try { chUrl = new URL(`${platform.domainPrefix}/$/search?q=${q}`) } catch {}
+        }
+        if (!chUrl) { cr.removeAttribute('data-wol-channel-button-pending'); continue }
+
+        // Inject compact button next to subscribe row
+        const buttonsContainer = (cr.querySelector('#buttons') as HTMLElement | null)
+          || (cr.querySelector('#action-buttons') as HTMLElement | null)
+          || (cr.querySelector('#subscribe-button')?.parentElement as HTMLElement | null)
+          || cr
+        const subscribeButton = cr.querySelector('#subscribe-button') as HTMLElement | null
+
+        // Reuse existing wrapper if present
+        let wrapper = cr.querySelector('[data-wol-results-channel-btn]') as HTMLElement | null
+        let link: HTMLAnchorElement | null = wrapper ? (wrapper.querySelector('a') as HTMLAnchorElement | null) : null
+        if (!wrapper) {
+          wrapper = document.createElement('div')
+          wrapper.setAttribute('data-wol-results-channel-btn','1')
+          wrapper.style.display = 'inline-flex'
+          wrapper.style.alignItems = 'center'
+          wrapper.style.marginRight = '6px'
+          link = document.createElement('a')
+          link.style.display = 'flex'
+          link.style.alignItems = 'center'
+          link.style.gap = '6px'
+          link.style.borderRadius = '14px'
+          link.style.padding = '0 6px'
+          link.style.height = '28px'
+          link.style.lineHeight = '28px'
+          link.style.fontWeight = '500'
+          link.style.fontSize = '12px'
+          link.style.textDecoration = 'none'
+          link.style.color = 'whitesmoke'
+          link.style.backgroundImage = platform.theme
+          link.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+          const icon = document.createElement('img')
+          icon.src = platform.button.icon
+          icon.style.height = '14px'
+          icon.style.width = '14px'
+          icon.style.pointerEvents = 'none'
+          const text = document.createElement('span')
+          text.textContent = 'Channel'
+          text.style.whiteSpace = 'nowrap'
+          link.appendChild(icon)
+          link.appendChild(text)
+          wrapper.appendChild(link)
+        }
+        // Update href every pass
+        if (link) link.href = chUrl.href
+
+        if (buttonsContainer) {
+          if (subscribeButton && subscribeButton.parentElement === buttonsContainer) buttonsContainer.insertBefore(wrapper, subscribeButton)
+          else buttonsContainer.appendChild(wrapper)
+        } else {
+          cr.appendChild(wrapper)
+        }
+        cr.setAttribute('data-wol-channel-button','1')
+        cr.removeAttribute('data-wol-channel-button-pending')
+
+        // Match Subscribe button sizing for a native look
+        try {
+          const subBtnEl = (subscribeButton?.querySelector('button, a, yt-button-shape button, yt-button-shape a, ytd-subscribe-button-renderer button') as HTMLElement | null) || subscribeButton
+          if (subBtnEl) {
+            let sbh = subBtnEl.getBoundingClientRect().height || (subBtnEl as any).offsetHeight || 0
+            if (!sbh) {
+              const elems = Array.from(subBtnEl.querySelectorAll('*')) as HTMLElement[]
+              for (const el of elems) {
+                const r = el.getBoundingClientRect()
+                if (r.height > 0) { sbh = r.height; break }
+              }
+            }
+            const h = Math.max(24, Math.round(sbh || 36))
+            wrapper.style.height = `${h}px`
+            wrapper.style.alignItems = 'center'
+            link.style.height = `${h}px`
+            link.style.lineHeight = `${h}px`
+            const subscribeStyle = window.getComputedStyle(subBtnEl)
+            if (subscribeStyle?.fontSize) link.style.fontSize = subscribeStyle.fontSize
+            if (subscribeStyle?.borderRadius) link.style.borderRadius = subscribeStyle.borderRadius
+            if (subscribeStyle?.paddingLeft && subscribeStyle?.paddingRight) {
+              link.style.paddingLeft = subscribeStyle.paddingLeft
+              link.style.paddingRight = subscribeStyle.paddingRight
+            }
+            const mb = subscribeStyle?.marginBottom || '0px'
+            wrapper.style.marginBottom = (mb === '0px') ? '8px' : mb
+          }
+        } catch {}
+
+        // Keep present during renderer churn
+        try {
+          let mo: MutationObserver | null = null
+          const ensure = () => {
+            // If version changed since this observer was attached, stop and exit
+            if (cr.getAttribute('data-wol-channel-btn-ver') !== ver) { try { mo?.disconnect() } catch {}; return }
+            if (!settings.resultsApplySelections || !settings.buttonChannelSub) { try { wrapper.remove() } catch {}; return }
+            const stillThere = wrapper.isConnected && cr.contains(wrapper)
+            const subBtn = cr.querySelector('#subscribe-button') as HTMLElement | null
+            const btns = (cr.querySelector('#buttons') as HTMLElement | null)
+              || (cr.querySelector('#action-buttons') as HTMLElement | null)
+              || (subBtn?.parentElement as HTMLElement | null)
+              || cr
+            if (!stillThere && btns) {
+              if (subBtn && subBtn.parentElement === btns) btns.insertBefore(wrapper, subBtn)
+              else btns.appendChild(wrapper)
+            }
+          }
+          mo = new MutationObserver(() => ensure())
+          mo.observe(cr, { childList: true, subtree: true })
+          // Track in shared state to avoid duplicate injections
+          try { channelRendererState.set(cr, { btn: wrapper, mo }) } catch {}
+        } catch {}
+      }
+    } catch {}
+  }
+
+  // Proactively (re)inject compact channel chips beside each video result on /results
+  async function refreshResultsVideoChannelChips() {
+    try {
+      if (location.pathname !== '/results') return
+      // Ensure CSS guard matches settings so we don't invisibly inject
+      try { ensureResultsPillsVisibility() } catch {}
+      if (!settings.resultsApplySelections || !settings.buttonChannelSub) {
+        enforceResultsChannelChipVisibility()
+        return
+      }
+
+      // Collect channel anchors from video result renderers
+      const vrs = Array.from(document.querySelectorAll('ytd-video-renderer')) as HTMLElement[]
+      type VRCtx = { vr: HTMLElement, nameAnchor: HTMLAnchorElement | null, handle: string | null, ucid: string | null }
+      const items: VRCtx[] = vrs.map(vr => {
+        const nameAnchor = vr.querySelector('#channel-info #channel-name a[href], ytd-channel-name#channel-name a[href]') as HTMLAnchorElement | null
+        let handle: string | null = null
+        let ucid: string | null = null
+        if (nameAnchor) {
+          try {
+            const href = nameAnchor.getAttribute('href') || nameAnchor.href || ''
+            const u = new URL(href, location.origin)
+            if (u.pathname.startsWith('/channel/')) ucid = u.pathname.split('/')[2] || null
+            else if (u.pathname.startsWith('/@')) handle = u.pathname.substring(1)
+          } catch {}
+        }
+        if (!ucid && !handle) {
+          const fb = vr.querySelector('a[href^="/channel/"]') as HTMLAnchorElement | null
+          if (fb) {
+            try { const u = new URL(fb.getAttribute('href') || fb.href, location.origin); const uc = u.pathname.split('/')[2]; if (uc) ucid = uc } catch {}
+          }
+        }
+        return { vr, nameAnchor, handle, ucid }
+      })
+
+      // Attempt to upgrade @handles to UC ids when possible (DOM hints only; no network)
+      async function upgradeHandleToUC(ctx: VRCtx): Promise<string | null> {
+        const vr = ctx.vr
+        // DOM hint: serialized endpoints may contain browseId
+        try {
+          const epEl = vr.querySelector('[data-serialized-endpoint]') as HTMLElement | null
+          if (epEl) {
+            try {
+              const data = JSON.parse(epEl.getAttribute('data-serialized-endpoint') || '{}')
+              const browseId = data?.browseEndpoint?.browseId
+              if (typeof browseId === 'string' && browseId.startsWith('UC')) return browseId
+            } catch {}
+          }
+        } catch {}
+        return null
+      }
+
+      for (const it of items) {
+        if (!it.ucid && it.handle) {
+          try { it.ucid = await upgradeHandleToUC(it) } catch {}
+        }
+      }
+
+      // Resolve unique UC channel ids in one call
+      const uniqueUC = Array.from(new Set(items.map(x => x.ucid).filter((x): x is string => !!x && x.startsWith('UC'))))
+      let resolved: Record<string, Target | null> = {}
+      if (uniqueUC.length > 0) {
+        const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
+        const srcs = uniqueUC.map(id => ({ platform: srcPlatform, id, type: 'channel' as const, url: new URL(location.href), time: null }))
+        resolved = await getTargetsBySources(...srcs)
+      }
+      const platform = targetPlatformSettings[settings.targetPlatform]
+
+      // Inject or ensure an inline chip in each renderer
+      for (const it of items) {
+        try {
+          const vr = it.vr
+          const channelInfo = vr.querySelector('#channel-info') as HTMLElement | null
+          const thumbA = channelInfo?.querySelector('#channel-thumbnail') as HTMLElement | null
+          // If we already manage a chip for this renderer, update and ensure placement
+          const managed = resultsVideoChipState.get(vr)
+          // Compute target URL for channel: prefer resolved UC -> handle -> search
+          let chUrl: URL | null = null
+          if (it.ucid && resolved[it.ucid]) chUrl = getOdyseeUrlByTarget(resolved[it.ucid]!)
+          if (!chUrl && it.handle) {
+            try { chUrl = new URL(`${platform.domainPrefix}/@${it.handle}`.replace('/@/@','/@')) } catch {}
+          }
+          if (!chUrl) {
+            const q = encodeURIComponent(it.nameAnchor?.textContent?.trim() || it.handle || it.ucid || '')
+            if (q) { try { chUrl = new URL(`${platform.domainPrefix}/$/search?q=${q}`) } catch {} }
+          }
+          if (!chUrl) continue
+
+          // Helper to (re)mount the chip once the host nodes exist
+          const ensureMount = () => {
+            const ci = vr.querySelector('#channel-info') as HTMLElement | null
+            const ta = ci?.querySelector('#channel-thumbnail') as HTMLElement | null
+            if (!ci || !ta) return false
+            try {
+              const cs = window.getComputedStyle(ci)
+              if (cs.display !== 'flex' && cs.display !== 'inline-flex') ci.style.display = 'flex'
+              ci.style.alignItems = 'center'
+            } catch {}
+
+            // Reuse existing DOM chip if present to avoid duplication
+            const existing = ci.querySelector('a[data-wol-inline-channel]') as HTMLElement | null
+            // Remove extras if any
+            try {
+              const all = Array.from(ci.querySelectorAll('a[data-wol-inline-channel]')) as HTMLElement[]
+              if (all.length > 1) all.slice(1).forEach(x => x.remove())
+            } catch {}
+            const inline = (resultsVideoChipState.get(vr)?.chip as HTMLElement) || (existing as HTMLElement) || document.createElement('a')
+            if (!inline.hasAttribute('data-wol-inline-channel')) inline.setAttribute('data-wol-inline-channel', '1')
+            inline.href = chUrl!.href
+            inline.target = '_blank'
+            inline.title = `Open channel on ${platform.button.platformNameText}`
+            inline.style.display = 'inline-flex'
+            inline.style.alignItems = 'center'
+            inline.style.justifyContent = 'center'
+            inline.style.flex = '0 0 auto'
+            inline.style.marginRight = '6px'
+            inline.style.width = '22px'
+            inline.style.height = '22px'
+            inline.style.borderRadius = '11px'
+            inline.style.background = 'transparent'
+            inline.style.overflow = 'hidden'
+            inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+            let icon = inline.querySelector('img') as HTMLImageElement | null
+            if (!icon) { icon = document.createElement('img'); inline.appendChild(icon) }
+            icon.src = platform.button.icon
+            icon.style.width = '22px'
+            icon.style.height = '22px'
+            icon.style.display = 'block'
+            icon.style.pointerEvents = 'none'
+
+            // Ensure position before the avatar
+            if (ta.parentElement === ci) {
+              if (inline.parentElement !== ci || inline.nextElementSibling !== ta) {
+                ci.insertBefore(inline, ta)
+              }
+            } else {
+              if (inline.parentElement !== ci || inline !== ci.firstElementChild) {
+                ci.insertBefore(inline, ci.firstChild)
+              }
+            }
+            // Remove stale guard if hiding
+            try {
+              const cs2 = getComputedStyle(inline)
+              if (cs2.display === 'none') {
+                inline.style.setProperty('display', 'inline-flex', 'important')
+                inline.style.setProperty('visibility', 'visible', 'important')
+                const guard = document.getElementById('wol-results-pills-visibility')
+                if (guard) guard.remove()
+              }
+            } catch {}
+
+            // Persist state and observer
+            const prev = resultsVideoChipState.get(vr)
+            try { prev?.mo?.disconnect() } catch {}
+            try {
+              const mo = new MutationObserver(() => {
+                // Keep chip present and before avatar as row churns
+                if (!settings.resultsApplySelections || !settings.buttonChannelSub) return
+                const cci = vr.querySelector('#channel-info') as HTMLElement | null
+                const tta = cci?.querySelector('#channel-thumbnail') as HTMLElement | null
+                if (!cci || !tta) return
+                if (!inline.isConnected || inline.parentElement !== cci || inline.nextElementSibling !== tta) {
+                  if (tta.parentElement === cci) cci.insertBefore(inline, tta)
+                  else cci.insertBefore(inline, cci.firstChild)
+                }
+              })
+              mo.observe(ci, { childList: true, subtree: false })
+              resultsVideoChipState.set(vr, { chip: inline, mo })
+            } catch {}
+            return true
+          }
+
+          // If host nodes are not ready yet, observe the renderer until they appear
+          if (!channelInfo || !thumbA) {
+            const prev = resultsVideoChipState.get(vr)
+            try { prev?.mo?.disconnect() } catch {}
+            try {
+              const mo = new MutationObserver(() => {
+                if (!settings.resultsApplySelections || !settings.buttonChannelSub) return
+                if (ensureMount()) { try { mo.disconnect() } catch {} }
+              })
+              mo.observe(vr, { childList: true, subtree: true })
+              resultsVideoChipState.set(vr, { chip: (prev?.chip as HTMLElement) || document.createElement('a'), mo })
+            } catch {}
+            continue
+          }
+
+          // Host exists now, mount immediately
+          ensureMount()
+
+          // Reuse existing DOM chip if present to avoid duplication
+          const existing = channelInfo.querySelector('a[data-wol-inline-channel]') as HTMLElement | null
+          const inline = (managed?.chip as HTMLElement) || (existing as HTMLElement) || document.createElement('a')
+          if (!managed?.chip) inline.setAttribute('data-wol-inline-channel', '1')
+          inline.href = chUrl.href
+          inline.target = '_blank'
+          inline.title = `Open channel on ${platform.button.platformNameText}`
+          inline.style.display = 'inline-flex'
+          inline.style.alignItems = 'center'
+          inline.style.justifyContent = 'center'
+          inline.style.flex = '0 0 auto'
+          inline.style.marginRight = '6px'
+          inline.style.width = '22px'
+          inline.style.height = '22px'
+          inline.style.borderRadius = '11px'
+          // Transparent background; let the icon fill the chip
+          inline.style.background = 'transparent'
+          inline.style.overflow = 'hidden'
+          inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+          // Ensure we have a single icon child, sized to fill
+          let icon = inline.querySelector('img') as HTMLImageElement | null
+          if (!icon) {
+            icon = document.createElement('img')
+            inline.appendChild(icon)
+          }
+          icon.src = platform.button.icon
+          icon.style.width = '22px'
+          icon.style.height = '22px'
+          icon.style.display = 'block'
+          icon.style.pointerEvents = 'none'
+          // Ensure position before the avatar
+          if (thumbA.parentElement === channelInfo) {
+            if (inline.parentElement !== channelInfo || inline.nextElementSibling !== thumbA) {
+              channelInfo.insertBefore(inline, thumbA)
+            }
+          } else {
+            // Fallback: prepend into channelInfo
+            if (inline.parentElement !== channelInfo || inline !== channelInfo.firstElementChild) {
+              channelInfo.insertBefore(inline, channelInfo.firstChild)
+            }
+          }
+          // If a stale CSS guard is still hiding pills, override and remove it
+          try {
+            const cs = getComputedStyle(inline)
+            if (cs.display === 'none') {
+              inline.style.setProperty('display', 'inline-flex', 'important')
+              inline.style.setProperty('visibility', 'visible', 'important')
+              const guard = document.getElementById('wol-results-pills-visibility')
+              if (guard) guard.remove()
+            }
+          } catch {}
+          // Observer already set inside ensureMount()
+        } catch {}
+      }
+    } catch {}
   }
 
   // Smart overlay management that preserves existing overlays when possible
@@ -998,18 +1643,22 @@ import { logger } from '../modules/logger'
 
   // Ensure overlay enhancement scheduling and observers are active when buttonOverlay is enabled
   function ensureOverlayEnhancementActive() {
+    // Keep overlays cleaned when disabled, but do not short-circuit observers needed for results chips
     if (!settings.buttonOverlay) {
       cleanupOverlays()
-      return
+    } else {
+      ensureOverlayCssInjected()
+      // Run overlay enhancement immediately when enabled
+      enhanceVideoTilesOnListings().catch((e) => logger.error(e))
     }
-    ensureOverlayCssInjected()
-    // Run enhancement immediately; rely on observers for subsequent DOM churn
-    enhanceVideoTilesOnListings().catch((e) => logger.error(e))
 
+    // Always maintain a global observer to handle dynamic results content
     if (!wolMutationObserver) {
       wolMutationObserver = new MutationObserver((mutations) => {
-        if (!settings.buttonOverlay) return
+        // Strict removal if toggles do not allow chips
+        enforceResultsChannelChipVisibility()
         let shouldEnhance = false
+        let shouldRefreshChips = false
         for (const mutation of mutations) {
           if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
             for (let i = 0; i < mutation.addedNodes.length; i++) {
@@ -1021,15 +1670,20 @@ import { logger } from '../modules/logger'
                   element.querySelector('a[href*="/shorts/"]')
                 )) {
                   shouldEnhance = true
+                  if (location.pathname === '/results') shouldRefreshChips = true
                   break
                 }
               }
             }
           }
         }
-        if (shouldEnhance) {
+        if (shouldEnhance && settings.buttonOverlay) {
           try { ensureResultsPillsVisibility() } catch {}
           enhanceVideoTilesOnListings().catch((e) => logger.error(e))
+        }
+        if (shouldRefreshChips && settings.resultsApplySelections && settings.buttonChannelSub) {
+          try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
+          try { refreshResultsChannelRendererButtons().catch(e => logger.error(e)) } catch {}
         }
       })
 
@@ -1045,19 +1699,24 @@ import { logger } from '../modules/logger'
           cleanupOverlaysByPageContext()
           cleanupOverlays()
           lastEnhanceTime = 0; lastEnhanceUrl = ''
-          enhanceVideoTilesOnListings().catch((e) => logger.error(e))
+          if (settings.buttonOverlay) enhanceVideoTilesOnListings().catch((e) => logger.error(e))
+          // Refresh results chips on nav as well
+          if (location.pathname === '/results' && settings.resultsApplySelections && settings.buttonChannelSub) {
+            try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
+            try { refreshResultsChannelRendererButtons().catch(e => logger.error(e)) } catch {}
+          }
           scheduleProcessCurrentPage(50)
           try { ensureResultsPillsVisibility() } catch {}
           // A single immediate pass is enough; observers will catch late content
         }
       }, 1000)
 
-      wolMutationObserver.observe(document.body, { childList: true, subtree: true })
+      try { wolMutationObserver.observe(document.body, { childList: true, subtree: true }) } catch {}
 
       if (window.location.pathname.includes('/@') || window.location.pathname.includes('/channel/')) {
         const tabContainer = document.querySelector('ytd-c4-tabbed-header-renderer') ||
           document.querySelector('ytd-page-header-renderer')
-        if (tabContainer) wolMutationObserver.observe(tabContainer, { childList: true, subtree: true })
+        if (tabContainer) try { wolMutationObserver.observe(tabContainer, { childList: true, subtree: true }) } catch {}
       }
     }
   }
@@ -1485,41 +2144,15 @@ import { logger } from '../modules/logger'
     for (const { a, id, type } of normalizedToProcess) {
       if (gen !== overlayGeneration) break
       const res = resolvedLocal.get(`${type}:${id}`) ?? null
-      // Results page filtering/enforcement: hide or show result tiles based on toggles
-      if (location.pathname === '/results' && settings.resultsApplySelections) {
-        try {
-          if (type === 'video') {
-            const videoRenderer = a.closest('ytd-video-renderer') as HTMLElement | null
-            const gridShelfItem = a.closest('.ytGridShelfViewModelGridShelfItem') as HTMLElement | null
-            const container = (videoRenderer || gridShelfItem) as HTMLElement | null
-            if (container) {
-              const shouldShow = !!settings.buttonVideoSub
-              if (!shouldShow) {
-                try { container.setAttribute('data-wol-hidden', '1'); container.style.display = 'none' } catch {}
-                continue
-              } else {
-                try { container.removeAttribute('data-wol-hidden'); container.style.removeProperty('display') } catch {}
-              }
-            }
-          } else if (type === 'channel') {
-            const channelRenderer = a.closest('ytd-channel-renderer') as HTMLElement | null
-            if (channelRenderer) {
-              const shouldShow = !!settings.buttonChannelSub
-              if (!shouldShow) {
-                try { channelRenderer.setAttribute('data-wol-hidden', '1'); channelRenderer.style.display = 'none' } catch {}
-                continue
-              } else {
-                try { channelRenderer.removeAttribute('data-wol-hidden'); channelRenderer.style.removeProperty('display') } catch {}
-              }
-            }
-          }
-        } catch {}
+      // Results page: do not hide or remove result tiles. Settings only control overlay/button UI.
+      // Any attributes previously used to hide are cleared elsewhere when toggles change.
+      // For non-results pages we require a resolved target; for results page we may still
+      // inject channel chips for video tiles even when the video itself did not resolve.
+      let url: URL | null = null
+      if (res) url = getOdyseeUrlByTarget(res)
+      if (!res && location.pathname !== '/results') {
+        continue
       }
-      if (!res) { 
-        continue 
-      }
-
-      const url = getOdyseeUrlByTarget(res)
 
       // On /results, render inline buttons instead of overlays for video tiles
       if (location.pathname === '/results') {
@@ -1533,7 +2166,7 @@ import { logger } from '../modules/logger'
             const videoRenderer = a.closest('ytd-video-renderer') as HTMLElement | null
             if (videoRenderer) {
               // 1) Inline "Watch on Odysee" pill to the right of the title/menu
-              if (settings.buttonVideoSub && !videoRenderer.querySelector('[data-wol-inline-watch]')) {
+              if (settings.buttonVideoSub && url && !videoRenderer.querySelector('[data-wol-inline-watch]')) {
                 const titleWrapper = (videoRenderer.querySelector('#title-wrapper') as HTMLElement | null) || (videoRenderer.querySelector('#meta') as HTMLElement | null) || videoRenderer
                 const menu = videoRenderer.querySelector('#menu') as HTMLElement | null
                 const btn = document.createElement('a')
@@ -1568,8 +2201,8 @@ import { logger } from '../modules/logger'
                 btn.style.background = platform.theme
                 const i = document.createElement('img')
                 i.src = platform.button.icon
-                i.style.width = '14px'
-                i.style.height = '14px'
+                i.style.width = '20px'
+                i.style.height = '20px'
                 i.style.pointerEvents = 'none'
                 const t = document.createElement('span')
                 t.textContent = 'Watch'
@@ -1594,217 +2227,14 @@ import { logger } from '../modules/logger'
                   }
                 }
                 if (WOL_DEBUG) dbg('WOL results inline watch injected', { videoId: id })
-
-                // Insert compact channel icon to the left of the channel avatar (in channel-info)
-                try {
-                  if (!settings.resultsApplySelections || !settings.buttonChannelSub) {
-                    // Respect toggles: do not insert when disabled
-                  } else if (!videoRenderer.querySelector('[data-wol-inline-channel]')) {
-                    // Try to extract channel id from anchors in this renderer
-                    let chId: string | null = null
-                    const nameA = videoRenderer.querySelector('#channel-info #channel-name a[href], ytd-channel-name#channel-name a[href]') as HTMLAnchorElement | null
-                    try {
-                      const href = nameA?.getAttribute('href') || nameA?.href || ''
-                      if (href) {
-                        const cu = new URL(href, location.origin)
-                        if (cu.pathname.startsWith('/channel/')) chId = cu.pathname.split('/')[2] || null
-                        else if (cu.pathname.startsWith('/@')) chId = await upgradeChannelIdFromRenderer(nameA!, cu.pathname.substring(1))
-                      }
-                    } catch {}
-                    if (!chId) {
-                      const fb = videoRenderer.querySelector('a[href^="/channel/"]') as HTMLAnchorElement | null
-                      if (fb) {
-                        try { const u = new URL(fb.getAttribute('href') || fb.href, location.origin); const uc = u.pathname.split('/')[2]; if (uc) chId = uc } catch {}
-                      }
-                    }
-                    if (chId) {
-                      const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
-                      const chRes = await getTargetsBySources({ platform: srcPlatform, id: chId, type: 'channel', url: new URL(location.href), time: null })
-                      const chTarget = chRes[chId] || null
-                      let chUrl: URL | null = null
-                      if (chTarget) chUrl = getOdyseeUrlByTarget(chTarget)
-                      else if (nameA?.href?.includes('/@')) {
-                        try { const handle = (new URL(nameA.href, location.origin)).pathname.substring(1); chUrl = new URL(`${platform.domainPrefix}/@${handle}`.replace('/@/@','/@')) } catch {}
-                      }
-                      if (!chUrl) {
-                        const q = encodeURIComponent(nameA?.textContent?.trim() || chId)
-                        try { chUrl = new URL(`${platform.domainPrefix}/$/search?q=${q}`) } catch {}
-                      }
-                      if (chUrl) {
-                        const chInfo = videoRenderer.querySelector('#channel-info') as HTMLElement | null
-                        const thumbA = chInfo?.querySelector('#channel-thumbnail') as HTMLElement | null
-                        const chBtn = document.createElement('a')
-                        chBtn.setAttribute('data-wol-inline-channel', '1')
-                        chBtn.href = chUrl.href
-                        chBtn.target = '_blank'
-                        chBtn.title = `Open channel on ${platform.button.platformNameText}`
-                        chBtn.style.display = 'inline-flex'
-                        chBtn.style.alignItems = 'center'
-                        chBtn.style.justifyContent = 'center'
-                        chBtn.style.flex = '0 0 auto'
-                        chBtn.style.marginRight = '6px'
-                        // Slight nudge up to align vertically with avatar (top felt short)
-                        chBtn.style.marginTop = '-2px'
-                        chBtn.style.width = '22px'
-                        chBtn.style.height = '22px'
-                        chBtn.style.borderRadius = '11px'
-                        // Use full-bleed icon instead of a filled circle background
-                        chBtn.style.background = 'transparent'
-                        chBtn.style.overflow = 'hidden'
-                        const icon = document.createElement('img')
-                        icon.src = platform.button.icon
-                        icon.style.width = '22px'
-                        icon.style.height = '22px'
-                        icon.style.pointerEvents = 'none'
-                        chBtn.appendChild(icon)
-                        chBtn.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
-                        if (chInfo && thumbA && chInfo.contains(thumbA)) {
-                          try {
-                            const cs = window.getComputedStyle(chInfo)
-                            if (cs.display !== 'flex' && cs.display !== 'inline-flex') chInfo.style.display = 'flex'
-                            chInfo.style.alignItems = 'center'
-                            chInfo.insertBefore(chBtn, thumbA)
-                            if (WOL_DEBUG) dbg('WOL results inline channel placed before avatar', { videoId: id, channelId: chId })
-                          } catch {
-                            chInfo.insertBefore(chBtn, thumbA)
-                          }
-                        } else {
-                          // Fallback: keep next to Watch pill if channel-info missing
-                          if (btn.parentElement) btn.parentElement.insertBefore(chBtn, btn)
-                          else if (menu && menu.parentElement === titleWrapper) titleWrapper.insertBefore(chBtn, menu)
-                          else titleWrapper?.appendChild(chBtn)
-                          if (WOL_DEBUG) dbg('WOL results inline channel fallback near watch', { videoId: id, channelId: chId })
-                        }
-                      }
-                    } else if (WOL_DEBUG) dbg('WOL results could not derive channel id for next-to-watch injection')
-                  }
-                } catch (e) { if (WOL_DEBUG) dbg('WOL results inline channel next-to-watch error', e) }
               }
-
-              // 2) Channel inline icon (results)
-              if (settings.resultsApplySelections && settings.buttonChannelSub && !videoRenderer.querySelector('[data-wol-inline-channel]')) {
-                const nameAnchor = (videoRenderer.querySelector('#channel-info #channel-name a[href], ytd-channel-name#channel-name a[href]') as HTMLAnchorElement | null)
-                const nameContainer = nameAnchor?.closest('#channel-info') as HTMLElement | null
-                  || nameAnchor?.closest('ytd-channel-name#channel-name') as HTMLElement | null
-                if (nameAnchor && (nameContainer || nameAnchor.parentElement)) {
-                  // Resolve channel to target
-                  let channelId: string | null = null
-                  try {
-                    const cu = new URL(nameAnchor.getAttribute('href') || nameAnchor.href, location.origin)
-                    if (cu.pathname.startsWith('/channel/')) channelId = cu.pathname.split('/')[2] || null
-                    else if (cu.pathname.startsWith('/@')) channelId = await upgradeChannelIdFromRenderer(nameAnchor, cu.pathname.substring(1))
-                    else {
-                      const fallback = videoRenderer.querySelector('a[href^="/channel/"]') as HTMLAnchorElement | null
-                      if (fallback) {
-                        try { const fu = new URL(fallback.getAttribute('href') || fallback.href, location.origin); const uc = fu.pathname.split('/')[2]; if (uc) channelId = uc } catch {}
-                      }
-                    }
-                  } catch {}
-                  if (channelId) {
-                    const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
-                    const chRes = await getTargetsBySources({ platform: srcPlatform, id: channelId, type: 'channel', url: new URL(location.href), time: null })
-                    const chTarget = chRes[channelId] || null
-                    // Choose best available target: direct resolve -> handle URL -> search URL
-                    let chUrl: URL | null = null
-                    if (chTarget) {
-                      chUrl = getOdyseeUrlByTarget(chTarget)
-                      if (WOL_DEBUG) dbg('WOL results inline channel target: direct', { channelId, url: chUrl.href })
-                    } else {
-                      // Try handle-based URL
-                      let handle: string | null = null
-                      try {
-                        const cu = new URL(nameAnchor.getAttribute('href') || nameAnchor.href, location.origin)
-                        if (cu.pathname.startsWith('/@')) handle = cu.pathname.substring(1)
-                      } catch {}
-                      if (handle) {
-                        try { chUrl = new URL(`${platform.domainPrefix}/@${handle}`.replace('/@/@','/@')) } catch {}
-                        if (WOL_DEBUG) dbg('WOL results inline channel target: handle', { handle, url: chUrl?.href })
-                      }
-                      // Fallback: Odysee search
-                      if (!chUrl) {
-                        const q = encodeURIComponent(nameAnchor.textContent?.trim() || handle || channelId)
-                        try { chUrl = new URL(`${platform.domainPrefix}/$/search?q=${q}`) } catch {}
-                        if (WOL_DEBUG) dbg('WOL results inline channel target: search', { q, url: chUrl?.href })
-                      }
-                    }
-                    if (chUrl) {
-                      const channelNameEl = (videoRenderer.querySelector('ytd-channel-name#channel-name') as HTMLElement | null)
-                      const container = (videoRenderer.querySelector('ytd-channel-name#channel-name #container') as HTMLElement | null)
-                        || channelNameEl
-                        || (nameAnchor.parentElement as HTMLElement)
-                  const ensureInline = () => {
-                    // Respect live setting: do not (re)insert when toggles are off or results app disabled
-                    if (!settings.resultsApplySelections || !settings.buttonChannelSub) return
-                        try {
-                          if (!container) return
-                          if (container.querySelector('[data-wol-inline-channel]')) return
-                          // Make sure the row can accommodate an inline control
-                          try {
-                            const cs = window.getComputedStyle(container)
-                            if (cs.display !== 'flex' && cs.display !== 'inline-flex') container.style.display = 'inline-flex'
-                            container.style.alignItems = 'center'
-                            ;(container as HTMLElement).style.gap = (cs.columnGap && cs.columnGap !== 'normal') ? cs.columnGap : '6px'
-                            container.style.overflow = 'visible'
-                          } catch {}
-                          const inline = document.createElement('a')
-                          inline.setAttribute('data-wol-inline-channel', '1')
-                          inline.href = chUrl!.href
-                          inline.target = '_blank'
-                          inline.title = `Open channel on ${platform.button.platformNameText}`
-                          inline.style.display = 'inline-flex'
-                          inline.style.alignItems = 'center'
-                          inline.style.justifyContent = 'center'
-                          inline.style.marginLeft = '6px'
-                          inline.style.flex = '0 0 auto'
-                          inline.style.alignSelf = 'center'
-                          inline.style.verticalAlign = 'middle'
-                          inline.style.width = '22px'
-                          inline.style.height = '22px'
-                          inline.style.borderRadius = '11px'
-                          inline.style.background = platform.theme
-                          inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
-                          const icon = document.createElement('img')
-                          icon.src = platform.button.icon
-                          icon.style.width = '14px'
-                          icon.style.height = '14px'
-                          icon.style.pointerEvents = 'none'
-                          inline.appendChild(icon)
-                          const textContainer = container.querySelector('#text-container') as HTMLElement | null
-                          if (textContainer && textContainer.parentElement === container) {
-                            textContainer.insertAdjacentElement('afterend', inline)
-                          } else {
-                            container.appendChild(inline)
-                          }
-                          // If still not visible inside #container, fall back to placing after the channel-name element (before badges)
-                          setTimeout(() => {
-                            try {
-                              const r = inline.getBoundingClientRect()
-                              const hidden = (r.width < 8 || r.height < 8 || getComputedStyle(inline).display === 'none')
-                              if (hidden && channelNameEl && channelNameEl.parentElement) {
-                                const siblingBadge = channelNameEl.parentElement.querySelector('ytd-badge-supported-renderer') as HTMLElement | null
-                                if (siblingBadge) channelNameEl.parentElement.insertBefore(inline, siblingBadge)
-                                else channelNameEl.insertAdjacentElement('afterend', inline)
-                                if (WOL_DEBUG) dbg('WOL results inline channel fallback after channel-name', { videoId: id, channelId })
-                              }
-                            } catch {}
-                          }, 50)
-                          if (WOL_DEBUG) dbg('WOL results inline channel injected', { videoId: id, channelId, url: chUrl!.href })
-                        } catch (err) { if (WOL_DEBUG) dbg('WOL results inline channel inject error', err) }
-                      }
-                      ensureInline()
-                      try { const mo = new MutationObserver(() => ensureInline()); mo.observe(container!, { childList: true, subtree: true }) } catch {}
-                    }
-                    else if (WOL_DEBUG) dbg('WOL results inline channel resolve failed', { channelId })
-                  }
-                  else if (WOL_DEBUG) dbg('WOL results could not determine channel id from nameAnchor', { href: nameAnchor?.href })
-                }
-                else if (WOL_DEBUG) dbg('WOL results channel name anchor not found inside videoRenderer')
-              }
+              
+              // Channel chips beside video results are handled by refreshResultsVideoChannelChips()
             }
             // Handle Shorts in grid shelf rows: add a bottom-right Watch pill
             // Shorts grid shelf tiles: place pill inside the larger tile container (not the anchor) to avoid autoplay overlap
             const gridItem = a.closest('.ytGridShelfViewModelGridShelfItem') as HTMLElement | null
-            if (settings.buttonVideoSub && gridItem && !gridItem.querySelector('[data-wol-inline-shorts-watch]')) {
+            if (settings.buttonVideoSub && url && gridItem && !gridItem.querySelector('[data-wol-inline-shorts-watch]')) {
               try {
                 // Ensure grid item can host an absolute child
                 const hostEl = gridItem
@@ -1864,17 +2294,37 @@ import { logger } from '../modules/logger'
         const videoResult = a.closest('ytd-video-renderer') as HTMLElement | null
         dbg('Watch on Odysee: Channel renderer found:', !!channelRenderer, 'Inside video result:', !!videoResult)
         if (channelRenderer) {
-          if (!settings.resultsApplySelections || !settings.buttonChannelSub) {
-            // If disabled, ensure any injected channel buttons are removed
-            try {
-              channelRenderer.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove())
-              channelRenderer.removeAttribute('data-wol-channel-button')
-            } catch {}
+          // Defer all /results channel-renderer buttons to the dedicated refresher
+          if (location.pathname === '/results') {
+            ;(a as any).dataset.wolEnhanced = 'done'
             continue
           }
-          // De-dupe: only inject one channel button per renderer
-          if (channelRenderer.getAttribute('data-wol-channel-button') === '1') {
+          if (!settings.resultsApplySelections || !settings.buttonChannelSub) {
+            // If disabled, ensure any injected channel buttons are removed and observers disconnected
+            try { cleanupResultsChannelButtons() } catch {}
             continue
+          }
+          // Reuse existing managed button for this renderer if present; just update the href and ensure attached
+          const existingState = channelRendererState.get(channelRenderer)
+          if (existingState?.btn) {
+            try {
+              const link = existingState.btn.querySelector('a') as HTMLAnchorElement | null
+              if (link) link.href = url.href
+              if (!existingState.btn.isConnected) {
+                const subBtn = channelRenderer.querySelector('#subscribe-button') as HTMLElement | null
+                const btns = (channelRenderer.querySelector('#buttons') as HTMLElement | null)
+                  || (channelRenderer.querySelector('#action-buttons') as HTMLElement | null)
+                  || (subBtn?.parentElement as HTMLElement | null)
+                  || channelRenderer
+                if (btns) {
+                  if (subBtn && subBtn.parentElement === btns) btns.insertBefore(existingState.btn, subBtn)
+                  else btns.appendChild(existingState.btn)
+                }
+              }
+              channelRenderer.setAttribute('data-wol-channel-button', '1')
+              ;(a as any).dataset.wolEnhanced = 'done'
+              continue
+            } catch {}
           }
           // Look for potential action containers in various layouts (search results, channel lists)
           const buttonsContainer = (channelRenderer.querySelector('#buttons') as HTMLElement | null)
@@ -1995,13 +2445,11 @@ import { logger } from '../modules/logger'
           }
 
           if (injected) {
-            // Mark renderer to prevent duplicate injections
+            // Mark renderer and manage via a single observer per renderer to prevent duplicates
             channelRenderer.setAttribute('data-wol-channel-button', '1')
-            // Keep the button present through renderer DOM churn (hover, dynamic updates)
             try {
               const ensurePresent = () => {
-                // Respect current setting; do not re-insert when channel buttons are disabled
-                if (!settings.buttonChannelSub) {
+                if (!settings.resultsApplySelections || !settings.buttonChannelSub) {
                   try { channelButton.remove() } catch {}
                   return
                 }
@@ -2016,8 +2464,11 @@ import { logger } from '../modules/logger'
                   else btns.appendChild(channelButton)
                 }
               }
+              const prev = channelRendererState.get(channelRenderer)
+              try { prev?.mo?.disconnect() } catch {}
               const crMo = new MutationObserver(() => { ensurePresent() })
               crMo.observe(channelRenderer, { childList: true, subtree: true })
+              channelRendererState.set(channelRenderer, { btn: channelButton, mo: crMo })
             } catch {}
           }
 
@@ -2790,9 +3241,15 @@ import { logger } from '../modules/logger'
 
        const source = await getSourceByUrl(urlNow)
        lastLoggedHref = urlNow.href
-       if (!source) { 
+       if (!source) {
+         // No page-level source (e.g., /results). Still refresh overlays and results chips.
          updateButtons(null)
-         return 
+         ensureOverlayEnhancementActive()
+         if (location.pathname === '/results' && settings.resultsApplySelections && settings.buttonChannelSub) {
+           try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
+           try { refreshResultsChannelRendererButtons().catch(e => logger.error(e)) } catch {}
+         }
+         return
        }
 
       // Compute targets: resolve both the primary item and (if video) the channel in a single call
@@ -2889,6 +3346,9 @@ import { logger } from '../modules/logger'
       }
       updateButtons({ buttonTargets: subscribeTargets, playerTarget, source })
       ensureOverlayEnhancementActive()
+      if (location.pathname === '/results' && settings.resultsApplySelections && settings.buttonChannelSub) {
+        try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
+      }
 
       // Redirect (guarded)
       let shouldRedirect = false
@@ -2923,257 +3383,6 @@ import { logger } from '../modules/logger'
         }
       }
     } catch (error) { logger.error(error) }
-  }
-
-  // Master Loop
-  for (
-    let url = new URL(location.href),
-    urlHrefCache: string | null = null;
-    ;
-    urlHrefCache = url.href,
-    url = new URL(location.href)
-  ) {
-    // Old periodic loop disabled; rely on event-driven processing
-    break
-
-    // Exit early if extension context has been invalidated
-    if (extensionContextInvalidated) {
-      logger.warn('Watch on Odysee: Extension context invalidated, stopping main loop. Please reload the page.')
-      break
-    }
-
-    try {
-      const urlNow = new URL(location.href)
-
-      // Clean up stale overlays when URL changes
-      if (urlNow.href !== urlHrefCache) {
-        // Use intelligent cleanup that preserves overlays when possible
-        cleanupOverlaysByPageContext()
-
-        // Clean up redirect tracking for old URLs when navigating
-        // Keep only the current URL and clear others to prevent memory buildup
-        const currentUrl = urlNow.href
-        const urlsToKeep = new Set([currentUrl])
-
-        for (const url of redirectedUrls) {
-          if (!urlsToKeep.has(url)) {
-            redirectedUrls.delete(url)
-          }
-        }
-      }
-
-      // Check if we're on a new video (different from last one)
-      if (urlNow.pathname.startsWith('/shorts/')) {
-        const currentShortsId = urlNow.pathname.split('/')[2]
-        if (currentShortsId && currentShortsId !== lastShortsChannelId) {
-          // New shorts video - clear cached channel data
-          lastShortsChannelId = currentShortsId
-          lastVideoPageChannelId = null
-          document.documentElement.removeAttribute('data-wol-channel-id')
-          // Force refresh of channel data
-          settingsDirty = true
-          lastResolveSig = null
-          lastResolved = {}
-        }
-      } else if (urlNow.pathname === '/watch') {
-        const currentVideoId = urlNow.searchParams.get('v')
-        if (currentVideoId && currentVideoId !== lastVideoPageChannelId) {
-          // New watch page video - clear cached channel data
-          lastVideoPageChannelId = null
-          document.documentElement.removeAttribute('data-wol-channel-id')
-          // Force refresh of channel data
-          settingsDirty = true
-          lastResolveSig = null
-          lastResolved = {}
-        }
-      }
-
-      const source = await getSourceByUrl(urlNow)
-      lastLoggedHref = urlNow.href
-      if (!source) {
-        updateButtons(null)
-        continue
-      }
-      // Compute targets: resolve both the primary item and (if video) the channel in a single call
-      let subscribeTargets: Target[] = []
-      let playerTarget: Target | null = null
-
-      const sourcesToResolve: Source[] = [source]
-
-      // If we are on a video page, also resolve the channel and show a channel button (if present)
-      let channelIdForVideoPage: string | null = null
-      if (source.type === 'video') {
-        let channelId: string | null = (document.documentElement.getAttribute('data-wol-channel-id') || null)
-
-        if (!channelId) {
-          // Try meta/LD+JSON/@handle fetch
-          channelId = document.querySelector<HTMLMetaElement>('meta[itemprop="channelId"]')?.content || null
-          if (!channelId) channelId = await getWatchPageChannelId()
-        }
-
-        if (!channelId) {
-          // Keep your old selectors, but add @handle variants
-          const ownerSelectors = [
-            'ytd-channel-name#channel-name a[href^="/channel/"]',
-            'ytd-channel-name#channel-name a[href^="/@"]',
-            'ytd-video-owner-renderer a[href^="/channel/"]',
-            'ytd-video-owner-renderer a[href^="/@"]',
-            '#owner a[href^="/channel/"]',
-            '#owner a[href^="/@"]',
-            '#watch-header a[href^="/channel/"]',
-            '.ytd-video-owner-renderer a[href^="/channel/"]',
-          ]
-          for (const selector of ownerSelectors) {
-            const ownerHref = document.querySelector<HTMLAnchorElement>(selector)?.href
-            if (ownerHref) {
-              try {
-                const p = new URL(ownerHref, location.origin).pathname.split('/')
-                // /channel/UC... -> p[2]
-                if (p[1] === 'channel' && p[2]?.startsWith('UC')) {
-                  channelId = p[2]
-                  break
-                }
-                // /@handle -> resolve via fetch
-                if (p[1]?.startsWith('@')) {
-                  const html = await (await fetch(ownerHref, { credentials: 'same-origin' })).text()
-                  const m = html.match(/"channelId"\s*:\s*"([^"]+)"/) ||
-                    html.match(/feeds\/videos\.xml\?channel_id=([A-Za-z0-9_-]+)/)
-                  if (m?.[1]?.startsWith('UC')) {
-                    channelId = m[1]
-                    break
-                  }
-                }
-              } catch { }
-            }
-          }
-        }
-
-        if (channelId) {
-          const channelSource: Source = { platform: source.platform, id: channelId, type: 'channel', url: urlNow, time: null }
-          sourcesToResolve.push(channelSource)
-          channelIdForVideoPage = channelId
-          lastVideoPageChannelId = channelId
-        }
-      }
-
-      // Resolve all at once (only if signature changed or periodic refresh needed)
-      const sig = sourcesToResolve.map(s => `${s.type}:${s.id}`).sort().join(',')
-      let resolved: Record<string, Target | null>
-      const needsResolve = settingsDirty || sig !== lastResolveSig || (Date.now() - lastResolveAt) > 10000
-      if (needsResolve) {
-        if (!resolveLogCache.has(sig)) {
-          resolveLogCache.add(sig)
-          logger.log('Resolving ids:', sig)
-        }
-        resolved = await getTargetsBySources(...sourcesToResolve)
-        lastResolved = resolved
-        lastResolveSig = sig
-        lastResolveAt = Date.now()
-        logger.log('Resolved results for:', sig, Object.keys(resolved))
-        settingsDirty = false
-      } else {
-        resolved = lastResolved
-      }
-      const primaryTarget = resolved[source.id] ?? findTargetFromSourcePage(source)
-      if (primaryTarget?.type === 'video') playerTarget = primaryTarget
-
-      // Build subscribe targets based on global toggles, not page-scoped
-      if (source.type === 'channel') {
-        if (settings.buttonChannelSub && primaryTarget) subscribeTargets.push(primaryTarget)
-      } else if (source.type === 'video') {
-        const vidTarget = resolved[source.id]
-        const chTarget = channelIdForVideoPage ? resolved[channelIdForVideoPage] : null
-        const isShorts = source.url.pathname.startsWith('/shorts/')
-        if (isShorts) {
-          if (settings.buttonChannelSub && chTarget) subscribeTargets.push(chTarget)
-          if (settings.buttonVideoSub && vidTarget) subscribeTargets.push(vidTarget)
-        } else {
-          if (settings.buttonChannelSub && chTarget) subscribeTargets.push(chTarget)
-          if (settings.buttonVideoSub && vidTarget) subscribeTargets.push(vidTarget)
-        }
-      }
-
-      if (subscribeTargets.length === 0 && !playerTarget) {
-        // No buttons to render now; keep overlays, but still assess redirect below
-        updateButtons(null)
-        ensureOverlayEnhancementActive()
-        // do not continue; allow redirect
-      }
-
-      // Update Buttons
-      if (urlHrefCache !== url.href || settingsDirty) updateButtons(null)
-      // If we have a player target (video), add timestamp
-      if (playerTarget?.type === 'video') {
-        const videoElement = document.querySelector<HTMLVideoElement>(source.platform.htmlQueries.videoPlayer)
-        if (videoElement) playerTarget.time = videoElement.currentTime > 3 && videoElement.currentTime < videoElement.duration - 1 ? videoElement.currentTime : null
-      }
-      // Render subscribe-area buttons and player button
-      updateButtons({ buttonTargets: subscribeTargets, playerTarget, source })
-
-      // Enhance all listing/related grids with Odysee logo on thumbnails
-      // Always enhance thumbnails, but exclude the main video area on watch pages
-      ensureOverlayEnhancementActive()
-
-      // Redirect
-      let shouldRedirect = false
-      let redirectTarget: Target | null = null
-      if (settings.redirectVideo && source.type === 'video' && !source.url.searchParams.has('list')) {
-        const vidTarget = resolved[source.id] ?? null
-        if (vidTarget?.type === 'video') { shouldRedirect = true; redirectTarget = vidTarget }
-      }
-      if (!shouldRedirect && settings.redirectChannel && source.type === 'channel') {
-        const channelRedirect = resolved[source.id] ?? null
-        if (channelRedirect) {
-          shouldRedirect = true
-          redirectTarget = channelRedirect
-        }
-      }
-
-      if (shouldRedirect && redirectTarget) {
-        if (url.href === urlHrefCache) continue
-
-        // Prevent multiple redirects for the same URL
-        const currentUrl = url.href
-        const now = Date.now()
-
-        // Check if we've already redirected this URL recently (within 30 seconds)
-        if (redirectedUrls.has(currentUrl)) {
-          logger.log('Watch on Odysee: Skipping redirect - already redirected this URL:', currentUrl)
-          continue
-        }
-
-        // Throttle redirects to prevent rapid-fire redirects
-        if (now - lastRedirectTime < 5000) { // Wait at least 5 seconds between any redirects
-          logger.log('Watch on Odysee: Throttling redirect - too soon since last redirect')
-          continue
-        }
-
-        const odyseeURL = getOdyseeUrlByTarget(redirectTarget)
-
-        // Mark this URL as redirected
-        redirectedUrls.add(currentUrl)
-        lastRedirectTime = now
-
-        // Clean up old entries after 2 minutes to prevent memory buildup
-        setTimeout(() => {
-          redirectedUrls.delete(currentUrl)
-        }, 120000)
-
-        logger.log('Watch on Odysee: Redirecting to:', odyseeURL.href)
-
-        if (source.type === 'video') {
-          findVideoElementAwait(source).then((videoElement) => videoElement.pause())
-        }
-
-        openNewTab(odyseeURL, 'auto')
-        if (window.history.length === 1)
-          window.close()
-        else
-          window.history.back()
-      }
-    } catch (error) {
-      logger.error(error)
-    }
   }
 
   // Initial kick using event-driven flow
