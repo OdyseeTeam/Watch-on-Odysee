@@ -42,6 +42,125 @@ import { logger } from '../modules/logger'
   const redirectedUrls = new Set<string>()
   let lastRedirectTime = 0
 
+  // Performance optimization: Task scheduler to coalesce heavy work
+  const scheduledTasks = new Map<string, number>()
+  const taskLastRun = new Map<string, number>()
+
+  function scheduleTask(taskName: string, fn: () => void | Promise<void>, delay: number = 100) {
+    const existing = scheduledTasks.get(taskName)
+    if (existing) clearTimeout(existing)
+
+    // Enforce minimum time between task runs for specific heavy tasks
+    const now = Date.now()
+    const lastRun = taskLastRun.get(taskName) || 0
+    const minInterval = taskName === 'enhanceListings' && location.pathname === '/watch' ? 500 : 200
+    const effectiveDelay = Math.max(delay, minInterval - (now - lastRun))
+
+    const timer = window.setTimeout(() => {
+      scheduledTasks.delete(taskName)
+      taskLastRun.set(taskName, Date.now())
+      try {
+        const result = fn()
+        if (result instanceof Promise) {
+          result.catch(e => logger.error(`Scheduled task ${taskName} failed:`, e))
+        }
+      } catch (e) {
+        logger.error(`Scheduled task ${taskName} failed:`, e)
+      }
+    }, effectiveDelay)
+
+    scheduledTasks.set(taskName, timer)
+  }
+
+  // Idle yield helper to prevent blocking the main thread
+  function idleYield(timeout: number = 50): Promise<void> {
+    return new Promise(resolve => {
+      if ('requestIdleCallback' in window) {
+        requestIdleCallback(() => resolve(), { timeout })
+      } else {
+        setTimeout(() => resolve(), Math.min(timeout, 16))
+      }
+    })
+  }
+
+  // Async batch DOM operations with yielding
+  async function asyncBatchRemove(selector: string, batchSize: number = 20) {
+    const elements = Array.from(document.querySelectorAll(selector))
+    for (let i = 0; i < elements.length; i++) {
+      elements[i].remove()
+      if ((i + 1) % batchSize === 0 && i < elements.length - 1) {
+        await idleYield(30)
+      }
+    }
+  }
+
+  async function asyncBatchProcess<T extends Element>(
+    selector: string,
+    processor: (el: T) => void,
+    batchSize: number = 20
+  ) {
+    const elements = Array.from(document.querySelectorAll<T>(selector))
+    for (let i = 0; i < elements.length; i++) {
+      try {
+        processor(elements[i])
+      } catch {}
+      if ((i + 1) % batchSize === 0 && i < elements.length - 1) {
+        await idleYield(30)
+      }
+    }
+  }
+
+  // Batched cleanup operations
+  async function performBatchedCleanup() {
+    // Remove inline watch buttons
+    await asyncBatchRemove('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch]')
+    // Remove channel buttons
+    await asyncBatchRemove('a[data-wol-inline-channel], [data-wol-results-channel-btn]')
+    // Remove overlays
+    await asyncBatchRemove('[data-wol-overlay]')
+    // Clear attributes
+    await asyncBatchProcess<HTMLElement>(
+      'ytd-channel-renderer[data-wol-channel-button]',
+      el => el.removeAttribute('data-wol-channel-button')
+    )
+    await asyncBatchProcess<HTMLElement>(
+      'ytd-video-renderer a[data-wol-enhanced], ytd-channel-renderer a[data-wol-enhanced], .ytGridShelfViewModelGridShelfItem a[data-wol-enhanced]',
+      el => el.removeAttribute('data-wol-enhanced')
+    )
+  }
+
+  // Schedule heavy operations instead of calling directly
+  function scheduleEnhanceListings(delay: number = 100) {
+    // For watch pages with related content, use longer delay to batch more effectively
+    const effectiveDelay = location.pathname === '/watch' ? Math.max(delay, 150) : delay
+    scheduleTask('enhanceListings', () => enhanceVideoTilesOnListings(), effectiveDelay)
+  }
+
+  function scheduleRefreshResultsChips(delay: number = 120) {
+    scheduleTask('refreshChips', () => refreshResultsVideoChannelChips(), delay)
+  }
+
+  function scheduleRefreshChannelButtons(delay: number = 150) {
+    scheduleTask('refreshChannelButtons', () => refreshResultsChannelRendererButtons(), delay)
+  }
+
+  function scheduleBatchedCleanup(delay: number = 50) {
+    scheduleTask('batchedCleanup', () => performBatchedCleanup(), delay)
+  }
+
+  // Wrapper to call async cleanup functions without waiting
+  function triggerCleanupOverlays() {
+    cleanupOverlays().catch(e => logger.error('Cleanup overlays failed:', e))
+  }
+
+  function triggerCleanupResultsChannelButtons(options?: { disconnectOnly?: boolean }) {
+    cleanupResultsChannelButtons(options).catch(e => logger.error('Cleanup channel buttons failed:', e))
+  }
+
+  function triggerCleanupResultsVideoChips(options?: { disconnectOnly?: boolean }) {
+    cleanupResultsVideoChips(options).catch(e => logger.error('Cleanup video chips failed:', e))
+  }
+
   // Global mutation observer for video tile enhancement
   let wolMutationObserver: MutationObserver | null = null
   // Extension boot tracking (for debugging)
@@ -169,15 +288,15 @@ import { logger } from '../modules/logger'
   try {
     const bumpGen = () => {
       overlayGeneration++
-      cleanupOverlays()
+      triggerCleanupOverlays()
       // Also clear any managed channel buttons on results to avoid stale observers/elements
-      try { cleanupResultsChannelButtons() } catch {}
-      try { cleanupResultsVideoChips({ disconnectOnly: true }) } catch {}
+      try { triggerCleanupResultsChannelButtons() } catch {}
+      try { triggerCleanupResultsVideoChips({ disconnectOnly: true }) } catch {}
       resetRelatedBatch()
       lastEnhanceTime = 0; lastEnhanceUrl = ''
-      // Slight delay to allow related tiles to populate so more get overlays at once
-      setTimeout(() => enhanceVideoTilesOnListings().catch(e => logger.error(e)), 600)
-      setTimeout(() => { try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {} }, 700)
+      // Longer delay on navigation to allow DOM to settle and batch more work
+      scheduleEnhanceListings(800)
+      scheduleRefreshResultsChips(900)
       // Also refresh page-level buttons/redirects once per navigation
       scheduleProcessCurrentPage(100)
       // Ensure results pills visibility reflects current setting on navigation
@@ -210,7 +329,7 @@ import { logger } from '../modules/logger'
             }
             // Use the comprehensive cleanup function
             logger.log('Watch on Odysee: Overlay setting disabled, cleaning up overlays')
-            cleanupOverlays()
+            triggerCleanupOverlays()
           }
         }
         // Apply/unapply results inline UI immediately on relevant toggle flips
@@ -227,8 +346,8 @@ import { logger } from '../modules/logger'
                 document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
                   .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
                 // Disconnect per-renderer observers and clear state to prevent reinsertion from old observers
-                cleanupResultsChannelButtons()
-                cleanupResultsVideoChips()
+                triggerCleanupResultsChannelButtons()
+                triggerCleanupResultsVideoChips()
               }
               // Enforce on every toggle flip
               enforceResultsChannelChipVisibility()
@@ -238,13 +357,13 @@ import { logger } from '../modules/logger'
                   document.querySelectorAll('ytd-video-renderer a[data-wol-enhanced], ytd-channel-renderer a[data-wol-enhanced], .ytGridShelfViewModelGridShelfItem a[data-wol-enhanced]')
                     .forEach(el => el.removeAttribute('data-wol-enhanced'))
                   // Also clear any per-renderer state and disconnect stale observers before reinjecting
-                  cleanupResultsChannelButtons()
-                  cleanupResultsVideoChips({ disconnectOnly: true })
+                  triggerCleanupResultsChannelButtons()
+                  triggerCleanupResultsVideoChips({ disconnectOnly: true })
                 } catch {}
                 // Immediately re-run chip refresher; then run again shortly to catch late DOM
-                try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
-                try { setTimeout(() => refreshResultsVideoChannelChips().catch(e => logger.error(e)), 120) } catch {}
-                try { setTimeout(() => refreshResultsChannelRendererButtons().catch(e => logger.error(e)), 150) } catch {}
+                scheduleRefreshResultsChips(50)
+                scheduleRefreshResultsChips(120)
+                scheduleRefreshChannelButtons(150)
               }
               // Update CSS guard
               try { ensureResultsPillsVisibility() } catch {}
@@ -275,7 +394,7 @@ import { logger } from '../modules/logger'
                 // Bypass enhancement throttling and immediately re-run for results
                 try { lastEnhanceTime = 0; lastEnhanceUrl = '' } catch {}
                 if (location.pathname === '/results') {
-                  setTimeout(() => enhanceVideoTilesOnListings().catch(e => logger.error(e)), 50)
+                  scheduleEnhanceListings(50)
                 }
               }
             }
@@ -286,8 +405,8 @@ import { logger } from '../modules/logger'
                 document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
                   .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
                 // Disconnect any observers tied to channel renderers; clear state
-                cleanupResultsChannelButtons()
-                cleanupResultsVideoChips()
+                triggerCleanupResultsChannelButtons()
+                triggerCleanupResultsVideoChips()
                 // Shorts subscribe mount cleanup
                 try { render(<WatchOnOdyseeButtons />, shortsSubscribeMountPoint) } catch {}
                 // Strict enforcement: remove any stray chips
@@ -301,8 +420,8 @@ import { logger } from '../modules/logger'
                 document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
                   .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
                 // Disconnect old observers so they don't reinsert stale buttons
-                cleanupResultsChannelButtons({ disconnectOnly: true })
-                cleanupResultsVideoChips({ disconnectOnly: true })
+                triggerCleanupResultsChannelButtons({ disconnectOnly: true })
+                triggerCleanupResultsVideoChips({ disconnectOnly: true })
                 
                 // Then clear enhanced flags so channels get re-processed
                 document.querySelectorAll('ytd-channel-renderer a[data-wol-enhanced="done"]')
@@ -314,8 +433,8 @@ import { logger } from '../modules/logger'
                 if (location.pathname === '/results') {
                   setTimeout(() => {
                     // Run both the regular enhance pass and the direct channel-chip refresh
-                    try { enhanceVideoTilesOnListings().catch(e => logger.error(e)) } catch {}
-                    try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
+                    scheduleEnhanceListings(0)
+                    scheduleRefreshResultsChips(0)
                   }, 50)
                 }
               }
@@ -352,9 +471,9 @@ import { logger } from '../modules/logger'
            try {
              // Force a slightly longer delay to ensure cleanup is complete first
              setTimeout(() => {
-               try { enhanceVideoTilesOnListings().catch(e => logger.error(e)) } catch {}
-               try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
-               try { refreshResultsChannelRendererButtons().catch(e => logger.error(e)) } catch {}
+               scheduleEnhanceListings(0)
+               scheduleRefreshResultsChips(0)
+               scheduleRefreshChannelButtons(0)
              }, 100)
            } catch {}
          }
@@ -366,8 +485,8 @@ import { logger } from '../modules/logger'
         try { lastEnhanceTime = 0; lastEnhanceUrl = '' } catch {}
         scheduleProcessCurrentPage(0)
         try { setTimeout(() => {
-          try { enhanceVideoTilesOnListings().catch(e => logger.error(e)) } catch {}
-          try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
+          scheduleEnhanceListings(0)
+          scheduleRefreshResultsChips(0)
         }, 50) } catch {}
       }
 
@@ -418,6 +537,174 @@ import { logger } from '../modules/logger'
   const shortsSubscribeMountPoint = document.createElement('div')
   shortsSubscribeMountPoint.style.display = 'inline-flex'
 
+  // Default pill height used as a safe fallback when reference height is not yet measurable
+  const DEFAULT_PILL_HEIGHT = 36
+
+  // Sync our wrapper and inner anchors to the height of a reference element (e.g., Subscribe)
+  function syncHeightToReference(refEl: HTMLElement | null) {
+    if (!refEl) return
+    const apply = (h: number) => {
+      const use = (!h || h <= 0) ? DEFAULT_PILL_HEIGHT : Math.max(h, DEFAULT_PILL_HEIGHT)
+      const hpx = `${Math.round(use)}px`
+      buttonMountPoint.style.height = hpx
+      try {
+        const anchors = buttonMountPoint.querySelectorAll('a[role="button"], a') as unknown as HTMLElement[]
+        anchors.forEach(a => {
+          a.style.height = hpx
+          a.style.lineHeight = 'normal'
+          a.style.display = 'inline-flex'
+          a.style.alignItems = 'center'
+          a.style.boxSizing = 'border-box'
+        })
+      } catch {}
+    }
+    // Apply immediately if we have some size, but also observe for subsequent growth
+    let last = 0
+    const h0 = refEl.offsetHeight || refEl.clientHeight || 0
+    if (h0 > 0) { last = h0; apply(h0) } else { apply(DEFAULT_PILL_HEIGHT) }
+    // Defer until YouTube finishes laying out the Subscribe control; update on any growth
+    try {
+      const ro = new ResizeObserver(() => {
+        const h = refEl.offsetHeight || refEl.clientHeight || 0
+        if (h > 0 && Math.round(h) !== Math.round(last)) {
+          last = h
+          apply(h)
+        }
+      })
+      ro.observe(refEl)
+      // Safety disconnect after a short period to avoid keeping observers around forever
+      setTimeout(() => { try { ro.disconnect() } catch {} }, 4000)
+    } catch {
+      // Fallback: a few animation frames
+      let attempts = 12
+      const tick = () => {
+        const h = refEl.offsetHeight || refEl.clientHeight || 0
+        if (h > 0 && Math.round(h) !== Math.round(last)) { last = h; apply(h) }
+        if (attempts-- > 0) requestAnimationFrame(tick)
+      }
+      requestAnimationFrame(tick)
+    }
+  }
+
+  // Generic: sync an arbitrary container (and its anchors) to match a reference element's height
+  function syncContainerHeightToReference(container: HTMLElement, refEl: HTMLElement | null) {
+    if (!refEl) return
+    // Avoid showing a too-small pill: keep container hidden until we apply a non-zero height at least once
+    let revealed = false
+    let lastApplied = 0
+    let stableCount = 0
+    // Safety: reveal after a short settle window even if no further size events arrive
+    const settleMs = 500
+    const revealTimer = setTimeout(() => { if (!revealed) { try { container.style.visibility = '' } catch {}; revealed = true } }, settleMs)
+    const hideIfNeeded = () => {
+      try {
+        const ch = container.offsetHeight || container.clientHeight || 0
+        if (ch === 0) container.style.visibility = 'hidden'
+      } catch {}
+    }
+    hideIfNeeded()
+    const apply = (h: number) => {
+      const use = (!h || h <= 0) ? DEFAULT_PILL_HEIGHT : Math.max(h, DEFAULT_PILL_HEIGHT)
+      const hpx = `${Math.round(use)}px`
+      container.style.height = hpx
+      container.style.minHeight = `${DEFAULT_PILL_HEIGHT}px`
+      try {
+        const anchors = container.querySelectorAll('a[role="button"], a') as unknown as HTMLElement[]
+        anchors.forEach(a => {
+          a.style.height = hpx
+          a.style.lineHeight = 'normal'
+          a.style.display = 'inline-flex'
+          a.style.alignItems = 'center'
+          a.style.boxSizing = 'border-box'
+        })
+      } catch {}
+      // Only reveal once height appears stable across at least two consecutive applies
+      if (Math.round(use) === Math.round(lastApplied)) stableCount++
+      else stableCount = 0
+      lastApplied = use
+      if (!revealed && stableCount >= 1) { // two consecutive matches
+        try { container.style.visibility = '' } catch {}
+        revealed = true
+        try { clearTimeout(revealTimer) } catch {}
+      }
+    }
+    let last = 0
+    const h0 = refEl.offsetHeight || refEl.clientHeight || 0
+    if (h0 > 0) { last = h0; apply(h0) } else { apply(DEFAULT_PILL_HEIGHT) }
+    try {
+      const ro = new ResizeObserver(() => {
+        const h = refEl.offsetHeight || refEl.clientHeight || 0
+        if (h > 0 && Math.round(h) !== Math.round(last)) { last = h; apply(h) }
+      })
+      ro.observe(refEl)
+      setTimeout(() => { try { ro.disconnect() } catch {} }, 4000)
+    } catch {
+      let attempts = 12
+      const tick = () => {
+        const h = refEl.offsetHeight || refEl.clientHeight || 0
+        if (h > 0 && Math.round(h) !== Math.round(last)) { last = h; apply(h) }
+        if (attempts-- > 0) requestAnimationFrame(tick)
+      }
+      requestAnimationFrame(tick)
+    }
+  }
+
+  // Lock widths of our rendered action anchors to prevent post-load reflow
+  function lockButtonWidthsIn(container: HTMLElement) {
+    try {
+      const anchors = Array.from(container.querySelectorAll<HTMLAnchorElement>('a[role="button"]'))
+      for (const a of anchors) {
+        if ((a as any).dataset?.wolWidthLocked === '1') continue
+        // Ensure minimum width for Channel and Watch buttons
+        const isChannelButton = a.textContent?.includes('Channel')
+        const isWatchButton = a.textContent?.includes('Watch')
+        if (isChannelButton) {
+          a.style.minWidth = '100px'
+          a.style.width = 'auto'
+        } else if (isWatchButton) {
+          a.style.minWidth = '85px'
+          a.style.width = 'auto'
+        } else {
+          const rect = a.getBoundingClientRect()
+          if (rect && rect.width > 0) {
+            const w = Math.round(rect.width)
+            a.style.width = `${w}px`
+            a.style.minWidth = `${w}px`
+          }
+        }
+        ;(a as any).dataset.wolWidthLocked = '1'
+      }
+    } catch {}
+  }
+
+  // Compute a reasonable single-line height for a heading element
+  function getLineHeightPx(el: HTMLElement | null): number | null {
+    if (!el) return null
+    try {
+      const cs = getComputedStyle(el)
+      const lh = cs.lineHeight
+      if (lh && lh.endsWith('px')) return Math.max(parseFloat(lh) || 0, DEFAULT_PILL_HEIGHT)
+      const fs = parseFloat(cs.fontSize || '0') || 0
+      if (fs > 0) return Math.max(Math.round(fs * 1.3), DEFAULT_PILL_HEIGHT)
+    } catch {}
+    return DEFAULT_PILL_HEIGHT
+  }
+
+  // Find the actual Subscribe button element (not just the host) for reliable height
+  function findSubscribeRefButton(from: Element | null): HTMLElement | null {
+    if (!from) return null
+    const q = (
+      from.querySelector('.ytSubscribeButtonViewModelContainer > button') as HTMLElement | null
+    ) || (
+      from.querySelector('button.yt-spec-button-shape-next') as HTMLElement | null
+    ) || (
+      from.querySelector('yt-animated-action .ytSubscribeButtonViewModelContainer button') as HTMLElement | null
+    ) || (
+      from.querySelector('button[aria-label^="Subscribe"], button[aria-label*="Subscribe"]') as HTMLElement | null
+    )
+    return q
+  }
+
   function WatchOnOdyseeButtons({ source, targets, compact }: { source?: Source, targets?: Target[], compact?: boolean }) {
     if (!source || !targets || targets.length === 0) return null
     return <div style={{ display: 'inline-flex' }}>
@@ -428,22 +715,27 @@ import { logger } from '../modules/logger'
           <div style={{ display: 'flex', height: '100%', alignItems: 'center', alignContent: 'center', minWidth: 'fit-content', marginRight: '6px'}}>
       <a href={`${url.href}`} target='_blank' role='button'
         style={{
-                display: 'flex', alignItems: 'center', gap: compact ? '0' : '6px', borderRadius: '16px', padding: compact ? '0 4px' : '0 12px', height: '100%',
-                fontWeight: 500, border: '0', color: 'whitesmoke', fontSize: compact ? '0' : '13px', textDecoration: 'none',
+                display: 'flex', alignItems: 'center', gap: compact ? '0' : '6px', borderRadius: '16px', padding: compact ? '0 4px' : '0 12px', height: '100%', minHeight: `${DEFAULT_PILL_HEIGHT}px`,
+                // Match YouTube subscribe control sizing
+                boxSizing: 'border-box',
+                lineHeight: 'normal',
+                fontWeight: 500, border: '0', color: 'whitesmoke', fontSize: compact ? '0' : '14px', textDecoration: 'none',
                 backgroundColor: target.platform.theme, backgroundImage: target.platform.theme,
+                minWidth: isChannel ? '100px' : '85px',
+                width: 'auto',
           ...target.platform.button.style?.button,
         }}
               onClick={(e: any) => { e.preventDefault(); e.stopPropagation(); openNewTab(url, 'user'); findVideoElementAwait(source).then((videoElement) => { videoElement.pause() }) }}
             >
               {isChannel ? (
                 h(Fragment, null,
-                  h('img', { src: target.platform.button.icon, height: 20, style: { ...(target.platform.button.style?.icon || {}) } } as any),
+                  h('img', { src: target.platform.button.icon, height: 20, style: { display: 'block', ...(target.platform.button.style?.icon || {}) } } as any),
                   !compact && h('span', { style: { minWidth: 'fit-content', whiteSpace: 'nowrap' } as any }, 'Channel')
                 )
               ) : (
                 h(Fragment, null,
                   !compact && h('span', { style: { minWidth: 'fit-content', whiteSpace: 'nowrap' } as any }, 'Watch'),
-                  h('img', { src: target.platform.button.icon, height: 20, style: { ...(target.platform.button.style?.icon || {}) } } as any)
+                  h('img', { src: target.platform.button.icon, height: 20, style: { display: 'block', ...(target.platform.button.style?.icon || {}) } } as any)
                 )
               )}
             </a>
@@ -482,6 +774,10 @@ import { logger } from '../modules/logger'
   }
 
   function updateButtons(params: { source: Source, buttonTargets: Target[] | null, playerTarget: Target | null } | null): void {
+    try {
+      const info = params ? { path: location.pathname, type: params.source?.type, targets: params.buttonTargets?.length || 0 } : { path: location.pathname, type: 'none', targets: 0 }
+      logger.log('Watch on Odysee: updateButtons', info)
+    } catch {}
     if (!params) {
       render(<WatchOnOdyseeButtons />, buttonMountPoint)
       render(<WatchOnOdyseePlayerButton />, playerButtonMountPoint)
@@ -596,6 +892,9 @@ import { logger } from '../modules/logger'
           if (settings.buttonChannelSub) {
             const channelBar = document.querySelector('ytd-reel-player-overlay-renderer yt-reel-channel-bar-view-model') as HTMLElement | null
             const channelName = channelBar?.querySelector('.ytReelChannelBarViewModelChannelName') as HTMLElement | null
+            // Try to locate the Shorts subscribe control to height-match (button inside the view-model)
+            const shortsSubscribe = (channelBar?.querySelector('yt-subscribe-button-view-model') as HTMLElement | null)
+              || (document.querySelector('ytd-reel-player-overlay-renderer yt-subscribe-button-view-model') as HTMLElement | null)
 
             if (channelBar && channelName) {
               if (shortsSubscribeMountPoint.getAttribute('data-id') !== params.source.id || shortsSubscribeMountPoint.parentElement !== channelBar) {
@@ -603,26 +902,79 @@ import { logger } from '../modules/logger'
                 // Insert to the right of channel name
                 channelName.insertAdjacentElement('afterend', shortsSubscribeMountPoint)
               }
-              // Match height to channel name
-              const hb = (channelName as HTMLElement | null)?.offsetHeight || (channelName as HTMLElement | null)?.clientHeight || 32
-              shortsSubscribeMountPoint.style.height = `${hb}px`
+              // Keep layout consistent and height synced to Shorts Subscribe
               shortsSubscribeMountPoint.style.display = 'inline-flex'
               shortsSubscribeMountPoint.style.alignItems = 'center'
               shortsSubscribeMountPoint.style.marginLeft = '8px'
               shortsSubscribeMountPoint.style.marginRight = '0'
+              // Sync height to the actual subscribe element when it settles
+              try { syncContainerHeightToReference(shortsSubscribeMountPoint, shortsSubscribe || channelName) } catch {}
               const channelTargets = (params.buttonTargets ?? []).filter(t => t.type === 'channel')
               if (channelTargets.length > 0) {
                 render(<WatchOnOdyseeButtons targets={channelTargets} source={params.source} />, shortsSubscribeMountPoint)
+                try { lockButtonWidthsIn(shortsSubscribeMountPoint) } catch {}
               }
             }
           }
           // Done with shorts subscribe handling
           return
         }
-        // Video page: place our buttons in a right-aligned action wrapper so the channel name keeps space
+        // Video page: prefer placing buttons inline with the title (top area under the video)
         if (params.source.type === 'video') {
-          const subscribeAction = (mountBefore.closest('.yt-flexible-actions-view-model-wiz__action') as HTMLElement | null) || (mountBefore.parentElement as HTMLElement | null)
-          const actionsContainer = subscribeAction?.parentElement as HTMLElement | null
+          const isShorts = params.source.url.pathname.startsWith('/shorts/')
+          if (!isShorts) {
+            const titleHost = (document.querySelector('ytd-watch-metadata #title') as HTMLElement | null)
+              || (document.querySelector('ytd-watch-metadata h1')?.parentElement as HTMLElement | null)
+            const h1 = (document.querySelector('ytd-watch-metadata #title h1') as HTMLElement | null)
+              || (document.querySelector('ytd-watch-metadata h1') as HTMLElement | null)
+            if (titleHost && h1) {
+              const cs = getComputedStyle(titleHost)
+              if (cs.position === 'static') titleHost.style.position = 'relative'
+              let titleMount = titleHost.querySelector('div[data-wol-title-buttons="1"]') as HTMLElement | null
+              if (!titleMount) {
+                titleMount = document.createElement('div')
+                titleMount.setAttribute('data-wol-title-buttons', '1')
+                titleMount.style.position = 'absolute'
+                titleMount.style.right = '0'
+                titleMount.style.top = '0'
+                titleMount.style.display = 'inline-flex'
+                titleMount.style.alignItems = 'center'
+                titleMount.style.pointerEvents = 'auto'
+                titleMount.style.zIndex = '4'
+                titleHost.appendChild(titleMount)
+              }
+              // Match the visual line height of the first title line for vertical alignment
+              const lh = getLineHeightPx(h1) || DEFAULT_PILL_HEIGHT
+              const h1Styles = getComputedStyle(h1)
+              const h1PaddingTop = parseFloat(h1Styles.paddingTop) || 0
+              const h1MarginTop = parseFloat(h1Styles.marginTop) || 0
+
+              // Position buttons to align with the baseline of the first line of title text
+              titleMount.style.height = `${Math.max(lh, DEFAULT_PILL_HEIGHT)}px`
+              titleMount.style.top = `${h1PaddingTop + h1MarginTop}px`
+
+              // Render buttons
+              if (buttonMountPoint.parentElement !== titleMount) {
+                titleMount.appendChild(buttonMountPoint)
+              }
+              buttonMountPoint.style.display = 'inline-flex'
+              buttonMountPoint.style.alignItems = 'center'
+              buttonMountPoint.style.marginLeft = '8px'
+              buttonMountPoint.style.marginRight = '0'
+              ;(buttonMountPoint.style as any).order = '1000'
+              buttonMountPoint.style.flex = '0 0 auto'
+              buttonMountPoint.setAttribute('data-id', params.source.id)
+              render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
+              try { lockButtonWidthsIn(buttonMountPoint) } catch {}
+              // Done with preferred title placement
+              return
+            }
+          }
+          // Fallback: place our buttons in a right-aligned action wrapper so the channel name keeps space
+          const subscribeAction = (mountBefore.closest('.yt-flexible-actions-view-model-wiz__action, .ytFlexibleActionsViewModelAction') as HTMLElement | null)
+          const actionsContainer = (
+            document.querySelector('#actions #top-level-buttons-computed') as HTMLElement | null
+          ) || (subscribeAction?.parentElement as HTMLElement | null)
           if (actionsContainer) {
             // Use a dedicated right-aligned action wrapper so we don't compete with the channel name area
             let rightWrapper = actionsContainer.querySelector('div[data-wol-action-wrapper-right="1"]') as HTMLElement | null
@@ -638,16 +990,14 @@ import { logger } from '../modules/logger'
               rightWrapper.style.marginLeft = 'auto'
               // Ensure our wrapper doesn't flex-grow and eat channel-name width
               rightWrapper.style.flex = '0 0 auto'
+              // Force order to the far right even if more actions are added later
+              ;(rightWrapper.style as any).order = '9999'
             }
             if (!rightWrapper.contains(buttonMountPoint)) rightWrapper.appendChild(buttonMountPoint)
             if (rightWrapper.parentElement !== actionsContainer) actionsContainer.appendChild(rightWrapper)
 
             // Height sync with Subscribe for visual alignment
-            try {
-              const hb = (mountBefore as HTMLElement)
-              const hpx = hb.offsetHeight || hb.clientHeight
-              if (hpx) buttonMountPoint.style.height = `${hpx}px`
-            } catch {}
+            try { syncHeightToReference(mountBefore as HTMLElement) } catch {}
             buttonMountPoint.style.display = 'inline-flex'
             buttonMountPoint.style.alignItems = 'center'
             buttonMountPoint.style.alignSelf = 'center'
@@ -658,12 +1008,13 @@ import { logger } from '../modules/logger'
             ;(buttonMountPoint.style as any).order = '1000'
             buttonMountPoint.setAttribute('data-id', params.source.id)
             render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
+            try { lockButtonWidthsIn(buttonMountPoint) } catch {}
 
             // Precise vertical alignment: match the visual center of the first action icon
             const alignToRow = () => {
               try {
                 // Prefer the primary actions row in watch metadata
-                const row = document.querySelector('#actions #top-level-buttons-computed') as HTMLElement | null
+              const row = document.querySelector('#actions #top-level-buttons-computed') as HTMLElement | null
                 const refBtn = (row?.querySelector('button, a, yt-button-shape button, yt-button-shape a, ytd-toggle-button-renderer button, segmented-like-dislike-button-view-model button, ytd-segmented-like-dislike-button-renderer button') as HTMLElement | null)
                   || (actionsContainer.querySelector('button, a') as HTMLElement | null)
                 if (!refBtn) return
@@ -697,11 +1048,7 @@ import { logger } from '../modules/logger'
                 buttonMountPoint.setAttribute('data-id', params.source.id)
                 ;(mountBefore as HTMLElement).insertAdjacentElement('afterend', buttonMountPoint)
               }
-              try {
-                const hb = (mountBefore as HTMLElement)
-                const hpx = hb.offsetHeight || hb.clientHeight
-                if (hpx) buttonMountPoint.style.height = `${hpx}px`
-              } catch {}
+              try { syncHeightToReference(mountBefore as HTMLElement) } catch {}
               buttonMountPoint.style.display = 'inline-flex'
               buttonMountPoint.style.alignItems = 'center'
               buttonMountPoint.style.alignSelf = 'center'
@@ -711,6 +1058,7 @@ import { logger } from '../modules/logger'
               buttonMountPoint.style.flex = '0 0 auto'
               ;(buttonMountPoint.style as any).order = '1000'
               render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
+              try { lockButtonWidthsIn(buttonMountPoint) } catch {}
 
               // Fallback alignment relative to Subscribe element
               const alignToSub = () => {
@@ -738,24 +1086,63 @@ import { logger } from '../modules/logger'
             }
           }
         } else {
-          // Channel and other pages: keep right-of-Subscribe placement
-          const subscribeAction = (mountBefore.closest('.yt-flexible-actions-view-model-wiz__action') as HTMLElement | null) || (mountBefore.parentElement as HTMLElement | null)
-          const actionsContainer = subscribeAction?.parentElement
-          if (actionsContainer) {
-            let wrapper = actionsContainer.querySelector('div[data-wol-action-wrapper="1"]') as HTMLElement | null
-            if (!wrapper) {
-              wrapper = document.createElement('div')
-              wrapper.setAttribute('data-wol-action-wrapper', '1')
-              wrapper.className = 'yt-flexible-actions-view-model-wiz__action'
-              wrapper.style.display = 'inline-flex'
-              wrapper.style.alignItems = 'center'
-              wrapper.style.margin = '0'
+          // Channel and other pages: try creating a dedicated action item right next to Subscribe (preferred)
+          {
+            const subscribeActionBlock = (mountBefore.closest('.ytFlexibleActionsViewModelAction') as HTMLElement | null)
+              || (document.querySelector('yt-flexible-actions-view-model .ytFlexibleActionsViewModelAction') as HTMLElement | null)
+            if (subscribeActionBlock) {
+              // Schedule placement until a reliable height is available
+              const myVersion = (++channelMainActionVersion)
+              const maxAttempts = 40
+              const attemptDelay = 60
+              const tryPlace = (attempt: number) => {
+                if (myVersion !== channelMainActionVersion) return
+                let channelAction = subscribeActionBlock.parentElement?.querySelector('div[data-wol-channel-action="1"]') as HTMLElement | null
+                if (!channelAction) {
+                  channelAction = document.createElement('div')
+                  channelAction.setAttribute('data-wol-channel-action', '1')
+                  channelAction.className = 'ytFlexibleActionsViewModelAction'
+                  channelAction.style.display = 'inline-flex'
+                  channelAction.style.alignItems = 'center'
+                  channelAction.style.margin = '0'
+                  subscribeActionBlock.insertAdjacentElement('afterend', channelAction)
+                }
+                if (!channelAction.contains(buttonMountPoint)) channelAction.appendChild(buttonMountPoint)
+                buttonMountPoint.setAttribute('data-id', params.source.id)
+
+                const refBtn = findSubscribeRefButton(mountBefore as HTMLElement)
+                const refH = refBtn ? (refBtn.offsetHeight || refBtn.clientHeight || 0) : 0
+                if (refH < 30 && attempt < maxAttempts) {
+                  // Wait a bit longer for the VM to finish sizing the inner button
+                  setTimeout(() => tryPlace(attempt + 1), attemptDelay)
+                  return
+                }
+                // Height sync and render
+                try { syncContainerHeightToReference(channelAction!, refBtn || (mountBefore as HTMLElement)) } catch {}
+                buttonMountPoint.style.display = 'inline-flex'
+                buttonMountPoint.style.alignItems = 'center'
+                // Channel main: slightly closer to Subscribe
+                buttonMountPoint.style.marginLeft = '8px'
+                buttonMountPoint.style.marginRight = '0'
+                ;(buttonMountPoint.style as any).order = '1000'
+                buttonMountPoint.style.flex = '0 0 auto'
+                render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
+                try { lockButtonWidthsIn(buttonMountPoint) } catch {}
+              }
+              tryPlace(0)
+              // Skip legacy fallback paths; scheduled placement will handle it
+              return
             }
-            if (!wrapper.contains(buttonMountPoint)) wrapper.appendChild(buttonMountPoint)
-            if (wrapper.parentElement !== actionsContainer || wrapper.previousElementSibling !== subscribeAction) {
-              subscribeAction?.insertAdjacentElement('afterend', wrapper)
+          }
+          // Channel and other pages: position immediately after the Subscribe control inside the same action block
+          const actionBlock = (mountBefore.closest('.ytFlexibleActionsViewModelAction') as HTMLElement | null)
+            || (mountBefore.closest('.yt-flexible-actions-view-model-wiz__action') as HTMLElement | null)
+            || (mountBefore.parentElement as HTMLElement | null)
+          if (actionBlock) {
+            if (buttonMountPoint.getAttribute('data-id') !== params.source.id || buttonMountPoint.parentElement !== actionBlock) {
+              (mountBefore as HTMLElement).insertAdjacentElement('afterend', buttonMountPoint)
+              buttonMountPoint.setAttribute('data-id', params.source.id)
             }
-            buttonMountPoint.setAttribute('data-id', params.source.id)
           } else {
             // Watch page fallback: insert strictly after the actual Subscribe button element
             const subscribeEl = (
@@ -769,12 +1156,26 @@ import { logger } from '../modules/logger'
               subscribeEl.insertAdjacentElement('afterend', buttonMountPoint)
               buttonMountPoint.setAttribute('data-id', params.source.id)
             }
+            // If not visible (container doesn't render light DOM), try known visible buttons containers
+            try {
+              if (!buttonMountPoint.offsetParent) {
+                const fallbackButtons = (
+                  document.querySelector('ytd-page-header-renderer #buttons') as HTMLElement | null
+                ) || (
+                  document.querySelector('ytd-c4-tabbed-header-renderer #buttons') as HTMLElement | null
+                ) || (
+                  document.querySelector('#channel-header-container #buttons') as HTMLElement | null
+                ) || (
+                  document.querySelector('#channel-header #buttons') as HTMLElement | null
+                )
+                if (fallbackButtons && buttonMountPoint.parentElement !== fallbackButtons) {
+                  fallbackButtons.appendChild(buttonMountPoint)
+                }
+              }
+            } catch {}
           }
-          try {
-            const hb = (mountBefore as HTMLElement)
-            const hpx = hb.offsetHeight || hb.clientHeight
-            if (hpx) buttonMountPoint.style.height = `${hpx}px`
-          } catch { }
+          // Apply height sync (works even if Subscribe isn’t yet measured)
+          syncHeightToReference(mountBefore as HTMLElement)
           buttonMountPoint.style.display = 'inline-flex'
           buttonMountPoint.style.alignItems = 'center'
           // Give the channel name more room and keep our buttons to the far right
@@ -1087,13 +1488,16 @@ import { logger } from '../modules/logger'
   }
 
   // Clean up all existing overlays
-  function cleanupOverlays() {
+  async function cleanupOverlays() {
     const existingOverlays = document.querySelectorAll('[data-wol-overlay]')
     dbg('Watch on Odysee: Cleaning up', existingOverlays.length, 'overlays')
-    existingOverlays.forEach(overlay => overlay.remove())
+    // Use async batch remove for overlays
+    await asyncBatchRemove('[data-wol-overlay]')
     // Clear enhanced flags so they can be re-enhanced if setting is re-enabled
-    const enhancedAnchors = document.querySelectorAll('a[data-wol-enhanced]')
-    enhancedAnchors.forEach(anchor => anchor.removeAttribute('data-wol-enhanced'))
+    await asyncBatchProcess<HTMLElement>(
+      'a[data-wol-enhanced]',
+      el => el.removeAttribute('data-wol-enhanced')
+    )
     // Reset global overlay state to avoid re-attaching stale overlays across navigations
     for (const [, ov] of overlayState.entries()) {
       try { ov.observer?.disconnect() } catch {}
@@ -1103,16 +1507,23 @@ import { logger } from '../modules/logger'
   }
 
   // Clean up stale overlays that no longer have corresponding videos
-  function cleanupStaleOverlays() {
-    const allOverlays = document.querySelectorAll('[data-wol-overlay]')
-    allOverlays.forEach(overlay => {
+  async function cleanupStaleOverlays() {
+    const allOverlays = Array.from(document.querySelectorAll('[data-wol-overlay]'))
+    const toRemove: Element[] = []
+    for (const overlay of allOverlays) {
       const overlayVideoId = overlay.getAttribute('data-wol-overlay')
       if (overlayVideoId) {
         // Check if there's still a video link for this ID
         const videoExists = document.querySelector(`a[href*="${overlayVideoId}"]`)
         if (!videoExists) {
-          overlay.remove()
+          toRemove.push(overlay)
         }
+      }
+    }
+    // Batch remove with yielding
+    for (let i = 0; i < toRemove.length; i++) {
+      toRemove[i].remove()
+      if ((i + 1) % 10 === 0) await idleYield(30)
       }
     })
   }
@@ -1141,49 +1552,59 @@ import { logger } from '../modules/logger'
   const resolvedLocal = new Map<string, Target | null>()
   // Persist preferred anchor per video id to keep overlay in the same area across re-renders
   const overlayAnchorPrefs = new Map<string, { anchor: 'top-left' | 'bottom-left', x: number, y: number }>()
+  // Channel main page action placement version guard (prevents stale scheduled attempts)
+  let channelMainActionVersion = 0
 
   // Enhanced cleanup for specific page contexts only
-  function cleanupOverlaysByPageContext() {
+  async function cleanupOverlaysByPageContext() {
     const currentPath = window.location.pathname
     // Only clear on the dedicated Shorts player page; keep overlays on /watch for related content
     if ((currentPath.startsWith('/shorts/') && currentPath.split('/').length === 3)) {
-      cleanupOverlays()
+      await cleanupOverlays()
     }
   }
 
   // Cleanup helper for channel buttons on results page to avoid duplicate reinsertion
-  function cleanupResultsChannelButtons(options?: { disconnectOnly?: boolean }) {
+  async function cleanupResultsChannelButtons(options?: { disconnectOnly?: boolean }) {
     try {
       // Remove all injected channel buttons and disconnect observers when asked
       const nodes = Array.from(document.querySelectorAll('ytd-channel-renderer')) as HTMLElement[]
-      for (const cr of nodes) {
+      for (let i = 0; i < nodes.length; i++) {
+        const cr = nodes[i]
         const st = channelRendererState.get(cr)
         if (st?.mo) {
           try { st.mo.disconnect() } catch {}
         }
         if (!options?.disconnectOnly) {
           try { st?.btn.remove() } catch {}
-          try { cr.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove()) } catch {}
+          const btns = Array.from(cr.querySelectorAll('[data-wol-results-channel-btn]'))
+          for (const btn of btns) btn.remove()
           try { cr.removeAttribute('data-wol-channel-button') } catch {}
         }
         // Always clear state to avoid stale reinserts
         try { channelRendererState.delete(cr) } catch {}
+        // Yield every 10 items
+        if ((i + 1) % 10 === 0) await idleYield(30)
       }
     } catch {}
   }
 
   // Cleanup helper for inline channel chips in video results to avoid stale observers
-  function cleanupResultsVideoChips(options?: { disconnectOnly?: boolean }) {
+  async function cleanupResultsVideoChips(options?: { disconnectOnly?: boolean }) {
     try {
       const vrs = Array.from(document.querySelectorAll('ytd-video-renderer')) as HTMLElement[]
-      for (const vr of vrs) {
+      for (let i = 0; i < vrs.length; i++) {
+        const vr = vrs[i]
         const st = resultsVideoChipState.get(vr)
         if (st?.mo) { try { st.mo.disconnect() } catch {} }
         if (!options?.disconnectOnly) {
           try { st?.chip.remove() } catch {}
-          try { vr.querySelectorAll('[data-wol-inline-channel]').forEach(el => el.remove()) } catch {}
+          const chips = Array.from(vr.querySelectorAll('[data-wol-inline-channel]'))
+          for (const chip of chips) chip.remove()
         }
         try { resultsVideoChipState.delete(vr) } catch {}
+        // Yield every 15 items
+        if ((i + 1) % 15 === 0) await idleYield(30)
       }
     } catch {}
   }
@@ -1193,7 +1614,7 @@ import { logger } from '../modules/logger'
     try {
       const allow = (location.pathname === '/results') && !!settings.resultsApplySelections && !!settings.buttonChannelSub
       if (!allow) {
-        cleanupResultsVideoChips()
+        triggerCleanupResultsVideoChips()
       }
     } catch {}
   }
@@ -1628,9 +2049,9 @@ import { logger } from '../modules/logger'
     const currentTime = Date.now()
     const currentUrl = window.location.href
 
-    // Clean up overlays that are very old (more than 5 minutes) to prevent memory leaks
+    // Clean up overlays that are very old (reduced from 5 minutes to 90 seconds for better performance)
     for (const [overlayId, overlayData] of overlayState.entries()) {
-      if (currentTime - overlayData.lastSeen > 300000) { // 5 minutes
+      if (currentTime - overlayData.lastSeen > 90000) { // 90 seconds (reduced from 300000ms/5 minutes)
         overlayData.element.remove()
         overlayState.delete(overlayId)
       }
@@ -1645,11 +2066,11 @@ import { logger } from '../modules/logger'
   function ensureOverlayEnhancementActive() {
     // Keep overlays cleaned when disabled, but do not short-circuit observers needed for results chips
     if (!settings.buttonOverlay) {
-      cleanupOverlays()
+      triggerCleanupOverlays()
     } else {
       ensureOverlayCssInjected()
       // Run overlay enhancement immediately when enabled
-      enhanceVideoTilesOnListings().catch((e) => logger.error(e))
+      scheduleEnhanceListings(0)
     }
 
     // Always maintain a global observer to handle dynamic results content
@@ -1679,11 +2100,13 @@ import { logger } from '../modules/logger'
         }
         if (shouldEnhance && settings.buttonOverlay) {
           try { ensureResultsPillsVisibility() } catch {}
-          enhanceVideoTilesOnListings().catch((e) => logger.error(e))
+          // Use longer delays for mutation-triggered updates to batch more changes
+          const enhanceDelay = location.pathname === '/watch' ? 200 : 100
+          scheduleEnhanceListings(enhanceDelay)
         }
         if (shouldRefreshChips && settings.resultsApplySelections && settings.buttonChannelSub) {
-          try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
-          try { refreshResultsChannelRendererButtons().catch(e => logger.error(e)) } catch {}
+          scheduleRefreshResultsChips(150)
+          scheduleRefreshChannelButtons(200)
         }
       })
 
@@ -1697,13 +2120,13 @@ import { logger } from '../modules/logger'
           dbg('Watch on Odysee: Detected location change from', previousHref, 'to', currentHref)
           overlayGeneration++
           cleanupOverlaysByPageContext()
-          cleanupOverlays()
+          triggerCleanupOverlays()
           lastEnhanceTime = 0; lastEnhanceUrl = ''
-          if (settings.buttonOverlay) enhanceVideoTilesOnListings().catch((e) => logger.error(e))
+          if (settings.buttonOverlay) scheduleEnhanceListings(100)
           // Refresh results chips on nav as well
           if (location.pathname === '/results' && settings.resultsApplySelections && settings.buttonChannelSub) {
-            try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
-            try { refreshResultsChannelRendererButtons().catch(e => logger.error(e)) } catch {}
+            scheduleRefreshResultsChips(120)
+            scheduleRefreshChannelButtons(150)
           }
           scheduleProcessCurrentPage(50)
           try { ensureResultsPillsVisibility() } catch {}
@@ -1735,7 +2158,9 @@ import { logger } from '../modules/logger'
      const now = Date.now()
      const currentUrl = window.location.href
      const isResults = location.pathname === '/results'
-     const minGap = isResults ? 800 : 400
+     const isWatch = location.pathname === '/watch'
+     // More aggressive throttling for watch pages to prevent lockups during filtering
+     const minGap = isWatch ? 1000 : (isResults ? 800 : 400)
      // Allow immediate re-processing if URL changed or if it's been too soon since last enhancement
      if (now - lastEnhanceTime < minGap && currentUrl === lastEnhanceUrl) {
        return
@@ -1746,7 +2171,7 @@ import { logger } from '../modules/logger'
     // Check if overlay buttons are enabled - clean up overlays if disabled but continue for inline buttons
     if (!settings.buttonOverlay) {
       // Clean up any existing overlays when setting is disabled
-      cleanupOverlays()
+      triggerCleanupOverlays()
       // But continue processing for /results page inline buttons which are controlled by other settings
       if (location.pathname !== '/results') {
         return
@@ -2141,8 +2566,23 @@ import { logger } from '../modules/logger'
       }
     }
 
+    // Process anchors with yielding to prevent blocking
+    let processedCount = 0
+    // More aggressive yielding for watch pages with related content
+    const yieldFrequency = location.pathname === '/watch' ? 20 : 50
+    const yieldTimeout = location.pathname === '/watch' ? 50 : 80
+
     for (const { a, id, type } of normalizedToProcess) {
       if (gen !== overlayGeneration) break
+
+      // Yield control back to the browser periodically to prevent long blocking tasks
+      processedCount++
+      if (processedCount % yieldFrequency === 0) {
+        await idleYield(yieldTimeout)
+        // Check generation again after yield
+        if (gen !== overlayGeneration) break
+      }
+
       const res = resolvedLocal.get(`${type}:${id}`) ?? null
       // Results page: do not hide or remove result tiles. Settings only control overlay/button UI.
       // Any attributes previously used to hide are cleared elsewhere when toggles change.
@@ -2301,7 +2741,7 @@ import { logger } from '../modules/logger'
           }
           if (!settings.resultsApplySelections || !settings.buttonChannelSub) {
             // If disabled, ensure any injected channel buttons are removed and observers disconnected
-            try { cleanupResultsChannelButtons() } catch {}
+            try { triggerCleanupResultsChannelButtons() } catch {}
             continue
           }
           // Reuse existing managed button for this renderer if present; just update the href and ensure attached
@@ -3246,8 +3686,8 @@ import { logger } from '../modules/logger'
          updateButtons(null)
          ensureOverlayEnhancementActive()
          if (location.pathname === '/results' && settings.resultsApplySelections && settings.buttonChannelSub) {
-           try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
-           try { refreshResultsChannelRendererButtons().catch(e => logger.error(e)) } catch {}
+           scheduleRefreshResultsChips(100)
+           scheduleRefreshChannelButtons(120)
          }
          return
        }
@@ -3315,10 +3755,42 @@ import { logger } from '../modules/logger'
         resolved = lastResolved
       }
 
-      const primaryTarget = resolved[source.id] ?? findTargetFromSourcePage(source)
+      let primaryTarget = resolved[source.id] ?? findTargetFromSourcePage(source)
       if (primaryTarget?.type === 'video') playerTarget = primaryTarget
 
       if (source.type === 'channel') {
+        // If no direct Odysee mapping yet, derive a deterministic fallback target
+        if (!primaryTarget) {
+          try {
+            // Prefer @handle in the header
+            const handleAnchor = (
+              document.querySelector('ytd-page-header-renderer a[href^="/@"]') as HTMLAnchorElement | null
+            ) || (
+              document.querySelector('yt-page-header-view-model a[href^="/@"]') as HTMLAnchorElement | null
+            ) || (
+              document.querySelector('#channel-header a[href^="/@"]') as HTMLAnchorElement | null
+            ) || (
+              document.querySelector('#channel-header-container a[href^="/@"]') as HTMLAnchorElement | null
+            )
+            const handleHref = handleAnchor?.getAttribute('href') || ''
+            const handleText = handleAnchor?.textContent?.trim() || ''
+            const handle = (handleHref.startsWith('/@') ? handleHref.substring(2) : '') || (handleText.startsWith('@') ? handleText.substring(1) : '')
+            const nameEl = (document.querySelector('ytd-page-header-renderer #channel-name #text') as HTMLElement | null)
+              || (document.querySelector('yt-page-header-view-model #channel-name #text') as HTMLElement | null)
+              || (document.querySelector('#text-container #text') as HTMLElement | null)
+            const channelName = nameEl?.textContent?.trim() || ''
+
+            const platform = targetPlatformSettings[settings.targetPlatform]
+            // Try direct Odysee handle first
+            if (handle) {
+              primaryTarget = { platform, type: 'channel', odyseePathname: `@${handle}`, time: null }
+            } else {
+              // Fallback to search by name or UC id
+              const q = channelName || source.id
+              primaryTarget = { platform, type: 'channel', odyseePathname: `$/search?q=${encodeURIComponent(q)}` , time: null }
+            }
+          } catch {}
+        }
         if (settings.buttonChannelSub && primaryTarget) subscribeTargets.push(primaryTarget)
       } else if (source.type === 'video') {
         const vidTarget = resolved[source.id]
@@ -3339,7 +3811,6 @@ import { logger } from '../modules/logger'
         // do not return; allow redirect assessment to run
       }
 
-      updateButtons(null)
       if (playerTarget?.type === 'video') {
         const videoElement = document.querySelector<HTMLVideoElement>(source.platform.htmlQueries.videoPlayer)
         if (videoElement) playerTarget.time = videoElement.currentTime > 3 && videoElement.currentTime < videoElement.duration - 1 ? videoElement.currentTime : null
@@ -3347,7 +3818,7 @@ import { logger } from '../modules/logger'
       updateButtons({ buttonTargets: subscribeTargets, playerTarget, source })
       ensureOverlayEnhancementActive()
       if (location.pathname === '/results' && settings.resultsApplySelections && settings.buttonChannelSub) {
-        try { refreshResultsVideoChannelChips().catch(e => logger.error(e)) } catch {}
+        scheduleRefreshResultsChips(100)
       }
 
       // Redirect (guarded)

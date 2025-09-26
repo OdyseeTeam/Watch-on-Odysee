@@ -11,3 +11,5 @@ playwright-report
 test-results
 dist.pem
 dist.crx
+
+.claude/settings.local.json
