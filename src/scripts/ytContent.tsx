@@ -168,6 +168,8 @@ import { logger } from '../modules/logger'
 
   // Global mutation observer for video tile enhancement
   let wolMutationObserver: MutationObserver | null = null
+  // Navigation polling interval
+  let wolNavigationPollInterval: number | null = null
   // Extension boot tracking (for debugging)
   const EXT_BOOT_AT = Date.now()
   // Batch state for watch-page related sidebar overlays (container-gated)
@@ -387,26 +389,17 @@ import { logger } from '../modules/logger'
               clearTimeout(timer)
             }
             scheduledTasks.clear()
-            logger.log('Watch on Odysee: Cleared', taskCount, 'scheduled tasks')
+            dbg('Watch on Odysee: Cleared', taskCount, 'scheduled tasks')
 
             // Disable mutation observer when overlay setting is turned off
             if (wolMutationObserver) {
               wolMutationObserver.disconnect()
               wolMutationObserver = null
-              logger.log('Watch on Odysee: Disconnected mutation observer')
+              dbg('Watch on Odysee: Disconnected mutation observer')
             }
             // Use the comprehensive cleanup function - await it to ensure completion
-            logger.log('Watch on Odysee: Overlay setting disabled, cleaning up overlays')
-            logger.log('Watch on Odysee: Current overlay count before cleanup:', document.querySelectorAll('[data-wol-overlay]').length)
+            dbg('Watch on Odysee: Overlay setting disabled, cleaning up overlays')
             await cleanupOverlays()
-            logger.log('Watch on Odysee: Overlay count after cleanup:', document.querySelectorAll('[data-wol-overlay]').length)
-            // Wait a bit and check again to see if anything recreates them
-            setTimeout(() => {
-              const afterDelay = document.querySelectorAll('[data-wol-overlay]').length
-              if (afterDelay > 0) {
-                logger.log('Watch on Odysee: PROBLEM - Found', afterDelay, 'overlays 500ms after cleanup!')
-              }
-            }, 500)
           }
         }
         // Apply/unapply results inline UI immediately on relevant toggle flips
@@ -1043,6 +1036,16 @@ import { logger } from '../modules/logger'
               buttonMountPoint.setAttribute('data-id', params.source.id)
               render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
               try { lockButtonWidthsIn(buttonMountPoint) } catch {}
+
+              // Add padding to h1 to prevent text from going behind buttons
+              // Wait for buttons to render to get accurate width
+              setTimeout(() => {
+                const buttonWidth = titleMount.offsetWidth
+                if (buttonWidth > 0 && h1) {
+                  h1.style.paddingRight = `${buttonWidth + 12}px`
+                }
+              }, 0)
+
               // Done with preferred title placement
               return
             }
@@ -1599,7 +1602,10 @@ import { logger } from '../modules/logger'
 
     // AGGRESSIVE CLEANUP: Also remove any orphaned overlay buttons without data attributes
     // These might be old overlays that lost their attributes somehow
-    const suspectOverlays = document.querySelectorAll('div[role="button"][aria-label="Watch on Odysee"]')
+    const suspectOverlays = Array.from(document.querySelectorAll('div[role="button"][aria-label="Watch on Odysee"]')).filter(el => {
+      // Only remove if it doesn't have the data attribute (to avoid removing newly created ones)
+      return !el.hasAttribute('data-wol-overlay')
+    })
     if (suspectOverlays.length > 0) {
       dbg('Watch on Odysee: Found', suspectOverlays.length, 'suspect overlays without data attributes, removing...')
       suspectOverlays.forEach(el => {
@@ -2251,7 +2257,11 @@ import { logger } from '../modules/logger'
 
     // CRITICAL FIX: Poll for SPA navigation changes, but DON'T duplicate cleanup
     // The main bumpGen handler already handles this via yt-navigate events
-    setInterval(() => {
+    // Clear any existing interval to prevent duplicates
+    if (wolNavigationPollInterval !== null) {
+      clearInterval(wolNavigationPollInterval)
+    }
+    wolNavigationPollInterval = window.setInterval(() => {
         const currentHref = window.location.href
         if (currentHref !== navigationLastHref) {
           navigationLastHref = currentHref
@@ -2273,7 +2283,7 @@ import { logger } from '../modules/logger'
           try { ensureResultsPillsVisibility() } catch {}
           // A single immediate pass is enough; observers will catch late content
         }
-    }, 1000)
+    }, 1000) as unknown as number
 
     if (window.location.pathname.includes('/@') || window.location.pathname.includes('/channel/')) {
       const tabContainer = document.querySelector('ytd-c4-tabbed-header-renderer') ||
