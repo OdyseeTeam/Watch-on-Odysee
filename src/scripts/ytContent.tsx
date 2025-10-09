@@ -136,7 +136,9 @@ import { logger } from '../modules/logger'
   function scheduleEnhanceListings(delay: number = 100, bypassThrottle: boolean = false) {
     // For watch pages with related content, use longer delay to batch more effectively
     const effectiveDelay = location.pathname === '/watch' ? Math.max(delay, 150) : delay
-    scheduleTask('enhanceListings', () => enhanceVideoTilesOnListings(bypassThrottle), effectiveDelay)
+    // Use unique key for retry tasks to prevent them from being overwritten by regular enhancement calls
+    const taskKey = bypassThrottle ? 'enhanceListings-retry' : 'enhanceListings'
+    scheduleTask(taskKey, () => enhanceVideoTilesOnListings(bypassThrottle), effectiveDelay)
   }
 
   function scheduleRefreshResultsChips(delay: number = 120) {
@@ -2602,6 +2604,12 @@ import { logger } from '../modules/logger'
     // De-duplicate by resolved id to avoid processing the same video twice (thumbnail + title, etc.)
     const scoreAnchor = (a: HTMLAnchorElement): number => {
       let s = 0
+      // Highest priority: anchors in secondary/related sections ONLY on watch pages
+      const isWatchPage = location.pathname === '/watch'
+      const inSecondary = !!(a.closest('#secondary') || a.closest('#related'))
+      if (isWatchPage && inSecondary) s += 100
+      // Prioritize lockup UI anchors in secondary/related sections on watch pages
+      if (isWatchPage && a.closest('yt-lockup-view-model') && inSecondary) s += 25
       if (a.matches('a#thumbnail, a#thumbnail.yt-simple-endpoint, a.yt-simple-endpoint.inline-block.style-scope.ytd-thumbnail')) s += 20
       if (a.closest('ytd-thumbnail')) s += 15
       if (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-item-renderer')) s += 10
@@ -2616,7 +2624,13 @@ import { logger } from '../modules/logger'
       } else {
         const ns = scoreAnchor(item.a)
         const ps = scoreAnchor(prev.a)
-        if (ns > ps) byId.set(item.id, item)
+        const inSecNew = !!(item.a.closest('#secondary') || item.a.closest('#related'))
+        const inSecPrev = !!(prev.a.closest('#secondary') || prev.a.closest('#related'))
+        overlayDbg(`[DEBUG] Dedup for ${item.id}: new score=${ns} (inSec=${inSecNew}) vs old score=${ps} (inSec=${inSecPrev})`)
+        if (ns > ps) {
+          overlayDbg(`[DEBUG] Dedup replaced for ${item.id}: new score=${ns} (inSec=${inSecNew}) vs old score=${ps} (inSec=${inSecPrev})`)
+          byId.set(item.id, item)
+        }
       }
     }
     const dedupedToProcess = Array.from(byId.values())
