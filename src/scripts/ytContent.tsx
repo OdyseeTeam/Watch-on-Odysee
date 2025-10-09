@@ -338,7 +338,16 @@ import { logger } from '../modules/logger'
       const isChannelPage = currentUrl.includes('/@') || currentUrl.includes('/channel/') ||
                             currentUrl.includes('/c/') || currentUrl.includes('/user/')
       const enhanceDelay = isChannelPage ? 800 : 300
-      scheduleEnhanceListings(enhanceDelay)
+
+      // Only schedule overlay enhancement if overlays are enabled
+      if (settings.buttonOverlay) {
+        scheduleEnhanceListings(enhanceDelay)
+        ensureOverlayEnhancementActive()
+        logger.log('🔍 Restarted overlay enhancement')
+      } else {
+        logger.log('⚠️ Button overlay disabled, skipping enhancement')
+      }
+
       scheduleRefreshResultsChips(400)
       // Also refresh page-level buttons/redirects once per navigation
       scheduleProcessCurrentPage(100)
@@ -346,14 +355,6 @@ import { logger } from '../modules/logger'
 
       // Ensure results pills visibility reflects current setting on navigation
       try { ensureResultsPillsVisibility() } catch {}
-
-      // Restart overlay enhancement after cleanup
-      if (settings.buttonOverlay) {
-        ensureOverlayEnhancementActive()
-        logger.log('🔍 Restarted overlay enhancement')
-      } else {
-        logger.log('⚠️ Button overlay disabled, skipping enhancement')
-      }
     }
     document.addEventListener('yt-navigate-finish', bumpGen as EventListener)
     document.addEventListener('yt-page-data-updated', bumpGen as EventListener)
@@ -372,20 +373,40 @@ import { logger } from '../modules/logger'
       // Handle overlay setting changes
       let needsButtonUpdate = false
       let needsOverlayUpdate = false
-      
+      let buttonOverlayNewValue: boolean | undefined = undefined
+
       let needsResultsEnforcementUpdate = false
       for (const [key, change] of Object.entries(changes)) {
         if (key === 'buttonOverlay') {
           needsOverlayUpdate = true
+          buttonOverlayNewValue = change.newValue as boolean
           if (!change.newValue) {
+            // Clear all scheduled tasks to prevent pending enhancements from running
+            const taskCount = scheduledTasks.size
+            for (const timer of scheduledTasks.values()) {
+              clearTimeout(timer)
+            }
+            scheduledTasks.clear()
+            logger.log('Watch on Odysee: Cleared', taskCount, 'scheduled tasks')
+
             // Disable mutation observer when overlay setting is turned off
             if (wolMutationObserver) {
               wolMutationObserver.disconnect()
               wolMutationObserver = null
+              logger.log('Watch on Odysee: Disconnected mutation observer')
             }
-            // Use the comprehensive cleanup function
+            // Use the comprehensive cleanup function - await it to ensure completion
             logger.log('Watch on Odysee: Overlay setting disabled, cleaning up overlays')
-            triggerCleanupOverlays()
+            logger.log('Watch on Odysee: Current overlay count before cleanup:', document.querySelectorAll('[data-wol-overlay]').length)
+            await cleanupOverlays()
+            logger.log('Watch on Odysee: Overlay count after cleanup:', document.querySelectorAll('[data-wol-overlay]').length)
+            // Wait a bit and check again to see if anything recreates them
+            setTimeout(() => {
+              const afterDelay = document.querySelectorAll('[data-wol-overlay]').length
+              if (afterDelay > 0) {
+                logger.log('Watch on Odysee: PROBLEM - Found', afterDelay, 'overlays 500ms after cleanup!')
+              }
+            }, 500)
           }
         }
         // Apply/unapply results inline UI immediately on relevant toggle flips
@@ -514,7 +535,7 @@ import { logger } from '../modules/logger'
       }
       
       // Apply updates immediately
-      if (needsOverlayUpdate && settings.buttonOverlay) {
+      if (needsOverlayUpdate && buttonOverlayNewValue) {
         // Re-enable overlays when setting is turned on
         ensureOverlayEnhancementActive()
       }
@@ -1546,7 +1567,9 @@ import { logger } from '../modules/logger'
   // Clean up all existing overlays
   async function cleanupOverlays() {
     const existingOverlays = document.querySelectorAll('[data-wol-overlay]')
-    dbg('Watch on Odysee: Cleaning up', existingOverlays.length, 'overlays')
+    const pinnedOverlays = document.querySelectorAll('[data-wol-overlay][data-wol-pinned="1"]')
+    const bodyOverlays = Array.from(existingOverlays).filter(el => el.parentElement === document.body)
+    dbg('Watch on Odysee: Cleaning up', existingOverlays.length, 'overlays (', pinnedOverlays.length, 'pinned,', bodyOverlays.length, 'on body)')
 
     // CRITICAL FIX: Disconnect all observers FIRST to prevent them from recreating overlays
     for (const [, ov] of overlayState.entries()) {
@@ -1559,8 +1582,30 @@ import { logger } from '../modules/logger'
     // The old cleanup functions will be garbage collected
     hoverFloatCleanupMap = new WeakMap()
 
-    // Use async batch remove for overlays
-    await asyncBatchRemove('[data-wol-overlay]')
+    // CRITICAL FIX: Remove all overlays synchronously to prevent observer race conditions
+    // The async batch remove was too slow, allowing observers to recreate overlays
+    existingOverlays.forEach(el => {
+      try { el.remove() } catch {}
+    })
+
+    // Double-check: if any overlays still exist (race condition), remove them again
+    const remainingOverlays = document.querySelectorAll('[data-wol-overlay]')
+    if (remainingOverlays.length > 0) {
+      dbg('Watch on Odysee: Found', remainingOverlays.length, 'remaining overlays after cleanup, removing again...')
+      remainingOverlays.forEach(el => {
+        try { el.remove() } catch {}
+      })
+    }
+
+    // AGGRESSIVE CLEANUP: Also remove any orphaned overlay buttons without data attributes
+    // These might be old overlays that lost their attributes somehow
+    const suspectOverlays = document.querySelectorAll('div[role="button"][aria-label="Watch on Odysee"]')
+    if (suspectOverlays.length > 0) {
+      dbg('Watch on Odysee: Found', suspectOverlays.length, 'suspect overlays without data attributes, removing...')
+      suspectOverlays.forEach(el => {
+        try { el.remove() } catch {}
+      })
+    }
 
     // Clear enhanced flags so they can be re-enhanced if setting is re-enabled
     await asyncBatchProcess<HTMLElement>(
@@ -3378,6 +3423,7 @@ import { logger } from '../modules/logger'
       const isResultsPage = location.pathname === '/results'
       
       host.addEventListener('mouseenter', () => {
+        if (!settings.buttonOverlay) return
         if (gen !== overlayGeneration) return
         try {
           // If already pinned (e.g., user is hovering the button or tile), skip any floating/retargeting logic
@@ -3660,7 +3706,7 @@ import { logger } from '../modules/logger'
       }
       // Pin when hovering the button itself (results page only)
       if (location.pathname === '/results') {
-        try { mount.addEventListener('pointerenter', (e) => { try { e.stopPropagation() } catch {} ; pinOverlay() }, { passive: true }) } catch {}
+        try { mount.addEventListener('pointerenter', (e) => { if (!settings.buttonOverlay) return; try { e.stopPropagation() } catch {} ; pinOverlay() }, { passive: true }) } catch {}
         try {
           mount.addEventListener('pointerleave', (e) => {
             try {
@@ -4046,7 +4092,7 @@ import { logger } from '../modules/logger'
 
       if (subscribeTargets.length === 0 && !playerTarget) {
         updateButtons(null)
-        ensureOverlayEnhancementActive()
+        if (settings.buttonOverlay) ensureOverlayEnhancementActive()
         // do not return; allow redirect assessment to run
       }
 
@@ -4055,7 +4101,7 @@ import { logger } from '../modules/logger'
         if (videoElement) playerTarget.time = videoElement.currentTime > 3 && videoElement.currentTime < videoElement.duration - 1 ? videoElement.currentTime : null
       }
       updateButtons({ buttonTargets: subscribeTargets, playerTarget, source })
-      ensureOverlayEnhancementActive()
+      if (settings.buttonOverlay) ensureOverlayEnhancementActive()
       if (location.pathname === '/results' && settings.resultsApplySelections && settings.buttonChannelSub) {
         scheduleRefreshResultsChips(100)
       }
