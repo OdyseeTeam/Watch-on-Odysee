@@ -322,6 +322,12 @@ import { logger } from '../modules/logger'
       await triggerCleanupOverlays()
       await triggerCleanupResultsChannelButtons()
       await triggerCleanupResultsVideoChips({ disconnectOnly: true })
+
+      // Clear enhanced flags so anchors can be re-processed on the new page
+      document.querySelectorAll('a[data-wol-enhanced="done"]').forEach(el => {
+        (el as HTMLElement).removeAttribute('data-wol-enhanced')
+      })
+
       logger.log('🧹 Cleanup complete')
 
       resetRelatedBatch()
@@ -2633,7 +2639,25 @@ import { logger } from '../modules/logger'
         }
       }
     }
-    const dedupedToProcess = Array.from(byId.values())
+    let dedupedToProcess = Array.from(byId.values())
+
+    // Filter out videos where the best anchor is in #secondary on non-watch pages
+    // These are likely from a hidden sidebar and shouldn't be processed
+    const isWatchPage = location.pathname === '/watch'
+    if (!isWatchPage) {
+      const beforeFilter = dedupedToProcess.length
+      dedupedToProcess = dedupedToProcess.filter(item => {
+        const inSecondary = !!(item.a.closest('#secondary') || item.a.closest('#related'))
+        if (inSecondary) {
+          overlayDbg(`[DEBUG] Filtering out ${item.id} - best anchor is in #secondary on non-watch page`)
+          return false
+        }
+        return true
+      })
+      if (beforeFilter !== dedupedToProcess.length) {
+        overlayDbg(`[DEBUG] Filtered out ${beforeFilter - dedupedToProcess.length} videos with #secondary anchors on non-watch page`)
+      }
+    }
 
     overlayDbg(`[DEBUG] Deduplication: ${toProcess.length} anchors -> ${dedupedToProcess.length} unique video IDs`)
     if (dedupedToProcess.length <= 10) {
