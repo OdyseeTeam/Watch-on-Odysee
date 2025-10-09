@@ -153,17 +153,17 @@ import { logger } from '../modules/logger'
     scheduleTask('batchedCleanup', () => performBatchedCleanup(), delay)
   }
 
-  // Wrapper to call async cleanup functions without waiting
-  function triggerCleanupOverlays() {
-    cleanupOverlays().catch(e => logger.error('Cleanup overlays failed:', e))
+  // Wrapper to call async cleanup functions (can optionally await)
+  function triggerCleanupOverlays(): Promise<void> {
+    return cleanupOverlays().catch(e => { logger.error('Cleanup overlays failed:', e) })
   }
 
-  function triggerCleanupResultsChannelButtons(options?: { disconnectOnly?: boolean }) {
-    cleanupResultsChannelButtons(options).catch(e => logger.error('Cleanup channel buttons failed:', e))
+  function triggerCleanupResultsChannelButtons(options?: { disconnectOnly?: boolean }): Promise<void> {
+    return cleanupResultsChannelButtons(options).catch(e => { logger.error('Cleanup channel buttons failed:', e) })
   }
 
-  function triggerCleanupResultsVideoChips(options?: { disconnectOnly?: boolean }) {
-    cleanupResultsVideoChips(options).catch(e => logger.error('Cleanup video chips failed:', e))
+  function triggerCleanupResultsVideoChips(options?: { disconnectOnly?: boolean }): Promise<void> {
+    return cleanupResultsVideoChips(options).catch(e => { logger.error('Cleanup video chips failed:', e) })
   }
 
   // Global mutation observer for video tile enhancement
@@ -177,6 +177,8 @@ import { logger } from '../modules/logger'
   let relatedBatchRevealTimer: number | null = null
   let relatedBatchRevealed = false
   let relatedBatchOverlayCount = 0
+  // Guard flag to prevent concurrent enhancement runs
+  let enhancementRunning = false
 
   // Ensure a global stylesheet exists to keep overlays visible above YouTube hover/previews
   function ensureOverlayCssInjected() {
@@ -293,13 +295,23 @@ import { logger } from '../modules/logger'
 
   // Track last href for both navigation handler and fallback polling
   let navigationLastHref = window.location.href
+  // Guard flag to prevent concurrent navigation handlers
+  let navigationHandlerRunning = false
 
   // Hook into YouTube SPA navigation events when available
   try {
     const bumpGen = async () => {
-      const currentUrl = location.href
-      navigationLastHref = currentUrl  // Update shared variable
-      logger.log('🔄 Navigation detected:', currentUrl)
+      // CRITICAL FIX: Prevent concurrent navigation handlers
+      if (navigationHandlerRunning) {
+        logger.log('⏸️ Navigation handler already running, skipping')
+        return
+      }
+      navigationHandlerRunning = true
+
+      try {
+        const currentUrl = location.href
+        navigationLastHref = currentUrl  // Update shared variable
+        logger.log('🔄 Navigation detected:', currentUrl)
 
       // CRITICAL FIX: Stop observers immediately to prevent stale work
       if (wolMutationObserver) {
@@ -341,10 +353,16 @@ import { logger } from '../modules/logger'
                             currentUrl.includes('/c/') || currentUrl.includes('/user/')
       const enhanceDelay = isChannelPage ? 800 : 300
 
-      // Only schedule overlay enhancement if overlays are enabled
+      // Schedule overlay enhancement if overlays are enabled
       if (settings.buttonOverlay) {
         scheduleEnhanceListings(enhanceDelay)
-        ensureOverlayEnhancementActive()
+        // Only call ensureOverlayEnhancementActive on non-channel pages
+        // On channel pages, observers are disabled to prevent lockups
+        if (!isChannelPage) {
+          ensureOverlayEnhancementActive()
+        } else {
+          logger.log('⚠️ Skipping ensureOverlayEnhancementActive on channel page')
+        }
         logger.log('🔍 Restarted overlay enhancement')
       } else {
         logger.log('⚠️ Button overlay disabled, skipping enhancement')
@@ -355,8 +373,13 @@ import { logger } from '../modules/logger'
       scheduleProcessCurrentPage(100)
       logger.log('📅 Scheduled enhancement tasks')
 
-      // Ensure results pills visibility reflects current setting on navigation
-      try { ensureResultsPillsVisibility() } catch {}
+        // Ensure results pills visibility reflects current setting on navigation
+        try { ensureResultsPillsVisibility() } catch {}
+
+        logger.log('✅ Navigation handler complete, returning control to browser')
+      } finally {
+        navigationHandlerRunning = false
+      }
     }
     document.addEventListener('yt-navigate-finish', bumpGen as EventListener)
     document.addEventListener('yt-page-data-updated', bumpGen as EventListener)
@@ -844,11 +867,14 @@ import { logger } from '../modules/logger'
   }
 
   function updateButtons(params: { source: Source, buttonTargets: Target[] | null, playerTarget: Target | null } | null): void {
+    const updateButtonsStartTime = performance.now()
     try {
       const info = params ? { path: location.pathname, type: params.source?.type, targets: params.buttonTargets?.length || 0 } : { path: location.pathname, type: 'none', targets: 0 }
       logger.log('Watch on Odysee: updateButtons', info)
+      dbg(`[CHANNEL-DEBUG] updateButtons called with:`, info)
     } catch {}
     if (!params) {
+      dbg(`[CHANNEL-DEBUG] updateButtons: clearing buttons (no params)`)
       render(<WatchOnOdyseeButtons />, buttonMountPoint)
       render(<WatchOnOdyseePlayerButton />, playerButtonMountPoint)
       return
@@ -1167,18 +1193,25 @@ import { logger } from '../modules/logger'
           }
         } else {
           // Channel and other pages: try creating a dedicated action item right next to Subscribe (preferred)
+          dbg(`[CHANNEL-DEBUG] Rendering channel page buttons`)
           {
             const subscribeActionBlock = (mountBefore.closest('.ytFlexibleActionsViewModelAction') as HTMLElement | null)
               || (document.querySelector('yt-flexible-actions-view-model .ytFlexibleActionsViewModelAction') as HTMLElement | null)
+            dbg(`[CHANNEL-DEBUG] Found subscribeActionBlock:`, !!subscribeActionBlock)
             if (subscribeActionBlock) {
               // Schedule placement until a reliable height is available
               const myVersion = (++channelMainActionVersion)
               const maxAttempts = 40
+              dbg(`[CHANNEL-DEBUG] Starting button placement attempts (version ${myVersion})`)
               const attemptDelay = 60
               const tryPlace = (attempt: number) => {
-                if (myVersion !== channelMainActionVersion) return
+                if (myVersion !== channelMainActionVersion) {
+                  dbg(`[CHANNEL-DEBUG] tryPlace cancelled - version mismatch`)
+                  return
+                }
                 let channelAction = subscribeActionBlock.parentElement?.querySelector('div[data-wol-channel-action="1"]') as HTMLElement | null
                 if (!channelAction) {
+                  dbg(`[CHANNEL-DEBUG] Creating new channelAction container`)
                   channelAction = document.createElement('div')
                   channelAction.setAttribute('data-wol-channel-action', '1')
                   channelAction.className = 'ytFlexibleActionsViewModelAction'
@@ -1192,12 +1225,15 @@ import { logger } from '../modules/logger'
 
                 const refBtn = findSubscribeRefButton(mountBefore as HTMLElement)
                 const refH = refBtn ? (refBtn.offsetHeight || refBtn.clientHeight || 0) : 0
+                dbg(`[CHANNEL-DEBUG] tryPlace attempt ${attempt}: refBtn height = ${refH}`)
                 if (refH < 30 && attempt < maxAttempts) {
                   // Wait a bit longer for the VM to finish sizing the inner button
+                  dbg(`[CHANNEL-DEBUG] Height too small (${refH}px), retrying in ${attemptDelay}ms (attempt ${attempt + 1}/${maxAttempts})`)
                   setTimeout(() => tryPlace(attempt + 1), attemptDelay)
                   return
                 }
                 // Height sync and render
+                dbg(`[CHANNEL-DEBUG] Rendering button (attempt ${attempt}, height ${refH}px)`)
                 try { syncContainerHeightToReference(channelAction!, refBtn || (mountBefore as HTMLElement)) } catch {}
                 buttonMountPoint.style.display = 'inline-flex'
                 buttonMountPoint.style.alignItems = 'center'
@@ -1208,6 +1244,8 @@ import { logger } from '../modules/logger'
                 buttonMountPoint.style.flex = '0 0 auto'
                 render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
                 try { lockButtonWidthsIn(buttonMountPoint) } catch {}
+                const renderEndTime = performance.now()
+                dbg(`[CHANNEL-DEBUG] Button rendered successfully in ${(renderEndTime - updateButtonsStartTime).toFixed(2)}ms`)
               }
               tryPlace(0)
               // Skip legacy fallback paths; scheduled placement will handle it
@@ -1578,12 +1616,17 @@ import { logger } from '../modules/logger'
     for (const [, ov] of overlayState.entries()) {
       try { ov.observer?.disconnect() } catch {}
     }
+    // Clear the entire overlayState map to release all references
+    overlayState.clear()
+    dbg('Watch on Odysee: Cleared overlayState, disconnected', overlayState.size, 'observers')
 
     // Cleanup hover observers/timers that might recreate overlays
     // Note: WeakMap is not iterable, so we can't loop over it
     // We'll just create a new one to clear references
     // The old cleanup functions will be garbage collected
     hoverFloatCleanupMap = new WeakMap()
+    hoverMoMap = new WeakMap()
+    hoverMoTimerMap = new WeakMap()
 
     // CRITICAL FIX: Remove all overlays synchronously to prevent observer race conditions
     // The async batch remove was too slow, allowing observers to recreate overlays
@@ -1661,8 +1704,8 @@ import { logger } from '../modules/logger'
     observer?: MutationObserver | null
   }>()
   // Hover-scoped observers (used outside results only)
-  const hoverMoMap = new WeakMap<HTMLElement, MutationObserver>()
-  const hoverMoTimerMap = new WeakMap<HTMLElement, number>()
+  let hoverMoMap = new WeakMap<HTMLElement, MutationObserver>()
+  let hoverMoTimerMap = new WeakMap<HTMLElement, number>()
   let hoverFloatCleanupMap = new WeakMap<HTMLElement, () => void>()
   // Results page: track channel renderer button + observer to avoid duplicates across toggles
   const channelRendererState = new WeakMap<HTMLElement, { btn: HTMLElement, mo: MutationObserver | null }>()
@@ -1689,6 +1732,16 @@ import { logger } from '../modules/logger'
   // Cleanup helper for channel buttons on results page to avoid duplicate reinsertion
   async function cleanupResultsChannelButtons(options?: { disconnectOnly?: boolean }) {
     try {
+      // Early return if not on results page to avoid expensive querySelector on channel pages
+      if (location.pathname !== '/results') {
+        // Still disconnect any existing observers
+        for (const [cr, st] of channelRendererState.entries()) {
+          if (st?.mo) try { st.mo.disconnect() } catch {}
+          channelRendererState.delete(cr)
+        }
+        return
+      }
+
       // Remove all injected channel buttons and disconnect observers when asked
       const nodes = Array.from(document.querySelectorAll('ytd-channel-renderer')) as HTMLElement[]
       for (let i = 0; i < nodes.length; i++) {
@@ -1714,6 +1767,16 @@ import { logger } from '../modules/logger'
   // Cleanup helper for inline channel chips in video results to avoid stale observers
   async function cleanupResultsVideoChips(options?: { disconnectOnly?: boolean }) {
     try {
+      // Early return if not on results page to avoid expensive querySelector on channel pages
+      if (location.pathname !== '/results') {
+        // Still disconnect any existing observers
+        for (const [vr, st] of resultsVideoChipState.entries()) {
+          if (st?.mo) try { st.mo.disconnect() } catch {}
+          resultsVideoChipState.delete(vr)
+        }
+        return
+      }
+
       const vrs = Array.from(document.querySelectorAll('ytd-video-renderer')) as HTMLElement[]
       for (let i = 0; i < vrs.length; i++) {
         const vr = vrs[i]
@@ -1780,13 +1843,27 @@ import { logger } from '../modules/logger'
         let handle: string | null = null
         let ucid: string | null = null
         try {
+          // Try multiple selectors to find channel ID
           const chA = cr.querySelector('a[href^="/channel/"]') as HTMLAnchorElement | null
           const hA = cr.querySelector('a[href^="/@"]') as HTMLAnchorElement | null
+
+          // Extract channel ID from /channel/ URL
           if (chA) {
             const u = new URL(chA.getAttribute('href') || chA.href, location.origin)
             const id = u.pathname.split('/')[2]
             if (id && id.startsWith('UC')) ucid = id
           }
+
+          // If no channel ID found, try to extract from data attributes or other sources
+          if (!ucid) {
+            // Check for channel ID in data attributes
+            const channelId = cr.getAttribute('channel-id') ||
+                            cr.querySelector('[channel-id]')?.getAttribute('channel-id') ||
+                            cr.querySelector('ytd-channel-name')?.getAttribute('channel-id')
+            if (channelId && channelId.startsWith('UC')) ucid = channelId
+          }
+
+          // Extract handle if still no channel ID
           if (!ucid && hA) {
             try { const u = new URL(hA.getAttribute('href') || hA.href, location.origin); handle = u.pathname.substring(1) } catch {}
           }
@@ -1800,7 +1877,10 @@ import { logger } from '../modules/logger'
           } catch {}
         }
         if (!chUrl && handle) {
-          try { chUrl = new URL(`${platform.domainPrefix}/@${handle}`.replace('/@/@','/@')) } catch {}
+          // Handle already includes @ symbol if present, normalize it
+          const normalizedHandle = handle.startsWith('@') ? handle.slice(1) : handle
+          const baseUrl = platform.domainPrefix.replace(/\/+$/, '') // Remove trailing slashes
+          try { chUrl = new URL(`${baseUrl}/@${normalizedHandle}`) } catch {}
         }
         if (!chUrl) {
           const nameText = (cr.querySelector('#channel-title')?.textContent || cr.textContent || '').trim()
@@ -2208,24 +2288,37 @@ import { logger } from '../modules/logger'
       wolMutationObserver = null
     }
 
-    // Always maintain a global observer to handle dynamic results content
-    wolMutationObserver = new MutationObserver((mutations) => {
-      // CRITICAL FIX: Check if generation changed (observer is stale)
-      if (currentGen !== overlayGeneration) {
-        logger.log('⚠️ Stale observer detected, gen:', currentGen, 'current:', overlayGeneration)
-        if (wolMutationObserver) {
-          wolMutationObserver.disconnect()
-          wolMutationObserver = null
+    // CRITICAL FIX: Skip global mutation observer on channel pages to prevent lockups
+    // Channel pages with many videos cause hundreds of mutations that lock up the browser
+    const isChannelPageForObserver = location.pathname.includes('/@') || location.pathname.includes('/channel/')
+
+    if (!isChannelPageForObserver) {
+      // Maintain a global observer to handle dynamic results content (watch pages, search results, etc)
+      wolMutationObserver = new MutationObserver((mutations) => {
+        // CRITICAL FIX: Check if generation changed (observer is stale)
+        if (currentGen !== overlayGeneration) {
+          logger.log('⚠️ Stale observer detected, gen:', currentGen, 'current:', overlayGeneration)
+          if (wolMutationObserver) {
+            wolMutationObserver.disconnect()
+            wolMutationObserver = null
+          }
+          return
         }
-        return
-      }
-        // Strict removal if toggles do not allow chips
-        enforceResultsChannelChipVisibility()
+
         let shouldEnhance = false
         let shouldRefreshChips = false
-        for (const mutation of mutations) {
+
+        // CRITICAL FIX: Limit how many mutations we process to prevent lockups on pages with many videos
+        const maxMutationsToCheck = 50
+        const mutationsToCheck = mutations.slice(0, maxMutationsToCheck)
+
+        for (const mutation of mutationsToCheck) {
           if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
-            for (let i = 0; i < mutation.addedNodes.length; i++) {
+            // CRITICAL FIX: Limit how many nodes we check per mutation
+            const maxNodesToCheck = 10
+            const nodesToCheck = Math.min(mutation.addedNodes.length, maxNodesToCheck)
+
+            for (let i = 0; i < nodesToCheck; i++) {
               const node = mutation.addedNodes[i]
               if (node.nodeType === Node.ELEMENT_NODE) {
                 const element = node as Element
@@ -2239,8 +2332,10 @@ import { logger } from '../modules/logger'
                 }
               }
             }
+            if (shouldEnhance) break // Early exit once we know we need to enhance
           }
         }
+
         if (shouldEnhance && settings.buttonOverlay) {
           try { ensureResultsPillsVisibility() } catch {}
           // Use longer delays for mutation-triggered updates to batch more changes
@@ -2252,40 +2347,60 @@ import { logger } from '../modules/logger'
           scheduleRefreshResultsChips(150)
           scheduleRefreshChannelButtons(200)
         }
-    })
-    wolMutationObserver.observe(document.body, { childList: true, subtree: true })
+
+        // Only enforce chip visibility on results pages, and do it less frequently
+        if (location.pathname === '/results') {
+          enforceResultsChannelChipVisibility()
+        }
+      })
+      wolMutationObserver.observe(document.body, { childList: true, subtree: true })
+      logger.log('✅ Global mutation observer enabled')
+    } else {
+      logger.log('⚠️ Skipping global mutation observer on channel page to prevent lockups')
+      // On channel pages, rely on scroll/intersection observer instead
+      scheduleEnhanceListings(1000) // Schedule periodic enhancement
+    }
 
     // CRITICAL FIX: Poll for SPA navigation changes, but DON'T duplicate cleanup
     // The main bumpGen handler already handles this via yt-navigate events
     // Clear any existing interval to prevent duplicates
     if (wolNavigationPollInterval !== null) {
       clearInterval(wolNavigationPollInterval)
+      wolNavigationPollInterval = null
     }
-    wolNavigationPollInterval = window.setInterval(() => {
-        const currentHref = window.location.href
-        if (currentHref !== navigationLastHref) {
-          navigationLastHref = currentHref
-          dbg('Watch on Odysee: Detected location change (fallback polling) to', currentHref)
 
-          // Don't call cleanup here - let the main navigation handler do it
-          // Just trigger a re-enhancement to catch any missed updates
-          lastEnhanceTime = 0; lastEnhanceUrl = ''
+    // CRITICAL FIX: Skip navigation polling on channel pages to prevent lockups
+    if (!isChannelPageForObserver) {
+      wolNavigationPollInterval = window.setInterval(() => {
+          const currentHref = window.location.href
+          if (currentHref !== navigationLastHref) {
+            navigationLastHref = currentHref
+            dbg('Watch on Odysee: Detected location change (fallback polling) to', currentHref)
 
-          if (settings.buttonOverlay) {
-            scheduleEnhanceListings(400)  // Longer delay since main handler already ran
+            // Don't call cleanup here - let the main navigation handler do it
+            // Just trigger a re-enhancement to catch any missed updates
+            lastEnhanceTime = 0; lastEnhanceUrl = ''
+
+            if (settings.buttonOverlay) {
+              scheduleEnhanceListings(400)  // Longer delay since main handler already ran
+            }
+            // Refresh results chips on nav as well
+            if (location.pathname === '/results' && settings.resultsApplySelections && settings.buttonChannelSub) {
+              scheduleRefreshResultsChips(120)
+              scheduleRefreshChannelButtons(150)
+            }
+            scheduleProcessCurrentPage(50)
+            try { ensureResultsPillsVisibility() } catch {}
+            // A single immediate pass is enough; observers will catch late content
           }
-          // Refresh results chips on nav as well
-          if (location.pathname === '/results' && settings.resultsApplySelections && settings.buttonChannelSub) {
-            scheduleRefreshResultsChips(120)
-            scheduleRefreshChannelButtons(150)
-          }
-          scheduleProcessCurrentPage(50)
-          try { ensureResultsPillsVisibility() } catch {}
-          // A single immediate pass is enough; observers will catch late content
-        }
-    }, 1000) as unknown as number
+      }, 1000) as unknown as number
+      logger.log('✅ Navigation polling interval enabled')
+    } else {
+      logger.log('⚠️ Skipping navigation polling on channel page')
+    }
 
-    if (window.location.pathname.includes('/@') || window.location.pathname.includes('/channel/')) {
+    // CRITICAL FIX: Only observe tab container if we created a mutation observer (not on channel pages)
+    if (wolMutationObserver && (window.location.pathname.includes('/@') || window.location.pathname.includes('/channel/'))) {
       const tabContainer = document.querySelector('ytd-c4-tabbed-header-renderer') ||
         document.querySelector('ytd-page-header-renderer')
       if (tabContainer) try { wolMutationObserver.observe(tabContainer, { childList: true, subtree: true }) } catch {}
@@ -2297,62 +2412,73 @@ import { logger } from '../modules/logger'
 
   // Enhance video tiles on listing pages (e.g., /videos, related content) with an Odysee logo link
   async function enhanceVideoTilesOnListings(bypassThrottle: boolean = false) {
-    const gen = overlayGeneration
-    logger.log('🎨 enhanceVideoTilesOnListings START, gen:', gen, 'url:', location.href)
-
-    // Safety: prune any overlays from prior generations
-    let prunedCount = 0
-    for (const [key, ov] of overlayState.entries()) {
-      if (ov.generation !== gen) {
-        ov.element.remove()
-        overlayState.delete(key)
-        prunedCount++
-      }
-    }
-    if (prunedCount > 0) {
-      logger.log('🗑️ Pruned', prunedCount, 'overlays from old generation')
-    }
-
-     // Throttle calls to prevent excessive processing (unless bypassed for retries)
-     const now = Date.now()
-     const currentUrl = window.location.href
-     if (!bypassThrottle) {
-       const isResults = location.pathname === '/results'
-       const isWatch = location.pathname === '/watch'
-       // CRITICAL FIX: Measure time between completion of enhancements, not start
-       // This allows mutation observer to trigger re-enhancement after initial work finishes
-       const minGap = isWatch ? 600 : (isResults ? 400 : 300)
-       // Allow immediate re-processing if URL changed
-       if (now - lastEnhanceTime < minGap && currentUrl === lastEnhanceUrl) {
-         logger.log('⏳ Enhancement throttled, last run completed', now - lastEnhanceTime, 'ms ago')
-         return
-       }
-     }
-    // Update URL tracking at start to detect navigation
-    lastEnhanceUrl = currentUrl
-    logger.log('✅ Enhancement running for', currentUrl, bypassThrottle ? '(bypass throttle)' : '')
-
-    // Check if overlay buttons are enabled - clean up overlays if disabled but continue for inline buttons
-    if (!settings.buttonOverlay) {
-      // Clean up any existing overlays when setting is disabled
-      triggerCleanupOverlays()
-      // But continue processing for /results page inline buttons which are controlled by other settings
-      if (location.pathname !== '/results') {
-        return
-      }
-    }
-
-    // If on results and the setting is disabled, remove any inline UI and stop
-    if (location.pathname === '/results' && !settings.resultsApplySelections) {
-      try {
-        document.querySelectorAll('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch]').forEach(el => el.remove())
-        document.querySelectorAll('a[data-wol-inline-channel], [data-wol-results-channel-btn]').forEach(el => el.remove())
-        document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
-          .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
-        document.querySelectorAll('[data-wol-overlay]').forEach(el => el.remove())
-      } catch {}
+    // CRITICAL FIX: Prevent concurrent runs
+    if (enhancementRunning) {
+      logger.log('⏸️ Enhancement already running, skipping')
       return
     }
+    enhancementRunning = true
+
+    try {
+      const gen = overlayGeneration
+      logger.log('🎨 enhanceVideoTilesOnListings START, gen:', gen, 'url:', location.href)
+
+      // Safety: prune any overlays from prior generations
+      let prunedCount = 0
+      for (const [key, ov] of overlayState.entries()) {
+        if (ov.generation !== gen) {
+          ov.element.remove()
+          overlayState.delete(key)
+          prunedCount++
+        }
+      }
+      if (prunedCount > 0) {
+        logger.log('🗑️ Pruned', prunedCount, 'overlays from old generation')
+      }
+
+       // Throttle calls to prevent excessive processing (unless bypassed for retries)
+       const now = Date.now()
+       const currentUrl = window.location.href
+       if (!bypassThrottle) {
+         const isResults = location.pathname === '/results'
+         const isWatch = location.pathname === '/watch'
+         // CRITICAL FIX: Measure time between completion of enhancements, not start
+         // This allows mutation observer to trigger re-enhancement after initial work finishes
+         const minGap = isWatch ? 600 : (isResults ? 400 : 300)
+         // Allow immediate re-processing if URL changed
+         if (now - lastEnhanceTime < minGap && currentUrl === lastEnhanceUrl) {
+           logger.log('⏳ Enhancement throttled, last run completed', now - lastEnhanceTime, 'ms ago')
+           enhancementRunning = false
+           return
+         }
+       }
+      // Update URL tracking at start to detect navigation
+      lastEnhanceUrl = currentUrl
+      logger.log('✅ Enhancement running for', currentUrl, bypassThrottle ? '(bypass throttle)' : '')
+
+      // Check if overlay buttons are enabled - clean up overlays if disabled but continue for inline buttons
+      if (!settings.buttonOverlay) {
+        // Clean up any existing overlays when setting is disabled
+        triggerCleanupOverlays()
+        // But continue processing for /results page inline buttons which are controlled by other settings
+        if (location.pathname !== '/results') {
+          enhancementRunning = false
+          return
+        }
+      }
+
+      // If on results and the setting is disabled, remove any inline UI and stop
+      if (location.pathname === '/results' && !settings.resultsApplySelections) {
+        try {
+          document.querySelectorAll('a[data-wol-inline-watch], a[data-wol-inline-shorts-watch]').forEach(el => el.remove())
+          document.querySelectorAll('a[data-wol-inline-channel], [data-wol-results-channel-btn]').forEach(el => el.remove())
+          document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
+            .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
+          document.querySelectorAll('[data-wol-overlay]').forEach(el => el.remove())
+        } catch {}
+        enhancementRunning = false
+        return
+      }
 
     // Debug logging for search pages
     if (WOL_DEBUG && window.location.pathname === '/results') {
@@ -2388,6 +2514,7 @@ import { logger } from '../modules/logger'
         }
       } catch {}
     }
+
 
     // Don't add overlays on playlist pages - they don't work well
     if (window.location.pathname.includes('/playlist') || window.location.pathname.includes('/podcasts')) {
@@ -2679,6 +2806,13 @@ import { logger } from '../modules/logger'
     }
     const byId = new Map<string, { a: HTMLAnchorElement, id: string, type: 'video' | 'channel' }>()
     for (const item of toProcess) {
+      // CRITICAL FIX: Check generation during dedup to abort if navigation happened
+      if (gen !== overlayGeneration) {
+        overlayDbg(`[DEBUG] Aborting dedup - generation changed from ${gen} to ${overlayGeneration}`)
+        enhancementRunning = false
+        return
+      }
+
       const prev = byId.get(item.id)
       if (!prev) {
         byId.set(item.id, item)
@@ -2984,6 +3118,13 @@ import { logger } from '../modules/logger'
             ;(a as any).dataset.wolEnhanced = 'done'
             continue
           }
+          // Skip channel renderer buttons on channel pages - they're not needed and the styling is expensive
+          const isChannelPageNow = location.pathname.includes('/@') || location.pathname.includes('/channel/') ||
+                                   location.pathname.includes('/c/') || location.pathname.includes('/user/')
+          if (isChannelPageNow) {
+            ;(a as any).dataset.wolEnhanced = 'done'
+            continue
+          }
           if (!settings.resultsApplySelections || !settings.buttonChannelSub) {
             // If disabled, ensure any injected channel buttons are removed and observers disconnected
             try { triggerCleanupResultsChannelButtons() } catch {}
@@ -3075,16 +3216,19 @@ import { logger } from '../modules/logger'
             }
             // Match Subscribe button size and paddings for a native look
             try {
+              // CRITICAL FIX: Check generation before expensive DOM operations
+              if (gen !== overlayGeneration) {
+                dbg('Watch on Odysee: Aborting channel button styling - generation changed')
+                return
+              }
+
               // Prefer an actual clickable button within the subscribe container for accurate metrics
               const subBtnEl = (subscribeButton.querySelector('button, a, yt-button-shape button, yt-button-shape a, ytd-subscribe-button-renderer button') as HTMLElement | null) || subscribeButton
               let sbh = subBtnEl.getBoundingClientRect().height || (subBtnEl as any).offsetHeight || 0
               if (!sbh) {
-                // Fallback: scan children for a visible height
-                const elems = Array.from(subBtnEl.querySelectorAll('*')) as HTMLElement[]
-                for (const el of elems) {
-                  const r = el.getBoundingClientRect()
-                  if (r.height > 0) { sbh = r.height; break }
-                }
+                // CRITICAL FIX: Removed expensive querySelectorAll('*') fallback that blocks during navigation
+                // Just use a reasonable default height instead
+                sbh = 36
               }
               const h = Math.max(24, Math.round(sbh || 36))
               channelButton.style.height = `${h}px`
@@ -3301,6 +3445,7 @@ import { logger } from '../modules/logger'
          const gridShelf = a.closest('yt-grid-shelf-view-model-wiz') as HTMLElement | null
          host = gridShelfItem || gridShelf || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media') as HTMLElement | null) || (a as unknown as HTMLElement)
          if (!host) {
+           overlayDbg(`[DEBUG] Skipping ${id} - no host element found for anchor:`, a.href, a.closest('*')?.tagName)
            continue
          }
        }
@@ -3774,11 +3919,35 @@ import { logger } from '../modules/logger'
 
           if (isProperlyAttached) {
             // Overlay is good, skip recreation
+            overlayDbg(`[DEBUG] Overlay ${id} already exists on this host, skipping`)
             ; (a as any).dataset.wolEnhanced = 'done'; continue
           } else {
             // Overlay exists but is disconnected or not visible - remove it and recreate
             already.remove()
             // Continue to create a new one
+          }
+        }
+
+        // CRITICAL: Check if overlay exists elsewhere in the document (prevents duplicates from multiple anchors)
+        // This can happen when YouTube has multiple anchor elements for the same video
+        const existingGlobal = document.querySelector(`[data-wol-overlay="${id}"]`) as HTMLElement | null
+        if (existingGlobal && existingGlobal !== already) {
+          if (existingGlobal.isConnected && existingGlobal.offsetWidth > 0) {
+            overlayDbg(`[DEBUG] Overlay ${id} already exists globally, skipping duplicate creation`)
+            ; (a as any).dataset.wolEnhanced = 'done'; continue
+          } else {
+            // Existing global overlay is disconnected or invisible, remove it
+            overlayDbg(`[DEBUG] Removing disconnected global overlay ${id}`)
+            try { existingGlobal.remove() } catch {}
+          }
+        }
+
+        // Also check overlayState to see if we already have an overlay for this video
+        const existingState = overlayState.get(id)
+        if (existingState && existingState.generation === gen) {
+          if (existingState.element.isConnected && existingState.element.offsetWidth > 0) {
+            overlayDbg(`[DEBUG] Overlay ${id} already in overlayState, skipping duplicate`)
+            ; (a as any).dataset.wolEnhanced = 'done'; continue
           }
         }
       } catch {}
@@ -3796,16 +3965,33 @@ import { logger } from '../modules/logger'
 
       // Store this overlay in our global state, and keep it alive during DOM churn
       let mo: MutationObserver | null = null
-      // Skip heavy per-tile observers on search results to prevent CPU spikes
-      if (location.pathname !== '/results') {
+      // Skip heavy per-tile observers on search results AND channel pages to prevent CPU spikes and lockups
+      const isChannelPage = location.pathname.includes('/@') || location.pathname.includes('/channel/')
+      if (location.pathname !== '/results' && !isChannelPage) {
         mo = new MutationObserver(() => {
+          // CRITICAL: Check generation first and disconnect immediately if stale
           if (gen !== overlayGeneration) { try { mo?.disconnect() } catch {} ; return }
           // Always keep overlay attached to the stable host element
           try {
+            // CRITICAL: Check if mount is already properly positioned and visible
+            if (mount.isConnected && host.contains(mount)) {
+              const box = mount.getBoundingClientRect()
+              // If overlay is visible and in correct position, don't touch it
+              if (box.width > 0 && box.height > 0) {
+                overlayDbg(`[DEBUG] Overlay ${id} already correctly positioned, skipping reattach`)
+                ensureOverlayVisibility()
+                return
+              }
+            }
+
+            // CRITICAL: Double-check generation before expensive querySelector operations
+            if (gen !== overlayGeneration) { try { mo?.disconnect() } catch {} ; return }
+
             // If original host is gone or no longer contains mount, try to locate a fresh host within the tile
             const containerRoot = tileContainer || host.parentElement || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null)
-            
+
             if (!host.isConnected || (containerRoot && !containerRoot.contains(host))) {
+              overlayDbg(`[DEBUG] Host disconnected for ${id}, searching for new host`)
               let newHost: HTMLElement | null = null
               const candidates = [
                 containerRoot?.querySelector('ytd-thumbnail #thumbnail') as HTMLElement | null,
@@ -3825,10 +4011,18 @@ import { logger } from '../modules/logger'
               }
               // Fallback: the anchor itself
               if (!newHost) newHost = a as unknown as HTMLElement
-              if (newHost) host = newHost
+              if (newHost) {
+                overlayDbg(`[DEBUG] Found new host for ${id}, reattaching`)
+                host = newHost
+              }
             }
+
+            // Only append if not already in host
             if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
-            if (!host.contains(mount)) host.appendChild(mount)
+            if (!host.contains(mount)) {
+              overlayDbg(`[DEBUG] Reattaching overlay ${id} to host`)
+              host.appendChild(mount)
+            }
           } catch {}
           ensureOverlayVisibility()
         })
@@ -3900,33 +4094,36 @@ import { logger } from '../modules/logger'
       // Otherwise, keep it alive; separate GC routine will clean up old ones
     }
 
-    // Update throttle timer AFTER work completes (not at start)
-    // This allows mutation observer to trigger re-enhancement soon after initial processing
-    lastEnhanceTime = Date.now()
+      // Update throttle timer AFTER work completes (not at start)
+      // This allows mutation observer to trigger re-enhancement soon after initial processing
+      lastEnhanceTime = Date.now()
 
-    // Retry logic for channel pages: if we found very few videos on initial load,
-    // YouTube might still be rendering. Retry a few times with increasing delays.
-    const isChannelPage = location.href.includes('/@') || location.href.includes('/channel/') ||
-                          location.href.includes('/c/') || location.href.includes('/user/')
-    if (isChannelPage) {
-      const videoCount = overlayState.size
+      // Retry logic for channel pages: if we found very few videos on initial load,
+      // YouTube might still be rendering. Retry a few times with increasing delays.
+      const isChannelPage = location.href.includes('/@') || location.href.includes('/channel/') ||
+                            location.href.includes('/c/') || location.href.includes('/user/')
+      if (isChannelPage) {
+        const videoCount = overlayState.size
 
-      // Reset attempts if this is a new generation
-      if (lastEnhanceAttempt.gen !== gen) {
-        lastEnhanceAttempt = { gen, videoCount: 0, attempts: 0 }
+        // Reset attempts if this is a new generation
+        if (lastEnhanceAttempt.gen !== gen) {
+          lastEnhanceAttempt = { gen, videoCount: 0, attempts: 0 }
+        }
+
+        // If we found suspiciously few videos (< 20) and haven't exceeded max retries
+        // YouTube typically renders 24-30 videos initially, so < 20 means page is still loading
+        if (videoCount < 20 && lastEnhanceAttempt.attempts < 5) {
+          lastEnhanceAttempt.attempts++
+          lastEnhanceAttempt.videoCount = videoCount
+          const retryDelay = 300 * lastEnhanceAttempt.attempts  // 300ms, 600ms, 900ms, 1200ms, 1500ms
+          overlayDbg(`[DEBUG] Found only ${videoCount} videos on channel page, attempt ${lastEnhanceAttempt.attempts}/5. Retrying in ${retryDelay}ms`)
+          scheduleEnhanceListings(retryDelay, true)  // Bypass throttle for retry attempts
+        } else if (lastEnhanceAttempt.attempts > 0) {
+          overlayDbg(`[DEBUG] Channel page enhancement complete after ${lastEnhanceAttempt.attempts} attempts, found ${videoCount} videos`)
+        }
       }
-
-      // If we found suspiciously few videos (< 20) and haven't exceeded max retries
-      // YouTube typically renders 24-30 videos initially, so < 20 means page is still loading
-      if (videoCount < 20 && lastEnhanceAttempt.attempts < 5) {
-        lastEnhanceAttempt.attempts++
-        lastEnhanceAttempt.videoCount = videoCount
-        const retryDelay = 300 * lastEnhanceAttempt.attempts  // 300ms, 600ms, 900ms, 1200ms, 1500ms
-        overlayDbg(`[DEBUG] Found only ${videoCount} videos on channel page, attempt ${lastEnhanceAttempt.attempts}/5. Retrying in ${retryDelay}ms`)
-        scheduleEnhanceListings(retryDelay, true)  // Bypass throttle for retry attempts
-      } else if (lastEnhanceAttempt.attempts > 0) {
-        overlayDbg(`[DEBUG] Channel page enhancement complete after ${lastEnhanceAttempt.attempts} attempts, found ${videoCount} videos`)
-      }
+    } finally {
+      enhancementRunning = false
     }
   }
 
@@ -3943,7 +4140,10 @@ import { logger } from '../modules/logger'
 
   async function processCurrentPage() {
     if (extensionContextInvalidated) return
+    const processStartTime = performance.now()
     logger.log('Watch on Odysee: processCurrentPage() called for URL:', location.href)
+    dbg(`[CHANNEL-DEBUG] ========== processCurrentPage START ==========`)
+    dbg(`[CHANNEL-DEBUG] URL: ${location.href}`)
     try {
       const urlNow = new URL(location.href)
 
@@ -4038,15 +4238,21 @@ import { logger } from '../modules/logger'
       const sig = sourcesToResolve.map(s => `${s.type}:${s.id}`).sort().join(',')
       let resolved: Record<string, Target | null>
       const needsResolve = settingsDirty || sig !== lastResolveSig || (Date.now() - lastResolveAt) > 10000
+
+      const resolveStartTime = performance.now()
       if (needsResolve) {
         if (!resolveLogCache.has(sig)) { resolveLogCache.add(sig); logger.log('Resolving ids:', sig) }
+        dbg(`[CHANNEL-DEBUG] Starting API resolution for:`, sig)
         resolved = await getTargetsBySources(...sourcesToResolve)
+        const resolveEndTime = performance.now()
+        dbg(`[CHANNEL-DEBUG] API resolution completed in ${(resolveEndTime - resolveStartTime).toFixed(2)}ms`)
         lastResolved = resolved
         lastResolveSig = sig
         lastResolveAt = Date.now()
         logger.log('Resolved results for:', sig, Object.keys(resolved))
         settingsDirty = false
       } else {
+        dbg(`[CHANNEL-DEBUG] Using cached resolution for:`, sig)
         resolved = lastResolved
       }
 
@@ -4054,6 +4260,10 @@ import { logger } from '../modules/logger'
       if (primaryTarget?.type === 'video') playerTarget = primaryTarget
 
       if (source.type === 'channel') {
+        const channelStartTime = performance.now()
+        dbg(`[CHANNEL-DEBUG] Processing channel page for ${source.id}`)
+        dbg(`[CHANNEL-DEBUG] Has primaryTarget from API:`, !!primaryTarget)
+
         // If no direct Odysee mapping yet, derive a deterministic fallback target
         if (!primaryTarget) {
           try {
@@ -4067,25 +4277,39 @@ import { logger } from '../modules/logger'
             ) || (
               document.querySelector('#channel-header-container a[href^="/@"]') as HTMLAnchorElement | null
             )
+            dbg(`[CHANNEL-DEBUG] Found handleAnchor:`, !!handleAnchor, handleAnchor?.getAttribute('href'))
+
             const handleHref = handleAnchor?.getAttribute('href') || ''
             const handleText = handleAnchor?.textContent?.trim() || ''
             const handle = (handleHref.startsWith('/@') ? handleHref.substring(2) : '') || (handleText.startsWith('@') ? handleText.substring(1) : '')
+            dbg(`[CHANNEL-DEBUG] Extracted handle: "${handle}"`)
+
             const nameEl = (document.querySelector('ytd-page-header-renderer #channel-name #text') as HTMLElement | null)
               || (document.querySelector('yt-page-header-view-model #channel-name #text') as HTMLElement | null)
               || (document.querySelector('#text-container #text') as HTMLElement | null)
             const channelName = nameEl?.textContent?.trim() || ''
+            dbg(`[CHANNEL-DEBUG] Channel name: "${channelName}"`)
 
             const platform = targetPlatformSettings[settings.targetPlatform]
             // Try direct Odysee handle first
             if (handle) {
               primaryTarget = { platform, type: 'channel', odyseePathname: `@${handle}`, time: null }
+              dbg(`[CHANNEL-DEBUG] Created primaryTarget with handle: @${handle}`)
             } else {
               // Fallback to search by name or UC id
               const q = channelName || source.id
               primaryTarget = { platform, type: 'channel', odyseePathname: `$/search?q=${encodeURIComponent(q)}` , time: null }
+              dbg(`[CHANNEL-DEBUG] Created fallback primaryTarget with query: ${q}`)
             }
-          } catch {}
+          } catch (e) {
+            dbg(`[CHANNEL-DEBUG] Error creating fallback target:`, e)
+          }
         }
+
+        const channelEndTime = performance.now()
+        dbg(`[CHANNEL-DEBUG] Channel processing took ${(channelEndTime - channelStartTime).toFixed(2)}ms`)
+        dbg(`[CHANNEL-DEBUG] Final primaryTarget:`, primaryTarget)
+
         if (settings.buttonChannelSub && primaryTarget) subscribeTargets.push(primaryTarget)
       } else if (source.type === 'video') {
         const vidTarget = resolved[source.id]
@@ -4101,6 +4325,7 @@ import { logger } from '../modules/logger'
       }
 
       if (subscribeTargets.length === 0 && !playerTarget) {
+        dbg(`[CHANNEL-DEBUG] No targets found, clearing buttons`)
         updateButtons(null)
         if (settings.buttonOverlay) ensureOverlayEnhancementActive()
         // do not return; allow redirect assessment to run
@@ -4109,6 +4334,11 @@ import { logger } from '../modules/logger'
       if (playerTarget?.type === 'video') {
         const videoElement = document.querySelector<HTMLVideoElement>(source.platform.htmlQueries.videoPlayer)
         if (videoElement) playerTarget.time = videoElement.currentTime > 3 && videoElement.currentTime < videoElement.duration - 1 ? videoElement.currentTime : null
+      }
+
+      dbg(`[CHANNEL-DEBUG] Calling updateButtons with ${subscribeTargets.length} targets`)
+      if (source.type === 'channel' && subscribeTargets.length > 0) {
+        dbg(`[CHANNEL-DEBUG] Channel button target:`, subscribeTargets[0])
       }
       updateButtons({ buttonTargets: subscribeTargets, playerTarget, source })
       if (settings.buttonOverlay) ensureOverlayEnhancementActive()
@@ -4148,10 +4378,14 @@ import { logger } from '../modules/logger'
           if (window.history.length === 1) window.close(); else window.history.back()
         }
       }
+
+      const processEndTime = performance.now()
+      dbg(`[CHANNEL-DEBUG] ========== processCurrentPage END (${(processEndTime - processStartTime).toFixed(2)}ms total) ==========`)
     } catch (error) { logger.error(error) }
   }
 
   // Initial kick using event-driven flow
-  scheduleProcessCurrentPage(0)
+  // Add delay for initial load to ensure DOM is fully ready (especially for channel pages)
+  scheduleProcessCurrentPage(400)
 
 })()

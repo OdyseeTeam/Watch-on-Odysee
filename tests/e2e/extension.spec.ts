@@ -909,3 +909,187 @@ test('watch page related rail overlays toggle without refresh', async () => {
   await test.info().attach('related_overlays.png', { body: relImg, contentType: 'image/png' })
   fs.writeFileSync(path.join(artifactsDir, 'related_overlays.png'), relImg)
 })
+
+test('REGRESSION: overlay toggle after hover + navigation', async () => {
+  const base = 'https://www.youtube.com/@WhiteHouse'
+  if (process.env.E2E_USE_STUBS !== '1') {
+    const chId = await getChannelIdForHandle('WhiteHouse')
+    if (!chId) test.skip(true, 'Could not resolve channel id')
+    const res = await realResolve({ channels: [chId] })
+    if (!res?.data?.channels?.[chId]) test.skip(true, 'Real API: channel not mirrored')
+  }
+
+  await ensurePopupToggle('Video Previews', true)
+
+  // Navigate to Videos tab
+  await page.goto(base + '/videos')
+  await dismissYouTubeConsentIfPresent(page)
+  await page.waitForSelector('ytd-grid-video-renderer, ytd-rich-item-renderer', { timeout: 60_000 })
+
+  // Verify initial overlays
+  const overlays = page.locator('[data-wol-overlay]')
+  await expect(overlays.first()).toBeVisible({ timeout: 45_000 })
+
+  // Hover over some video thumbnails to trigger hover handlers
+  const thumbnails = page.locator('ytd-grid-video-renderer a#thumbnail, ytd-rich-item-renderer a#thumbnail')
+  const thumbCount = await thumbnails.count()
+  if (thumbCount > 0) {
+    for (let i = 0; i < Math.min(3, thumbCount); i++) {
+      await thumbnails.nth(i).hover()
+      await page.waitForTimeout(200)
+    }
+  }
+
+  ensureArtifactsDir()
+  const afterHover = await page.screenshot({ fullPage: true })
+  fs.writeFileSync(path.join(artifactsDir, 'regression_after_hover.png'), afterHover)
+
+  // Navigate to a watch page
+  const firstVideo = page.locator('ytd-grid-video-renderer a#video-title, ytd-rich-item-renderer a#video-title-link').first()
+  await firstVideo.click()
+  await page.waitForURL(/\/watch\?v=/, { timeout: 30_000 })
+  await dismissYouTubeConsentIfPresent(page)
+
+  // Navigate back to Videos tab
+  await page.goBack()
+  await page.waitForURL(/\/@WhiteHouse\/videos/, { timeout: 30_000 })
+  await page.waitForTimeout(2000)
+
+  // Verify overlays are present after navigation
+  const overlaysAfterNav = page.locator('[data-wol-overlay]')
+  await expect(overlaysAfterNav.first()).toBeVisible({ timeout: 45_000 })
+  const countBeforeToggle = await overlaysAfterNav.count()
+  expect(countBeforeToggle).toBeGreaterThan(0)
+
+  const beforeToggle = await page.screenshot({ fullPage: true })
+  fs.writeFileSync(path.join(artifactsDir, 'regression_before_toggle.png'), beforeToggle)
+
+  // CRITICAL: Toggle overlays OFF - ALL overlays should disappear
+  await ensurePopupToggle('Video Previews', false)
+  await page.waitForTimeout(1000) // Give time for cleanup
+
+  // Verify ALL overlays are gone (including any that were hovered)
+  await expect(overlaysAfterNav).toHaveCount(0, { timeout: 5000 })
+
+  const afterToggleOff = await page.screenshot({ fullPage: true })
+  await test.info().attach('regression_after_toggle_off.png', { body: afterToggleOff, contentType: 'image/png' })
+  fs.writeFileSync(path.join(artifactsDir, 'regression_after_toggle_off.png'), afterToggleOff)
+})
+
+test('REGRESSION: all overlays shown on channel page after navigation', async () => {
+  const base = 'https://www.youtube.com/@WhiteHouse'
+  if (process.env.E2E_USE_STUBS !== '1') {
+    const chId = await getChannelIdForHandle('WhiteHouse')
+    if (!chId) test.skip(true, 'Could not resolve channel id')
+    const res = await realResolve({ channels: [chId] })
+    if (!res?.data?.channels?.[chId]) test.skip(true, 'Real API: channel not mirrored')
+  }
+
+  await ensurePopupToggle('Video Previews', true)
+
+  // Navigate to Videos tab
+  await page.goto(base + '/videos')
+  await dismissYouTubeConsentIfPresent(page)
+  await page.waitForSelector('ytd-grid-video-renderer, ytd-rich-item-renderer', { timeout: 60_000 })
+
+  // Count initial overlays
+  const overlaysInitial = page.locator('[data-wol-overlay]')
+  await expect(overlaysInitial.first()).toBeVisible({ timeout: 45_000 })
+  const initialCount = await overlaysInitial.count()
+  expect(initialCount).toBeGreaterThan(0)
+
+  ensureArtifactsDir()
+  const initialScreenshot = await page.screenshot({ fullPage: true })
+  fs.writeFileSync(path.join(artifactsDir, 'regression_initial_overlays.png'), initialScreenshot)
+
+  // Navigate to watch page
+  const firstVideo = page.locator('ytd-grid-video-renderer a#video-title, ytd-rich-item-renderer a#video-title-link').first()
+  await firstVideo.click()
+  await page.waitForURL(/\/watch\?v=/, { timeout: 30_000 })
+  await dismissYouTubeConsentIfPresent(page)
+
+  // Navigate back to Videos tab
+  await page.goBack()
+  await page.waitForURL(/\/@WhiteHouse\/videos/, { timeout: 30_000 })
+  await page.waitForTimeout(3000) // Give extra time for all overlays to be created
+
+  // CRITICAL: Verify same number of overlays (or more) are present
+  const overlaysAfterNav = page.locator('[data-wol-overlay]')
+  await expect(overlaysAfterNav.first()).toBeVisible({ timeout: 45_000 })
+  const afterNavCount = await overlaysAfterNav.count()
+
+  // Allow for some variance (YouTube might show different number of videos), but ensure we have overlays
+  expect(afterNavCount).toBeGreaterThan(0)
+  expect(afterNavCount).toBeGreaterThanOrEqual(Math.floor(initialCount * 0.8)) // At least 80% of original count
+
+  const afterNavScreenshot = await page.screenshot({ fullPage: true })
+  await test.info().attach('regression_after_nav_overlays.png', { body: afterNavScreenshot, contentType: 'image/png' })
+  fs.writeFileSync(path.join(artifactsDir, 'regression_after_nav_overlays.png'), afterNavScreenshot)
+
+  // Navigate to Streams tab
+  const streamsTab = page.locator('yt-tab-shape:has-text("Live"), tp-yt-paper-tab:has-text("Live")').first()
+  if (await streamsTab.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await streamsTab.click()
+    await page.waitForURL(/\/(live|streams)/, { timeout: 30_000 })
+    await page.waitForTimeout(2000)
+
+    // Verify overlays on Streams tab
+    const overlaysOnStreams = page.locator('[data-wol-overlay]')
+    const streamsCount = await overlaysOnStreams.count()
+    expect(streamsCount).toBeGreaterThan(0)
+
+    // Navigate back to Videos
+    const videosTab = page.locator('yt-tab-shape:has-text("Videos"), tp-yt-paper-tab:has-text("Videos")').first()
+    await videosTab.click()
+    await page.waitForURL(/\/videos/, { timeout: 30_000 })
+    await page.waitForTimeout(3000)
+
+    // CRITICAL: Verify all overlays still present
+    const overlaysFinal = page.locator('[data-wol-overlay]')
+    await expect(overlaysFinal.first()).toBeVisible({ timeout: 45_000 })
+    const finalCount = await overlaysFinal.count()
+    expect(finalCount).toBeGreaterThan(0)
+    expect(finalCount).toBeGreaterThanOrEqual(Math.floor(initialCount * 0.8))
+
+    const finalScreenshot = await page.screenshot({ fullPage: true })
+    await test.info().attach('regression_final_overlays.png', { body: finalScreenshot, contentType: 'image/png' })
+    fs.writeFileSync(path.join(artifactsDir, 'regression_final_overlays.png'), finalScreenshot)
+  }
+})
+
+test('REGRESSION: watch page related videos all have overlays', async () => {
+  await ensurePopupToggle('Video Previews', true)
+
+  // Navigate to a watch page with related videos
+  await page.goto('https://www.youtube.com/watch?v=qn2K3UyIsEo')
+  await dismissYouTubeConsentIfPresent(page)
+
+  // Wait for related/secondary container
+  const relatedContainer = page.locator('#secondary, #related, ytd-watch-next-secondary-results-renderer').first()
+  await expect(relatedContainer).toBeVisible({ timeout: 60_000 })
+
+  // Wait for video thumbnails in related section
+  await page.waitForSelector('#secondary ytd-compact-video-renderer, #related ytd-compact-video-renderer, ytd-watch-next-secondary-results-renderer ytd-compact-video-renderer', { timeout: 60_000 })
+
+  // Give time for all overlays to be created
+  await page.waitForTimeout(3000)
+
+  // Count video thumbnails
+  const videoThumbnails = page.locator('#secondary ytd-compact-video-renderer a#thumbnail, #related ytd-compact-video-renderer a#thumbnail')
+  const thumbCount = await videoThumbnails.count()
+  expect(thumbCount).toBeGreaterThan(0)
+
+  // Count overlays in related section
+  const relatedOverlays = relatedContainer.locator('[data-wol-overlay]')
+  const overlayCount = await relatedOverlays.count()
+
+  // CRITICAL: Verify we have overlays for videos in related section
+  expect(overlayCount).toBeGreaterThan(0)
+  // Should have at least half the videos with overlays (accounting for ads, etc)
+  expect(overlayCount).toBeGreaterThanOrEqual(Math.floor(thumbCount * 0.5))
+
+  ensureArtifactsDir()
+  const screenshot = await page.screenshot({ fullPage: true })
+  await test.info().attach('regression_related_overlays.png', { body: screenshot, contentType: 'image/png' })
+  fs.writeFileSync(path.join(artifactsDir, 'regression_related_overlays.png'), screenshot)
+})
