@@ -3,6 +3,7 @@ import { parseYouTubeURLTimeString } from '../modules/yt'
 import type { resolveById, ResolveUrlTypes } from '../modules/yt/urlResolve'
 import { getExtensionSettingsAsync, getSourcePlatfromSettingsFromHostname, getTargetPlatfromSettingsEntiries, SourcePlatform, sourcePlatfromSettings, TargetPlatform, targetPlatformSettings } from '../settings';
 import { logger } from '../modules/logger'
+import { channelCache } from '../modules/yt/channelCache'
 
 (async () => {
   const sleep = (t: number) => new Promise(resolve => setTimeout(resolve, t))
@@ -170,6 +171,8 @@ import { logger } from '../modules/logger'
   let wolMutationObserver: MutationObserver | null = null
   // Navigation polling interval
   let wolNavigationPollInterval: number | null = null
+  // Scroll handler for channel pages
+  let wolChannelScrollHandler: ((e: Event) => void) | null = null
   // Extension boot tracking (for debugging)
   const EXT_BOOT_AT = Date.now()
   // Batch state for watch-page related sidebar overlays (container-gated)
@@ -321,6 +324,11 @@ import { logger } from '../modules/logger'
         wolMutationObserver.disconnect()
         wolMutationObserver = null
         logger.log('✋ Stopped mutation observer')
+      }
+      if (wolChannelScrollHandler) {
+        window.removeEventListener('scroll', wolChannelScrollHandler)
+        wolChannelScrollHandler = null
+        logger.log('✋ Stopped channel scroll handler')
       }
 
       // CRITICAL FIX: Clear all scheduled tasks to prevent race conditions
@@ -1456,6 +1464,59 @@ import { logger } from '../modules/logger'
       if (cid) document.documentElement.setAttribute('data-wol-channel-id', cid)
       if (lastLoggedHref !== url.href) logger.log('Initial watch page channel ID (any method):', cid)
 
+      // IMPORTANT: Populate persistent cache with verified UC from watch page
+      // This is ACCURATE because it's the actual channel of the video being watched
+      if (cid && cid.startsWith('UC')) {
+        try {
+          // Also try to get the channel handle from the page
+          let channelHandle: string | null = null
+
+          // Try to find handle from channel link
+          const channelLink = document.querySelector('#owner #channel-name a[href^="/@"], ytd-channel-name#channel-name a[href^="/@"]') as HTMLAnchorElement | null
+          if (channelLink) {
+            const handleMatch = channelLink.href.match(/\/@([^\/]+)/)
+            if (handleMatch) {
+              channelHandle = handleMatch[1]
+            }
+          }
+
+          // Also check ytInitialPlayerResponse for author
+          if (!channelHandle && pr?.author) {
+            // Sometimes author is "@handle" format
+            if (pr.author.startsWith('@')) {
+              channelHandle = pr.author.slice(1)
+            }
+          }
+
+          if (channelHandle) {
+            // Persist the verified mapping silently
+            (async () => {
+              try {
+                await channelCache.putHandle(channelHandle!, cid)
+                await channelCache.putYtUrl(`/@${channelHandle}`, cid)
+                await channelCache.putYtUrl(`/channel/${cid}`, cid)
+
+                // Also update in-memory caches for immediate use
+                const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
+                const srcs = [{ platform: srcPlatform, id: cid, type: 'channel' as const, url: new URL(location.href), time: null }]
+                const resolved = await getTargetsBySources(...srcs)
+                const target = resolved[cid] || null
+                if (target) {
+                  ucResolvePageCache.set(cid, target)
+                  handleResolvePageCache.set(channelHandle!, target)
+                  ytUrlResolvePageCache.set(`/@${channelHandle}`, target)
+                  ytUrlResolvePageCache.set(`/channel/${cid}`, target)
+                }
+              } catch (err) {
+                // Silently fail - cache population is best-effort
+              }
+            })()
+          }
+        } catch {
+          // Silently fail - cache extraction is best-effort
+        }
+      }
+
       // Build video source from the watch URL
       const videoId = url.searchParams.get('v')!
       const timeParam = url.searchParams.get('t')
@@ -1951,7 +2012,13 @@ import { logger } from '../modules/logger'
       if (!data) { initialDataMapCache = { url: href, handleToUC: new Map(), videoToUC: new Map(), collectedAt: Date.now() }; return initialDataMapCache }
       const maps = collectMappingsFromInitialData(data)
       initialDataMapCache = { url: href, handleToUC: maps.handleToUC, videoToUC: maps.videoToUC, collectedAt: Date.now() }
-      if (WOL_DEBUG) dbg('[RESULTS][MAP] collected from initialData: handles=', maps.handleToUC.size, 'videos=', maps.videoToUC.size)
+      if (WOL_DEBUG) {
+        dbg('[RESULTS][MAP] collected from initialData: handles=', maps.handleToUC.size, 'videos=', maps.videoToUC.size)
+        // Log all handle mappings to see what YouTube provided
+        for (const [handle, uc] of maps.handleToUC.entries()) {
+          dbg('[RESULTS][MAP] handle mapping:', '@' + handle, '->', uc)
+        }
+      }
     } catch { initialDataMapCache = { url: href, handleToUC: new Map(), videoToUC: new Map(), collectedAt: Date.now() } }
     return initialDataMapCache
   }
@@ -2032,6 +2099,77 @@ import { logger } from '../modules/logger'
     } catch {}
   }
 
+  // Helper: Extract UC mappings from ytInitialData on search results page
+  function extractSearchResultsUCMappings(): Map<string, string> {
+    const mappings = new Map<string, string>()
+
+    try {
+      // Try to get ytInitialData from window
+      const initialData = (window as any).ytInitialData || (window as any).ytcfg?.data_?.INITIAL_DATA
+      if (!initialData) {
+        return mappings
+      }
+
+      // Recursively search for channel info in the data
+      const findChannels = (obj: any, depth = 0): void => {
+        if (!obj || typeof obj !== 'object' || depth > 10) return
+
+        // Look for channel renderer objects
+        if (obj.channelRenderer) {
+          const cr = obj.channelRenderer
+          const channelId = cr.channelId
+          const vanityUrl = cr.navigationEndpoint?.browseEndpoint?.canonicalBaseUrl ||
+                          cr.navigationEndpoint?.commandMetadata?.webCommandMetadata?.url
+
+          if (channelId && channelId.startsWith('UC') && vanityUrl) {
+            // Extract handle from URL like "/@veritasium" or "/c/veritasium"
+            const handleMatch = vanityUrl.match(/\/@([^\/]+)/)
+            if (handleMatch) {
+              const handle = handleMatch[1]
+              mappings.set(handle, channelId)
+            }
+          }
+        }
+
+        // Look for video renderer objects with channel info
+        if (obj.videoRenderer) {
+          const vr = obj.videoRenderer
+          const channelId = vr.ownerText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId ||
+                          vr.longBylineText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId
+          const channelUrl = vr.ownerText?.runs?.[0]?.navigationEndpoint?.commandMetadata?.webCommandMetadata?.url ||
+                           vr.longBylineText?.runs?.[0]?.navigationEndpoint?.commandMetadata?.webCommandMetadata?.url
+
+          if (channelId && channelId.startsWith('UC') && channelUrl) {
+            const handleMatch = channelUrl.match(/\/@([^\/]+)/)
+            if (handleMatch) {
+              const handle = handleMatch[1]
+              if (!mappings.has(handle)) {
+                mappings.set(handle, channelId)
+              }
+            }
+          }
+        }
+
+        // Recurse through object properties
+        for (const key in obj) {
+          if (Array.isArray(obj[key])) {
+            for (const item of obj[key]) {
+              findChannels(item, depth + 1)
+            }
+          } else {
+            findChannels(obj[key], depth + 1)
+          }
+        }
+      }
+
+      findChannels(initialData)
+    } catch {
+      // Silently fail
+    }
+
+    return mappings
+  }
+
   // Ensure channel renderer buttons (top channel section on results) are present
   async function refreshResultsChannelRendererButtons() {
     try {
@@ -2068,6 +2206,12 @@ import { logger } from '../modules/logger'
         return
       }
 
+      // Extract UC mappings from ytInitialData on search results
+      const ucMappingsFromInitialData = extractSearchResultsUCMappings()
+      if (WOL_DEBUG && ucMappingsFromInitialData.size > 0) {
+        dbg('[RESULTS][CR] Using UC mappings from ytInitialData:', Array.from(ucMappingsFromInitialData.entries()))
+      }
+
       let injectedCount = 0
       // Helper: upgrade @handle to UC via lightweight fetch (fallback)
       async function upgradeHandleToUC_CR(handle: string): Promise<string | null> {
@@ -2087,6 +2231,29 @@ import { logger } from '../modules/logger'
                 }
               }
             }
+          }
+
+          // Check if we have this handle in the ytInitialData mappings
+          const normalizedHandle = h.startsWith('@') ? h.slice(1) : h
+          if (ucMappingsFromInitialData.has(normalizedHandle)) {
+            const uc = ucMappingsFromInitialData.get(normalizedHandle)!
+            return uc
+          }
+
+          // Check persistent cache
+          try {
+            const persistedUC = await channelCache.getHandle(normalizedHandle)
+            if (persistedUC && persistedUC.startsWith('UC')) {
+              return persistedUC
+            }
+          } catch {
+            // Silently fail
+          }
+
+          // CRITICAL: NEVER use fetch on search results pages - it returns personalized/wrong data
+          if (location.pathname === '/results' || location.pathname.startsWith('/results')) {
+            if (WOL_DEBUG) dbg('[RESULTS][CR] Skipping fetch on search results page for handle:', handle)
+            return null
           }
 
           // Not cached, fetch it
@@ -2170,6 +2337,7 @@ import { logger } from '../modules/logger'
               const u = new URL(hA.getAttribute('href') || hA.href, location.origin)
               handle = u.pathname.substring(1)
               ytUrl = u.pathname // Store YT URL
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'extracted handle+ytUrl from hA:', handle, ytUrl)
             } catch {}
           }
           // If no explicit /@ anchor, attempt to read handle text anywhere in the renderer
@@ -2177,96 +2345,258 @@ import { logger } from '../modules/logger'
             try {
               const txt = cr.textContent || ''
               const m = txt.match(/@[A-Za-z0-9_\.\-]+/)
-              if (m) handle = m[0]
-            } catch {}
-          }
-          // Map handle -> UC via initialData if UC still missing
-          if (!ucid && handle) {
-            try {
-              const maps = getInitialDataMappings()
-              const norm = handle.startsWith('@') ? handle.slice(1) : handle
-              const mapped = maps.handleToUC.get(norm)
-              if (mapped && mapped.startsWith('UC')) ucid = mapped
+              if (m) {
+                handle = m[0]
+                if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'extracted handle from text:', handle)
+              }
             } catch {}
           }
           // Deep scan: endpoint-like attributes on the renderer
+          // IMPORTANT: Check data attributes BEFORE initialData mapping because data attributes
+          // come from the actual rendered DOM and are more reliable than YouTube's personalized initialData
           if (!ucid) {
-            const attrNodes = cr.querySelectorAll('[data-serialized-endpoint],[data-innertube-command],[data-endpoint],[endpoint]')
-            for (const el of Array.from(attrNodes)) {
+            // Try ALL elements with any data attribute, not just specific ones
+            const allElements = Array.from(cr.querySelectorAll('*'))
+            let foundUCs: string[] = []
+
+            for (const el of allElements) {
               try {
-                const raw = (el as HTMLElement).getAttribute('data-serialized-endpoint')
-                  || (el as HTMLElement).getAttribute('data-innertube-command')
-                  || (el as HTMLElement).getAttribute('data-endpoint')
-                  || (el as HTMLElement).getAttribute('endpoint')
-                if (!raw) continue
-                const data = JSON.parse(raw)
-                const bid = data?.browseEndpoint?.browseId
-                  || data?.commandMetadata?.webCommandMetadata?.browseEndpoint?.browseId
-                  || data?.webCommandMetadata?.browseEndpoint?.browseId
-                  || data?.browseId
-                if (typeof bid === 'string' && bid.startsWith('UC')) { ucid = bid; break }
+                // Check all data- attributes
+                for (const attr of Array.from(el.attributes)) {
+                  if (!attr.name.startsWith('data-')) continue
+                  try {
+                    const data = JSON.parse(attr.value)
+                    // Recursively search for browseId in the JSON
+                    const findBrowseId = (obj: any): string | null => {
+                      if (!obj || typeof obj !== 'object') return null
+                      if (obj.browseId && typeof obj.browseId === 'string' && obj.browseId.startsWith('UC')) {
+                        return obj.browseId
+                      }
+                      for (const key in obj) {
+                        const result = findBrowseId(obj[key])
+                        if (result) return result
+                      }
+                      return null
+                    }
+                    const bid = findBrowseId(data)
+                    if (bid) {
+                      foundUCs.push(bid)
+                      if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'found UC in', attr.name, ':', bid)
+                    }
+                  } catch {}
+                }
               } catch {}
             }
+
+            if (foundUCs.length > 0) {
+              // Use the FIRST UC found, as it's usually the channel's own ID
+              // (later UCs might be related/suggested channels)
+              ucid = foundUCs[0]
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '✅ using FIRST UC from DOM scan:', ucid, 'total found:', foundUCs.length, foundUCs)
+            }
           }
-          // Fallback regex in text
-          if (!ucid) {
-            try { const m = (cr.textContent || '').match(/UC[a-zA-Z0-9_-]{22}/); if (m) ucid = m[0] } catch {}
-          }
+          // DISABLED: Do NOT use initialData mapping for handle→UC conversion on results pages
+          // YouTube's initialData can contain personalized/wrong UC IDs that don't match what's visually displayed
+          // Instead, we'll rely on direct DOM extraction above or fetch upgrade below
+          //
+          // // Map handle -> UC via initialData if UC still missing
+          // if (!ucid && handle) {
+          //   try {
+          //     const maps = getInitialDataMappings()
+          //     const norm = handle.startsWith('@') ? handle.slice(1) : handle
+          //     const mapped = maps.handleToUC.get(norm)
+          //     if (mapped && mapped.startsWith('UC')) {
+          //       ucid = mapped
+          //       if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '⚠️ MAPPED handle', norm, 'to UC via initialData:', ucid, '(THIS MAY BE WRONG)')
+          //     }
+          //   } catch {}
+          // }
         } catch {}
-        // If UC not found yet and we have a handle, try initialData mapping
-        if (!ucid && handle) {
-          try {
-            const maps = getInitialDataMappings()
-            const norm = handle.startsWith('@') ? handle.slice(1) : handle
-            if (maps.handleToUC.has(norm)) ucid = maps.handleToUC.get(norm) || null
-          } catch {}
+
+        // BEFORE trying to upgrade handle via fetch, check if we have this handle cached from previous visits
+        // This prevents using YouTube's personalized fetch response
+        if (!ucid && handle && ytUrl) {
+          const normHandle = handle.startsWith('@') ? handle.slice(1) : handle
+
+          // Step 1: Check in-memory ytUrl cache first (fastest)
+          if (ytUrlResolvePageCache.has(ytUrl)) {
+            const target = ytUrlResolvePageCache.get(ytUrl)
+            if (target) {
+              // Found in ytUrl cache, now get the UC from UC cache
+              for (const [uc, cachedTarget] of ucResolvePageCache.entries()) {
+                if (cachedTarget === target && uc.startsWith('UC')) {
+                  ucid = uc
+                  if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '✅ found UC via in-memory ytUrl cache:', ucid, 'for', ytUrl)
+                  break
+                }
+              }
+            }
+          }
+
+          // Step 2: Check in-memory handle cache
+          if (!ucid && handleResolvePageCache.has(normHandle)) {
+            const target = handleResolvePageCache.get(normHandle)
+            if (target) {
+              // Found in handle cache, now get the UC from UC cache
+              for (const [uc, cachedTarget] of ucResolvePageCache.entries()) {
+                if (cachedTarget === target && uc.startsWith('UC')) {
+                  ucid = uc
+                  if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '✅ found UC via in-memory handle cache:', ucid, 'for @' + normHandle)
+                  break
+                }
+              }
+            }
+          }
+
+          // Step 3: Check persistent ytUrl cache (survives page reloads)
+          if (!ucid) {
+            try {
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'checking PERSISTENT ytUrl cache for:', ytUrl)
+              const persistedUC = await channelCache.getYtUrl(ytUrl)
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'PERSISTENT ytUrl cache result:', persistedUC === undefined ? 'MISS (undefined)' : (persistedUC === null ? 'null' : persistedUC))
+              if (persistedUC && persistedUC.startsWith('UC')) {
+                ucid = persistedUC
+                if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '✅ found UC via PERSISTENT ytUrl cache:', ucid, 'for', ytUrl)
+              }
+            } catch (err) {
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '❌ ERROR checking persistent ytUrl cache:', err)
+            }
+          }
+
+          // Step 4: Check persistent handle cache (survives page reloads)
+          if (!ucid) {
+            try {
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'checking PERSISTENT handle cache for:', normHandle)
+              const persistedUC = await channelCache.getHandle(normHandle)
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'PERSISTENT handle cache result:', persistedUC === undefined ? 'MISS (undefined)' : (persistedUC === null ? 'null' : persistedUC))
+              if (persistedUC && persistedUC.startsWith('UC')) {
+                ucid = persistedUC
+                if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '✅ found UC via PERSISTENT handle cache:', ucid, 'for @' + normHandle)
+              }
+            } catch (err) {
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '❌ ERROR checking persistent handle cache:', err)
+            }
+          }
         }
+
         // As last resort, upgrade handle to UC via fetch (guarded)
+        // This may return wrong UC due to YouTube personalization
         if (!ucid && handle) {
+          if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '⚠️ NO CACHE HIT - upgrading handle to UC via fetch (may be wrong due to YT personalization):', handle)
           ucid = await upgradeHandleToUC_CR(handle)
+          if (WOL_DEBUG && ucid) dbg('[RESULTS][CR]', i, '⚠️ upgraded handle to UC via fetch:', ucid, '(THIS MAY BE WRONG)')
           if (myGen !== overlayGeneration) return
         }
 
         if (ucid) {
           if (myGen !== overlayGeneration) return
-          if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'ucid:', ucid, 'handle:', handle || '-')
+          if (WOL_DEBUG) {
+            dbg('[RESULTS][CR]', i, 'ucid:', ucid, 'handle:', handle || '-', 'ytUrl:', ytUrl || '-')
+            // Log what's in the caches to understand why lookup is failing
+            dbg('[RESULTS][CR]', i, 'Cache status - ytUrls:', ytUrlResolvePageCache.size, 'handles:', handleResolvePageCache.size, 'UCs:', ucResolvePageCache.size)
+            if (handleResolvePageCache.size > 0) {
+              dbg('[RESULTS][CR]', i, 'Handle cache contents:', Array.from(handleResolvePageCache.keys()))
+            }
+            if (ytUrl && ytUrlResolvePageCache.size > 0) {
+              dbg('[RESULTS][CR]', i, 'YtUrl cache contents:', Array.from(ytUrlResolvePageCache.keys()))
+            }
+          }
           try {
-            // First try page cache to avoid duplicate resolution
-            if (ucResolvePageCache.has(ucid)) {
-              const t = ucResolvePageCache.get(ucid)
+            // First try ytUrl cache (most direct - no UC/handle mismatch issues)
+            if (!chUrl && ytUrl && ytUrlResolvePageCache.has(ytUrl)) {
+              const t = ytUrlResolvePageCache.get(ytUrl)
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'found ytUrl in cache:', ytUrl, 'target:', t ? 'valid' : 'null')
               if (t) {
                 chUrl = getOdyseeUrlByTarget(t)
-                if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'resolved from cache ->', chUrl.href)
+                if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'resolved from ytUrl cache ->', chUrl.href)
+              }
+            }
+
+            // Then try handle cache (more reliable than UC since YouTube shows different UCs for same channel)
+            if (!chUrl && handle) {
+              const normHandle = handle.startsWith('@') ? handle.slice(1) : handle
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'checking handle cache for:', normHandle)
+              if (handleResolvePageCache.has(normHandle)) {
+                const t = handleResolvePageCache.get(normHandle)
+                if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'found handle in cache:', normHandle, 'target:', t ? 'valid' : 'null')
+                if (t) {
+                  chUrl = getOdyseeUrlByTarget(t)
+                  if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'resolved from handle cache ->', chUrl.href)
+                  // Populate UC and ytUrl caches for this mapping
+                  try {
+                    ucResolvePageCache.set(ucid, t)
+                    if (ytUrl) ytUrlResolvePageCache.set(ytUrl, t)
+                  } catch {}
+                }
+              }
+            }
+
+            // Finally try UC cache
+            if (!chUrl && ucResolvePageCache.has(ucid)) {
+              const t = ucResolvePageCache.get(ucid)
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'found UC in cache:', ucid, 'target:', t ? 'valid' : 'null')
+              if (t) {
+                chUrl = getOdyseeUrlByTarget(t)
+                if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'resolved from UC cache ->', chUrl.href)
                 // Populate all caches for quick VR injection
                 try {
                   if (handle) handleResolvePageCache.set(handle.startsWith('@') ? handle.slice(1) : handle, t)
                   if (ytUrl && !ytUrlResolvePageCache.has(ytUrl)) ytUrlResolvePageCache.set(ytUrl, t)
                 } catch {}
-                // Nudge chips refresher to leverage newly-known mapping (with anti-ping-pong guard)
-                const now = Date.now()
-                if (now - lastButtonsToChipsNudge > MIN_CROSS_NUDGE_INTERVAL) {
-                  lastButtonsToChipsNudge = now
-                  scheduleRefreshResultsChips(50)
-                  if (WOL_DEBUG) dbg('[RESULTS][CR] nudging chips refresher (cache hit)')
-                } else if (WOL_DEBUG) {
-                  dbg('[RESULTS][CR] skipping chips nudge (too soon,', now - lastButtonsToChipsNudge, 'ms ago)')
-                }
               }
             }
-            // If not cached, resolve once now
+
+            // If resolved from any cache, nudge chips refresher
+            if (chUrl) {
+              const now = Date.now()
+              if (now - lastButtonsToChipsNudge > MIN_CROSS_NUDGE_INTERVAL) {
+                lastButtonsToChipsNudge = now
+                scheduleRefreshResultsChips(50)
+                if (WOL_DEBUG) dbg('[RESULTS][CR] nudging chips refresher (cache hit)')
+              } else if (WOL_DEBUG) {
+                dbg('[RESULTS][CR] skipping chips nudge (too soon,', now - lastButtonsToChipsNudge, 'ms ago)')
+              }
+            }
+
+            // If not cached anywhere, resolve via API
             if (!chUrl) {
               const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'calling API to resolve UC:', ucid)
               const res = await getTargetsBySources({ platform: srcPlatform, id: ucid, type: 'channel', url: new URL(location.href), time: null })
               // Yield after API call to prevent blocking
               await new Promise(resolve => setTimeout(resolve, 0))
               if (myGen !== overlayGeneration) return
               const t = res[ucid] || null
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'API returned:', t ? 'valid target' : 'null', 'for UC:', ucid)
               // Populate all page caches for future CR/VR usage
               try {
                 ucResolvePageCache.set(ucid, t ?? null)
-                if (t && handle) handleResolvePageCache.set(handle.startsWith('@') ? handle.slice(1) : handle, t)
-                if (t && ytUrl) ytUrlResolvePageCache.set(ytUrl, t)
-                if (WOL_DEBUG && ytUrl) dbg('[CACHE] Stored YT URL', ytUrl, 'from CR resolution')
+                // IMPORTANT: Only cache handle/ytUrl mappings for successful resolutions
+                // YouTube sometimes shows wrong handles (e.g., @veritasium for both main and FR channels)
+                // so we should only cache when we have a valid target to avoid blocking correct lookups
+                if (t) {
+                  if (handle) {
+                    const normHandle = handle.startsWith('@') ? handle.slice(1) : handle
+                    handleResolvePageCache.set(normHandle, t)
+                    // Also persist to IndexedDB for cross-reload cache
+                    channelCache.putHandle(normHandle, ucid).catch(err => {
+                      if (WOL_DEBUG) dbg('[CACHE] Error persisting handle:', err)
+                    })
+                    if (WOL_DEBUG) dbg('[CACHE] Stored handle', normHandle, '→', ucid, 'from CR resolution (in-memory + persistent)')
+                  }
+                  if (ytUrl) {
+                    ytUrlResolvePageCache.set(ytUrl, t)
+                    // Also persist to IndexedDB for cross-reload cache
+                    channelCache.putYtUrl(ytUrl, ucid).catch(err => {
+                      if (WOL_DEBUG) dbg('[CACHE] Error persisting ytUrl:', err)
+                    })
+                    if (WOL_DEBUG) dbg('[CACHE] Stored YT URL', ytUrl, '→', ucid, 'from CR resolution (in-memory + persistent)')
+                  }
+                  // Persist UC → Target mapping
+                  channelCache.putUC(ucid, t).catch(err => {
+                    if (WOL_DEBUG) dbg('[CACHE] Error persisting UC:', err)
+                  })
+                }
               } catch {}
               if (t) {
                 chUrl = getOdyseeUrlByTarget(t)
@@ -2580,6 +2910,52 @@ import { logger } from '../modules/logger'
             }
           }
         }
+
+        // Check persistent cache first if we have a handle
+        if (ctx.handle) {
+          try {
+            const normalizedHandle = ctx.handle.startsWith('@') ? ctx.handle.slice(1) : ctx.handle
+            const persistedUC = await channelCache.getHandle(normalizedHandle)
+            if (persistedUC && persistedUC.startsWith('UC')) {
+              return persistedUC
+            }
+          } catch {
+            // Silently fail
+          }
+        }
+
+        // AGGRESSIVE DOM EXTRACTION: Look for UC in ALL data attributes in the renderer
+        try {
+          const allElements = Array.from(vr.querySelectorAll('*'))
+          for (const el of allElements) {
+            for (const attr of Array.from(el.attributes)) {
+              if (!attr.name.startsWith('data-')) continue
+              try {
+                const data = JSON.parse(attr.value)
+                // Recursively search for browseId in the JSON
+                const findBrowseId = (obj: any): string | null => {
+                  if (!obj || typeof obj !== 'object') return null
+                  if (obj.browseId && typeof obj.browseId === 'string' && obj.browseId.startsWith('UC')) {
+                    return obj.browseId
+                  }
+                  if (obj.channelId && typeof obj.channelId === 'string' && obj.channelId.startsWith('UC')) {
+                    return obj.channelId
+                  }
+                  for (const key in obj) {
+                    const result = findBrowseId(obj[key])
+                    if (result) return result
+                  }
+                  return null
+                }
+                const bid = findBrowseId(data)
+                if (bid) {
+                  return bid
+                }
+              } catch {}
+            }
+          }
+        } catch {}
+
         // DOM hint: serialized endpoints may contain browseId
         try {
           const epEl = vr.querySelector('[data-serialized-endpoint]') as HTMLElement | null
@@ -2593,6 +2969,13 @@ import { logger } from '../modules/logger'
           // Newer attributes
           const ucFromAttrs = extractUCFromAttrs(vr)
           if (ucFromAttrs) return ucFromAttrs
+
+          // CRITICAL: NEVER use fetch on search results pages - it returns personalized/wrong data
+          if (location.pathname === '/results' || location.pathname.startsWith('/results')) {
+            if (WOL_DEBUG) dbg('[RESULTS][VR] Skipping fetch on search results page for handle:', ctx.handle)
+            return null
+          }
+
           // Fallback: fetch mapped handle page to discover UC when available
           if (ctx.handle) {
             try {
@@ -2784,6 +3167,41 @@ import { logger } from '../modules/logger'
             dbg('[RESULTS][VR] skipping buttons nudge (too soon,', now - lastChipsToButtonsNudge, 'ms ago)')
           }
         } catch {}
+      }
+
+      // IMPORTANT: Populate persistent cache with verified UC-handle mappings from results page
+      // These are ACCURATE because they come from the actual DOM, not from fetch
+      try {
+        const verifiedMappings = new Map<string, string>()
+
+        // Collect all verified UC-handle pairs from the items
+        for (const it of items) {
+          if (it.ucid && it.handle && it.ucid.startsWith('UC')) {
+            const normalizedHandle = it.handle.startsWith('@') ? it.handle.slice(1) : it.handle
+            // Only add if we successfully resolved this UC (meaning it's a real channel)
+            if (ucResolvePageCache.has(it.ucid) || resolved[it.ucid]) {
+              verifiedMappings.set(normalizedHandle, it.ucid)
+            }
+          }
+        }
+
+        // Persist these verified mappings
+        if (verifiedMappings.size > 0) {
+          for (const [handle, ucid] of verifiedMappings.entries()) {
+            // Store in persistent cache asynchronously
+            (async () => {
+              try {
+                await channelCache.putHandle(handle, ucid)
+                await channelCache.putYtUrl(`/@${handle}`, ucid)
+                await channelCache.putYtUrl(`/channel/${ucid}`, ucid)
+              } catch {
+                // Silently fail - cache population is best-effort
+              }
+            })()
+          }
+        }
+      } catch {
+        // Silently fail
       }
 
       // If none of the channels resolved, schedule controlled retries with exponential backoff
@@ -3164,8 +3582,29 @@ import { logger } from '../modules/logger'
       logger.log('✅ Global mutation observer enabled')
     } else {
       logger.log('⚠️ Skipping global mutation observer on channel page to prevent lockups')
-      // On channel pages, rely on scroll/intersection observer instead
-      scheduleEnhanceListings(1000) // Schedule periodic enhancement
+      // On channel pages, use scroll-based re-enhancement to catch newly loaded videos
+      scheduleEnhanceListings(1000) // Initial enhancement
+      scheduleEnhanceListings(2500) // Retry for slow-loading initial videos
+
+      // Clean up old scroll handler if exists
+      if (wolChannelScrollHandler) {
+        window.removeEventListener('scroll', wolChannelScrollHandler)
+        wolChannelScrollHandler = null
+      }
+
+      // Set up scroll listener to re-enhance when user scrolls (debounced)
+      let scrollTimer: number | null = null
+      wolChannelScrollHandler = () => {
+        if (scrollTimer !== null) clearTimeout(scrollTimer)
+        scrollTimer = window.setTimeout(() => {
+          if (location.pathname.includes('/@') || location.pathname.includes('/channel/') ||
+              location.pathname.includes('/c/') || location.pathname.includes('/user/')) {
+            scheduleEnhanceListings(300)
+          }
+        }, 500)
+      }
+      window.addEventListener('scroll', wolChannelScrollHandler, { passive: true })
+      logger.log('✅ Scroll-based enhancement enabled for channel page')
     }
 
     // CRITICAL FIX: Poll for SPA navigation changes, but DON'T duplicate cleanup
@@ -3758,6 +4197,77 @@ import { logger } from '../modules/logger'
     // Detect if we're on a channel page (which can have many videos)
     const isChannelPage = location.pathname.includes('/@') || location.pathname.includes('/channel/') ||
                           location.pathname.includes('/c/') || location.pathname.includes('/user/')
+
+    // When on a channel page, populate persistent cache with the correct UC mapping
+    if (isChannelPage) {
+      try {
+        let channelHandle: string | null = null
+        let channelUC: string | null = null
+
+        // Extract handle from URL
+        const handleMatch = location.pathname.match(/\/@([^\/]+)/)
+        if (handleMatch) {
+          channelHandle = handleMatch[1]
+        }
+
+        // Extract UC from URL
+        const ucMatch = location.pathname.match(/\/channel\/(UC[^\/]+)/)
+        if (ucMatch) {
+          channelUC = ucMatch[1]
+        }
+
+        // Try to get UC from the page if we only have handle
+        if (channelHandle && !channelUC) {
+          // Look for channel ID in meta tags or page data
+          const metaChannelId = document.querySelector('meta[itemprop="channelId"]')?.getAttribute('content') ||
+                              document.querySelector('meta[property="og:url"]')?.getAttribute('content')?.match(/\/channel\/(UC[^\/]+)/)?.[1]
+          if (metaChannelId && metaChannelId.startsWith('UC')) {
+            channelUC = metaChannelId
+          }
+
+          // Also try ytInitialData
+          if (!channelUC) {
+            const initialData = (window as any).ytInitialData || (window as any).ytcfg?.data_?.INITIAL_DATA
+            if (initialData?.header?.c4TabbedHeaderRenderer?.channelId) {
+              channelUC = initialData.header.c4TabbedHeaderRenderer.channelId
+            } else if (initialData?.metadata?.channelMetadataRenderer?.externalId) {
+              channelUC = initialData.metadata.channelMetadataRenderer.externalId
+            }
+          }
+        }
+
+        // If we have both handle and UC, update caches
+        if (channelHandle && channelUC && channelUC.startsWith('UC')) {
+          // Update in-memory caches
+          const normalizedHandle = channelHandle.startsWith('@') ? channelHandle.slice(1) : channelHandle
+
+          // Store in persistent cache for future use - wrap in async function
+          (async () => {
+            try {
+              await channelCache.putHandle(normalizedHandle, channelUC)
+              await channelCache.putYtUrl(`/@${normalizedHandle}`, channelUC)
+              await channelCache.putYtUrl(`/channel/${channelUC}`, channelUC)
+
+              // Also update in-memory caches for immediate use
+              const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
+              const srcs = [{ platform: srcPlatform, id: channelUC, type: 'channel' as const, url: new URL(location.href), time: null }]
+              const resolved = await getTargetsBySources(...srcs)
+              const target = resolved[channelUC] || null
+              if (target) {
+                ucResolvePageCache.set(channelUC, target)
+                handleResolvePageCache.set(normalizedHandle, target)
+                ytUrlResolvePageCache.set(`/@${normalizedHandle}`, target)
+                ytUrlResolvePageCache.set(`/channel/${channelUC}`, target)
+              }
+            } catch {
+              // Silently fail - cache population is best-effort
+            }
+          })()
+        }
+      } catch {
+        // Silently fail - cache extraction is best-effort
+      }
+    }
 
     // CRITICAL: On channel pages, process in smaller batches to prevent freezing
     const batchSize = isChannelPage ? 2 : 10
@@ -5154,12 +5664,24 @@ import { logger } from '../modules/logger'
             const target = resolved[src.id] || null
             if (src.type === 'channel' && src.id.startsWith('UC')) {
               ucResolvePageCache.set(src.id, target)
-              if (WOL_DEBUG) dbg('[CACHE] Stored UC', src.id, 'in page cache:', !!target)
+              // Persist UC → Target to IndexedDB
+              if (target) {
+                channelCache.putUC(src.id, target).catch(err => {
+                  if (WOL_DEBUG) dbg('[CACHE] Error persisting UC on channel page:', err)
+                })
+              }
+              if (WOL_DEBUG) dbg('[CACHE] Stored UC', src.id, 'in page cache (in-memory + persistent):', !!target)
 
               // Cache by YouTube channel URL (/channel/UC...)
               const channelUrl = `/channel/${src.id}`
               ytUrlResolvePageCache.set(channelUrl, target)
-              if (WOL_DEBUG) dbg('[CACHE] Stored YT URL', channelUrl, 'in page cache:', !!target)
+              // Persist ytUrl → UC to IndexedDB
+              if (target) {
+                channelCache.putYtUrl(channelUrl, src.id).catch(err => {
+                  if (WOL_DEBUG) dbg('[CACHE] Error persisting ytUrl on channel page:', err)
+                })
+              }
+              if (WOL_DEBUG) dbg('[CACHE] Stored YT URL', channelUrl, 'in page cache (in-memory + persistent):', !!target)
 
               // Also try to cache by handle if we can extract it from the page
               try {
@@ -5173,18 +5695,35 @@ import { logger } from '../modules/logger'
                   document.querySelector('#channel-header-container a[href^="/@"]') as HTMLAnchorElement | null
                 )
 
+                if (WOL_DEBUG) dbg('[CACHE] Looking for handle anchor, found:', !!handleAnchor)
                 if (handleAnchor) {
                   const handleHref = handleAnchor.getAttribute('href') || ''
                   const handleText = handleAnchor.textContent?.trim() || ''
                   const handle = (handleHref.startsWith('/@') ? handleHref.substring(2) : '') || (handleText.startsWith('@') ? handleText.substring(1) : '')
-                  if (handle) {
+                  if (WOL_DEBUG) dbg('[CACHE] Extracted handle from href/text:', handle)
+                  if (handle && target) {
                     handleResolvePageCache.set(handle, target)
                     const handleUrl = `/@${handle}`
                     ytUrlResolvePageCache.set(handleUrl, target)
-                    if (WOL_DEBUG) dbg('[CACHE] Stored handle @' + handle, 'and YT URL', handleUrl, 'in page cache:', !!target)
+                    // Persist to IndexedDB
+                    if (WOL_DEBUG) dbg('[CACHE] 💾 WRITING to persistent cache: handle', handle, '→ UC', src.id)
+                    channelCache.putHandle(handle, src.id).catch(err => {
+                      if (WOL_DEBUG) dbg('[CACHE] ❌ Error persisting handle on channel page:', err)
+                    })
+                    if (WOL_DEBUG) dbg('[CACHE] 💾 WRITING to persistent cache: ytUrl', handleUrl, '→ UC', src.id)
+                    channelCache.putYtUrl(handleUrl, src.id).catch(err => {
+                      if (WOL_DEBUG) dbg('[CACHE] ❌ Error persisting handleUrl on channel page:', err)
+                    })
+                    if (WOL_DEBUG) dbg('[CACHE] ✅ Stored handle @' + handle, 'and YT URL', handleUrl, 'in page cache (in-memory + persistent):', !!target)
+                  } else {
+                    if (WOL_DEBUG) dbg('[CACHE] Failed to extract handle from anchor or no target')
                   }
+                } else {
+                  if (WOL_DEBUG) dbg('[CACHE] No handle anchor found on page')
                 }
-              } catch {}
+              } catch (e) {
+                if (WOL_DEBUG) dbg('[CACHE] Error caching handle:', e)
+              }
             }
           }
         } catch (e) {

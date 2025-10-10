@@ -1,6 +1,7 @@
 import { h, render } from 'preact'
 import { useState } from 'preact/hooks'
 import { odyseeUrlCache } from '../../modules/yt/urlCache'
+import { channelCache } from '../../modules/yt/channelCache'
 import { logger } from '../../modules/logger'
 import { setExtensionSetting, targetPlatformSettings, useExtensionSettings } from '../../settings'
 
@@ -89,7 +90,7 @@ function WatchOnOdyseePopup(params: {}) {
         </section>
         <section>
           <label>Tools</label>
-          <button type='button' onClick={() => loads(odyseeUrlCache.clearAll())} className={`button active`}>
+          <button type='button' onClick={() => loads(Promise.all([odyseeUrlCache.clearAll(), channelCache.clearAll()]))} className={`button active`}>
             Clear Resolver Cache
           </button>
         </section>
