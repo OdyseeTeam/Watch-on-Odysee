@@ -292,6 +292,9 @@ import { logger } from '../modules/logger'
   let extensionContextInvalidated = false
   // Incrementing generation to invalidate stale overlay work across tab/page changes
   let overlayGeneration = 0
+  let overlayGenerationBumpedAt = Date.now()
+  // Per-generation timing metrics (for debugging latency)
+  const navGenMetrics = new Map<number, { chipsFirstAt?: number, crFirstAt?: number, ucBatchAt?: number }>()
 
   // Track last href for both navigation handler and fallback polling
   let navigationLastHref = window.location.href
@@ -311,7 +314,7 @@ import { logger } from '../modules/logger'
       try {
         const currentUrl = location.href
         navigationLastHref = currentUrl  // Update shared variable
-        logger.log('🔄 Navigation detected:', currentUrl)
+      logger.log('🔄 Navigation detected:', currentUrl)
 
       // CRITICAL FIX: Stop observers immediately to prevent stale work
       if (wolMutationObserver) {
@@ -330,13 +333,68 @@ import { logger } from '../modules/logger'
 
       // Bump generation BEFORE cleanup so cleanup operations can check it
       overlayGeneration++
+      overlayGenerationBumpedAt = Date.now()
       logger.log('⬆️ Bumped generation to', overlayGeneration)
+
+      // Reset per-results caches/maps to avoid stale chips/buttons across channel/search changes
+      try {
+        resolvedLocal.clear()
+      } catch {}
+      try {
+        initialDataMapCache = null
+      } catch {}
+      try {
+        // Reset bounded retry tracking for channel renderers
+        // Recreate the WeakMap to drop previous entries
+        // @ts-ignore - reassignment is intentional for cache reset
+        channelRendererRetryCount = new WeakMap<HTMLElement, number>()
+      } catch {}
+      try {
+        // Clear any remembered overlay anchor preferences across pages
+        overlayAnchorPrefs.clear()
+      } catch {}
+      try {
+        // Clear page-level resolution cache to avoid cross-page leakage
+        lastResolved = {}
+        lastResolveSig = null
+        lastResolveAt = 0
+        lastVideoPageChannelId = null
+        lastShortsChannelId = null
+        // DON'T clear ucResolvePageCache, handleResolvePageCache, and ytUrlResolvePageCache - these are cross-page caches
+        // that help speed up repeated searches. They're keyed by globally-unique UC/handle IDs or YT URLs.
+        // Only trim them if they get too large (memory management)
+        if (ucResolvePageCache.size > 100) {
+          // Keep the 50 most recently accessed entries
+          const entries = Array.from(ucResolvePageCache.entries())
+          ucResolvePageCache.clear()
+          entries.slice(-50).forEach(([k, v]) => ucResolvePageCache.set(k, v))
+          logger.log('🗑️ Trimmed ucResolvePageCache from', entries.length, 'to 50 entries')
+        }
+        if (handleResolvePageCache.size > 100) {
+          const entries = Array.from(handleResolvePageCache.entries())
+          handleResolvePageCache.clear()
+          entries.slice(-50).forEach(([k, v]) => handleResolvePageCache.set(k, v))
+          logger.log('🗑️ Trimmed handleResolvePageCache from', entries.length, 'to 50 entries')
+        }
+        if (ytUrlResolvePageCache.size > 100) {
+          const entries = Array.from(ytUrlResolvePageCache.entries())
+          ytUrlResolvePageCache.clear()
+          entries.slice(-50).forEach(([k, v]) => ytUrlResolvePageCache.set(k, v))
+          logger.log('🗑️ Trimmed ytUrlResolvePageCache from', entries.length, 'to 50 entries')
+        }
+        logger.log('💾 Preserved caches: UC=', ucResolvePageCache.size, 'handles=', handleResolvePageCache.size, 'ytUrls=', ytUrlResolvePageCache.size)
+      } catch {}
+      logger.log('🧽 Cleared results caches (resolvedLocal, initialData mappings, retries)')
 
       // CRITICAL FIX: Don't await cleanup - let it run async to avoid blocking navigation
       // The generation bump will cause any running enhancement to exit early
       triggerCleanupOverlays().catch(e => logger.error('Cleanup overlays failed:', e))
       triggerCleanupResultsChannelButtons().catch(e => logger.error('Cleanup channel buttons failed:', e))
-      triggerCleanupResultsVideoChips({ disconnectOnly: true }).catch(e => logger.error('Cleanup chips failed:', e))
+      // Full cleanup of inline chips on navigation to avoid stale channel links
+      triggerCleanupResultsVideoChips().catch(e => logger.error('Cleanup chips failed:', e))
+
+      // Immediately clear any page-level buttons to avoid showing stale targets during nav
+      try { updateButtons(null) } catch {}
 
       // Clear enhanced flags so anchors can be re-processed on the new page
       document.querySelectorAll('a[data-wol-enhanced="done"]').forEach(el => {
@@ -369,7 +427,8 @@ import { logger } from '../modules/logger'
         logger.log('⚠️ Button overlay disabled, skipping enhancement')
       }
 
-      scheduleRefreshResultsChips(400)
+      // Run chips a bit earlier, then overlays/buttons
+      scheduleRefreshResultsChips(220)
       // Also refresh page-level buttons/redirects once per navigation
       scheduleProcessCurrentPage(100)
       logger.log('📅 Scheduled enhancement tasks')
@@ -1769,18 +1828,133 @@ import { logger } from '../modules/logger'
   // Results page: track channel renderer button + observer to avoid duplicates across toggles
   // Use Map (not WeakMap) so we can iterate and reliably disconnect observers during cleanup
   const channelRendererState = new Map<HTMLElement, { btn: HTMLElement, mo: MutationObserver | null }>()
+  // Retry guard for channel renderer button injection (per-renderer bounded retries)
+  var channelRendererRetryCount = new WeakMap<HTMLElement, number>()
   // Version counter to invalidate old observers for channel renderers (prevents duplicate reinserts)
   let channelRendererButtonVersion = 0
   let channelRendererButtonRunning = false
   // Results page: track per-video renderer compact channel chip + observer
   // Use Map (not WeakMap) for the same reason as above
   const resultsVideoChipState = new Map<HTMLElement, { chip: HTMLElement, mo: MutationObserver | null }>()
+  // Concurrency/throttle for results video chip refresher
+  let resultsVideoChipRunning = false
+  let resultsVideoChipPendingRerun = false
+  let lastResultsChipsSig = ''
+  let lastResultsChipsAt = 0
+  let resultsChipsQuietUntil = 0
+  let resultsChipsBackoffMs = 0
+  let resultsChipsRetryKey: string | null = null
+  // Cross-refresh tracking to prevent ping-pong loops between CR and VR refreshers
+  let lastChipsToButtonsNudge = 0
+  let lastButtonsToChipsNudge = 0
+  const MIN_CROSS_NUDGE_INTERVAL = 2000 // Don't ping-pong more than once every 2 seconds
   // Local resolve cache for listing pages (video/channel -> Target|null)
   const resolvedLocal = new Map<string, Target | null>()
+  // Per-page UC -> Target cache shared between VR chips and CR buttons
+  const ucResolvePageCache = new Map<string, Target | null>()
+  // Per-page @handle (without @) -> Target cache to enable fast chip injection without UC
+  const handleResolvePageCache = new Map<string, Target | null>()
+  // Per-page YouTube channel URL -> Target cache (e.g., "/@veritasium" or "/channel/UCHnyfMqiRRG1u-2MsSQLbXA")
+  const ytUrlResolvePageCache = new Map<string, Target | null>()
   // Persist preferred anchor per video id to keep overlay in the same area across re-renders
   const overlayAnchorPrefs = new Map<string, { anchor: 'top-left' | 'bottom-left', x: number, y: number }>()
   // Channel main page action placement version guard (prevents stale scheduled attempts)
   let channelMainActionVersion = 0
+
+  // Cached mappings from ytInitialData on results pages
+  let initialDataMapCache: {
+    url: string,
+    handleToUC: Map<string, string>,
+    videoToUC: Map<string, string>,
+    collectedAt: number
+  } | null = null
+
+  function getYtInitialData(): any | null {
+    try {
+      const anyWin = (window as any)
+      if (anyWin?.ytInitialData) return anyWin.ytInitialData
+      // Fallback: scrape from script tags
+      const scripts = Array.from(document.querySelectorAll('script'))
+      for (const s of scripts) {
+        const txt = s.textContent || ''
+        const idx = txt.indexOf('ytInitialData')
+        if (idx >= 0) {
+          // Try to locate assignment pattern: ytInitialData = {...};
+          const m = txt.match(/ytInitialData\s*=\s*(\{[\s\S]*?\});/)
+          if (m && m[1]) {
+            try { return JSON.parse(m[1]) } catch {}
+          }
+        }
+      }
+    } catch {}
+    return null
+  }
+
+  function collectMappingsFromInitialData(data: any): { handleToUC: Map<string, string>, videoToUC: Map<string, string> } {
+    const handleToUC = new Map<string, string>()
+    const videoToUC = new Map<string, string>()
+
+    const pushHandle = (h?: string | null, uc?: string | null) => {
+      if (!h || !uc) return
+      const norm = h.startsWith('@') ? h.slice(1) : h
+      if (uc.startsWith('UC') && !handleToUC.has(norm)) handleToUC.set(norm, uc)
+    }
+    const pushVideo = (vid?: string | null, uc?: string | null) => {
+      if (!vid || !uc) return
+      if (uc.startsWith('UC') && !videoToUC.has(vid)) videoToUC.set(vid, uc)
+    }
+
+    const stack: any[] = [data]
+    while (stack.length) {
+      const node = stack.pop()
+      if (!node || typeof node !== 'object') continue
+      try {
+        if (node.videoRenderer) {
+          const vr = node.videoRenderer
+          const vid = vr?.videoId || null
+          const run = (vr?.ownerText?.runs?.[0]) || (vr?.shortBylineText?.runs?.[0]) || (vr?.longBylineText?.runs?.[0]) || null
+          const handleText: string | null = (run?.text && String(run.text).startsWith('@')) ? run.text : null
+          const uc = run?.navigationEndpoint?.browseEndpoint?.browseId || null
+          pushHandle(handleText, uc)
+          pushVideo(vid, uc)
+        }
+        if (node.channelRenderer) {
+          const cr = node.channelRenderer
+          const uc = cr?.channelId || cr?.navigationEndpoint?.browseEndpoint?.browseId || null
+          // canonicalBaseUrl: "/@handle"
+          const cbu = cr?.navigationEndpoint?.browseEndpoint?.canonicalBaseUrl || ''
+          const handleFromCbu = (typeof cbu === 'string' && cbu.startsWith('/@')) ? cbu.slice(1) : null
+          // Some variants store handle under "handleText" / "@handle"
+          const handleText = cr?.handleText || null
+          const titleRun = cr?.title?.runs?.[0]?.text || null
+          const guessHandle = (h?: string | null) => { if (h && h.startsWith('@')) pushHandle(h, uc) }
+          guessHandle(handleFromCbu)
+          guessHandle(handleText)
+          guessHandle(titleRun && String(titleRun).startsWith('@') ? titleRun : null)
+        }
+      } catch {}
+      try {
+        for (const k of Object.keys(node)) {
+          const v = node[k]
+          if (v && typeof v === 'object') stack.push(v)
+        }
+      } catch {}
+    }
+    return { handleToUC, videoToUC }
+  }
+
+  function getInitialDataMappings(force = false) {
+    const href = location.href
+    if (!force && initialDataMapCache && initialDataMapCache.url === href) return initialDataMapCache
+    try {
+      const data = getYtInitialData()
+      if (!data) { initialDataMapCache = { url: href, handleToUC: new Map(), videoToUC: new Map(), collectedAt: Date.now() }; return initialDataMapCache }
+      const maps = collectMappingsFromInitialData(data)
+      initialDataMapCache = { url: href, handleToUC: maps.handleToUC, videoToUC: maps.videoToUC, collectedAt: Date.now() }
+      if (WOL_DEBUG) dbg('[RESULTS][MAP] collected from initialData: handles=', maps.handleToUC.size, 'videos=', maps.videoToUC.size)
+    } catch { initialDataMapCache = { url: href, handleToUC: new Map(), videoToUC: new Map(), collectedAt: Date.now() } }
+    return initialDataMapCache
+  }
 
   // Enhanced cleanup for specific page contexts only
   async function cleanupOverlaysByPageContext() {
@@ -1864,6 +2038,20 @@ import { logger } from '../modules/logger'
       if (location.pathname !== '/results') return
       if (!settings.resultsApplySelections || !settings.buttonChannelSub) return
 
+      // Guard: avoid running with stale ytInitialData immediately after SPA navigation
+      const myGen = overlayGeneration
+      const navDiff = Date.now() - overlayGenerationBumpedAt
+      if (navDiff < 150) {
+        await new Promise(r => setTimeout(r, 150 - navDiff))
+      }
+      if (myGen !== overlayGeneration) return
+
+      // If already running, reschedule once shortly after to pick up newly-resolved UC cache
+      if (channelRendererButtonRunning) {
+        scheduleRefreshChannelButtons(150)
+        return
+      }
+
       if (WOL_DEBUG) dbg('[RESULTS][CR] begin, selections:', settings.resultsApplySelections, 'buttonChannelSub:', settings.buttonChannelSub)
 
       // Prevent concurrent executions
@@ -1880,8 +2068,45 @@ import { logger } from '../modules/logger'
         return
       }
 
+      let injectedCount = 0
+      // Helper: upgrade @handle to UC via lightweight fetch (fallback)
+      async function upgradeHandleToUC_CR(handle: string): Promise<string | null> {
+        try {
+          const h = handle.startsWith('@') ? handle : ('@' + handle)
+          const ytPath = `/${h}`
+
+          // First check if we have this handle's URL cached
+          if (ytUrlResolvePageCache.has(ytPath)) {
+            const target = ytUrlResolvePageCache.get(ytPath)
+            if (target) {
+              // Look for corresponding UC in ucResolvePageCache
+              for (const [uc, cachedTarget] of ucResolvePageCache.entries()) {
+                if (cachedTarget === target && uc.startsWith('UC')) {
+                  if (WOL_DEBUG) dbg('[RESULTS][CR] Upgraded handle to UC from ytUrl cache:', uc)
+                  return uc
+                }
+              }
+            }
+          }
+
+          // Not cached, fetch it
+          const href = `/${encodeURIComponent(h)}`
+          const controller = new AbortController()
+          const tid = setTimeout(() => controller.abort(), 1500)
+          const resp = await fetch(href, { credentials: 'same-origin', signal: controller.signal })
+          clearTimeout(tid)
+          if (resp.ok) {
+            const text = await resp.text()
+            const m = text.match(/\"channelId\"\s*:\s*\"(UC[^\"]+)\"/)
+            if (m && m[1]) return m[1]
+          }
+        } catch {}
+        return null
+      }
+
       for (let i = 0; i < renderers.length; i++) {
         const cr = renderers[i]
+        if (myGen !== overlayGeneration) return
         // CRITICAL FIX: Yield before processing each renderer to prevent freezing
         await new Promise(resolve => setTimeout(resolve, 0))
 
@@ -1910,10 +2135,11 @@ import { logger } from '../modules/logger'
           // Mark pending to prevent concurrent duplicate injections
           cr.setAttribute('data-wol-channel-button-pending','1')
         }
-        // Derive URL: prefer /channel/UC..., else /@handle, else search by name
+        // Derive URL: prefer /channel/UC..., else map /@handle via initialData; no search fallback
         let chUrl: URL | null = null
         let handle: string | null = null
         let ucid: string | null = null
+        let ytUrl: string | null = null
         try {
           // Try multiple selectors to find channel ID
           const chA = cr.querySelector('a[href^="/channel/"]') as HTMLAnchorElement | null
@@ -1923,7 +2149,10 @@ import { logger } from '../modules/logger'
           if (chA) {
             const u = new URL(chA.getAttribute('href') || chA.href, location.origin)
             const id = u.pathname.split('/')[2]
-            if (id && id.startsWith('UC')) ucid = id
+            if (id && id.startsWith('UC')) {
+              ucid = id
+              ytUrl = u.pathname // Store YT URL
+            }
           }
 
           // If no channel ID found, try to extract from data attributes or other sources
@@ -1937,7 +2166,28 @@ import { logger } from '../modules/logger'
 
           // Extract handle if still no channel ID
           if (!ucid && hA) {
-            try { const u = new URL(hA.getAttribute('href') || hA.href, location.origin); handle = u.pathname.substring(1) } catch {}
+            try {
+              const u = new URL(hA.getAttribute('href') || hA.href, location.origin)
+              handle = u.pathname.substring(1)
+              ytUrl = u.pathname // Store YT URL
+            } catch {}
+          }
+          // If no explicit /@ anchor, attempt to read handle text anywhere in the renderer
+          if (!ucid && !handle) {
+            try {
+              const txt = cr.textContent || ''
+              const m = txt.match(/@[A-Za-z0-9_\.\-]+/)
+              if (m) handle = m[0]
+            } catch {}
+          }
+          // Map handle -> UC via initialData if UC still missing
+          if (!ucid && handle) {
+            try {
+              const maps = getInitialDataMappings()
+              const norm = handle.startsWith('@') ? handle.slice(1) : handle
+              const mapped = maps.handleToUC.get(norm)
+              if (mapped && mapped.startsWith('UC')) ucid = mapped
+            } catch {}
           }
           // Deep scan: endpoint-like attributes on the renderer
           if (!ucid) {
@@ -1963,19 +2213,76 @@ import { logger } from '../modules/logger'
             try { const m = (cr.textContent || '').match(/UC[a-zA-Z0-9_-]{22}/); if (m) ucid = m[0] } catch {}
           }
         } catch {}
+        // If UC not found yet and we have a handle, try initialData mapping
+        if (!ucid && handle) {
+          try {
+            const maps = getInitialDataMappings()
+            const norm = handle.startsWith('@') ? handle.slice(1) : handle
+            if (maps.handleToUC.has(norm)) ucid = maps.handleToUC.get(norm) || null
+          } catch {}
+        }
+        // As last resort, upgrade handle to UC via fetch (guarded)
+        if (!ucid && handle) {
+          ucid = await upgradeHandleToUC_CR(handle)
+          if (myGen !== overlayGeneration) return
+        }
+
         if (ucid) {
+          if (myGen !== overlayGeneration) return
           if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'ucid:', ucid, 'handle:', handle || '-')
           try {
-            const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
-            const res = await getTargetsBySources({ platform: srcPlatform, id: ucid, type: 'channel', url: new URL(location.href), time: null })
-            // Yield after API call to prevent blocking
-            await new Promise(resolve => setTimeout(resolve, 0))
-            const t = res[ucid] || null
-            if (t) {
-              chUrl = getOdyseeUrlByTarget(t)
-              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'resolved ->', chUrl.href)
-            } else {
-              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'resolver returned null')
+            // First try page cache to avoid duplicate resolution
+            if (ucResolvePageCache.has(ucid)) {
+              const t = ucResolvePageCache.get(ucid)
+              if (t) {
+                chUrl = getOdyseeUrlByTarget(t)
+                if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'resolved from cache ->', chUrl.href)
+                // Populate all caches for quick VR injection
+                try {
+                  if (handle) handleResolvePageCache.set(handle.startsWith('@') ? handle.slice(1) : handle, t)
+                  if (ytUrl && !ytUrlResolvePageCache.has(ytUrl)) ytUrlResolvePageCache.set(ytUrl, t)
+                } catch {}
+                // Nudge chips refresher to leverage newly-known mapping (with anti-ping-pong guard)
+                const now = Date.now()
+                if (now - lastButtonsToChipsNudge > MIN_CROSS_NUDGE_INTERVAL) {
+                  lastButtonsToChipsNudge = now
+                  scheduleRefreshResultsChips(50)
+                  if (WOL_DEBUG) dbg('[RESULTS][CR] nudging chips refresher (cache hit)')
+                } else if (WOL_DEBUG) {
+                  dbg('[RESULTS][CR] skipping chips nudge (too soon,', now - lastButtonsToChipsNudge, 'ms ago)')
+                }
+              }
+            }
+            // If not cached, resolve once now
+            if (!chUrl) {
+              const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
+              const res = await getTargetsBySources({ platform: srcPlatform, id: ucid, type: 'channel', url: new URL(location.href), time: null })
+              // Yield after API call to prevent blocking
+              await new Promise(resolve => setTimeout(resolve, 0))
+              if (myGen !== overlayGeneration) return
+              const t = res[ucid] || null
+              // Populate all page caches for future CR/VR usage
+              try {
+                ucResolvePageCache.set(ucid, t ?? null)
+                if (t && handle) handleResolvePageCache.set(handle.startsWith('@') ? handle.slice(1) : handle, t)
+                if (t && ytUrl) ytUrlResolvePageCache.set(ytUrl, t)
+                if (WOL_DEBUG && ytUrl) dbg('[CACHE] Stored YT URL', ytUrl, 'from CR resolution')
+              } catch {}
+              if (t) {
+                chUrl = getOdyseeUrlByTarget(t)
+                if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'resolved ->', chUrl.href)
+                // Nudge chips refresher now that mapping is known (with anti-ping-pong guard)
+                const now = Date.now()
+                if (now - lastButtonsToChipsNudge > MIN_CROSS_NUDGE_INTERVAL) {
+                  lastButtonsToChipsNudge = now
+                  scheduleRefreshResultsChips(50)
+                  if (WOL_DEBUG) dbg('[RESULTS][CR] nudging chips refresher (new resolution)')
+                } else if (WOL_DEBUG) {
+                  dbg('[RESULTS][CR] skipping chips nudge (too soon,', now - lastButtonsToChipsNudge, 'ms ago)')
+                }
+              } else {
+                if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'resolver returned null')
+              }
             }
           } catch {}
         }
@@ -1986,6 +2293,19 @@ import { logger } from '../modules/logger'
           try { cr.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove()) } catch {}
           try { const st = channelRendererState.get(cr); st?.mo?.disconnect(); channelRendererState.delete(cr) } catch {}
           cr.removeAttribute('data-wol-channel-button')
+          // bounded retry to avoid infinite loop
+          const prev = (channelRendererRetryCount.get(cr) || 0)
+          if (prev < 3) {
+            channelRendererRetryCount.set(cr, prev + 1)
+            if (WOL_DEBUG) dbg('[RESULTS][CR] scheduling bounded retry #', prev + 1)
+            scheduleRefreshChannelButtons(500 + prev * 400)
+          } else {
+            if (WOL_DEBUG) dbg('[RESULTS][CR] giving up on this pass (no chUrl after retries)')
+            try {
+              const since = Date.now() - overlayGenerationBumpedAt
+              logger.log(`[TIMING] CR give-up after retries +${since}ms (gen ${myGen})`)
+            } catch {}
+          }
           continue
         }
 
@@ -2021,8 +2341,8 @@ import { logger } from '../modules/logger'
           link.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
           const icon = document.createElement('img')
           icon.src = platform.button.icon
-          icon.style.height = '14px'
-          icon.style.width = '14px'
+          icon.style.height = '20px'
+          icon.style.width = '20px'
           icon.style.pointerEvents = 'none'
           const text = document.createElement('span')
           text.textContent = 'Channel'
@@ -2032,6 +2352,7 @@ import { logger } from '../modules/logger'
           wrapper.appendChild(link)
         }
         // Update href every pass
+        if (myGen !== overlayGeneration) return
         if (link) link.href = chUrl.href
         if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'href set', chUrl.href)
 
@@ -2043,6 +2364,18 @@ import { logger } from '../modules/logger'
         }
         cr.setAttribute('data-wol-channel-button','1')
         cr.removeAttribute('data-wol-channel-button-pending')
+        injectedCount++
+
+        // Timing: first CR button injection since navigation
+        try {
+          const since = Date.now() - overlayGenerationBumpedAt
+          const m = navGenMetrics.get(myGen) || {}
+          if (!m.crFirstAt) {
+            m.crFirstAt = since
+            navGenMetrics.set(myGen, m)
+            logger.log(`[TIMING] CR button injected +${since}ms (gen ${myGen})`)
+          }
+        } catch {}
 
         // Match Subscribe button sizing for a native look
         try {
@@ -2080,6 +2413,7 @@ import { logger } from '../modules/logger'
         try {
           let mo: MutationObserver | null = null
           const ensure = () => {
+            if (overlayGeneration !== myGen) { try { mo?.disconnect() } catch {}; return }
             // If version changed since this observer was attached, stop and exit
             if (cr.getAttribute('data-wol-channel-btn-ver') !== ver) { try { mo?.disconnect() } catch {}; return }
             if (!settings.resultsApplySelections || !settings.buttonChannelSub) { try { wrapper.remove() } catch {}; return }
@@ -2100,6 +2434,7 @@ import { logger } from '../modules/logger'
           try { channelRendererState.set(cr, { btn: wrapper, mo }) } catch {}
         } catch {}
       }
+      // No global retry loop here; bounded per-renderer retries are scheduled above
     } catch {}
     finally {
       channelRendererButtonRunning = false
@@ -2117,18 +2452,54 @@ import { logger } from '../modules/logger'
         return
       }
 
+      // Prevent concurrent runs; queue a single rerun if invoked while running
+      if (resultsVideoChipRunning) { resultsVideoChipPendingRerun = true; return }
+      resultsVideoChipRunning = true
+
+      // Guard: avoid running with stale ytInitialData immediately after SPA navigation
+      const myGen = overlayGeneration
+      const navDiff = Date.now() - overlayGenerationBumpedAt
+      if (navDiff < 150) {
+        await new Promise(r => setTimeout(r, 150 - navDiff))
+      }
+      if (myGen !== overlayGeneration) { resultsVideoChipRunning = false; return }
+
+      // Ensure initialData mappings are loaded for handle→UC and video→UC lookups
+      const maps = getInitialDataMappings()
+      if (myGen !== overlayGeneration) { resultsVideoChipRunning = false; return }
+
+      // Compute a simple signature of what's on the page and already known
+      try {
+        const now0 = Date.now()
+        if (now0 < resultsChipsQuietUntil) { resultsVideoChipRunning = false; return }
+        const ucids = new Set(items.map(x => x.ucid).filter((x): x is string => !!x))
+        let ucResolved = 0
+        for (const uc of ucids) { const t = ucResolvePageCache.get(uc); if (t) ucResolved++ }
+        let handleMatches = 0
+        for (const it of items) { const h = it.handle ? (it.handle.startsWith('@') ? it.handle.slice(1) : it.handle) : null; if (h && handleResolvePageCache.has(h)) handleMatches++ }
+        const sig = `${location.href}|${ucids.size}|${ucResolved}|${handleMatches}`
+        const now = Date.now()
+        if (lastResultsChipsSig === sig && (now - lastResultsChipsAt) < 1200) {
+          resultsVideoChipRunning = false
+          return
+        }
+        lastResultsChipsSig = sig
+      } catch {}
+
       // Collect channel anchors from video result renderers
       const vrs = Array.from(document.querySelectorAll('ytd-video-renderer')) as HTMLElement[]
       if (WOL_DEBUG) dbg('[RESULTS][VR] video renderers:', vrs.length)
-      type VRCtx = { vr: HTMLElement, nameAnchor: HTMLAnchorElement | null, handle: string | null, ucid: string | null }
+      type VRCtx = { vr: HTMLElement, nameAnchor: HTMLAnchorElement | null, handle: string | null, ucid: string | null, ytUrl: string | null }
       const items: VRCtx[] = vrs.map(vr => {
         const nameAnchor = vr.querySelector('#channel-info #channel-name a[href], ytd-channel-name#channel-name a[href]') as HTMLAnchorElement | null
         let handle: string | null = null
         let ucid: string | null = null
+        let ytUrl: string | null = null
         if (nameAnchor) {
           try {
             const href = nameAnchor.getAttribute('href') || nameAnchor.href || ''
             const u = new URL(href, location.origin)
+            ytUrl = u.pathname // Store the full YT pathname for cache lookups
             if (u.pathname.startsWith('/channel/')) ucid = u.pathname.split('/')[2] || null
             else if (u.pathname.startsWith('/@')) handle = u.pathname.substring(1)
           } catch {}
@@ -2136,11 +2507,28 @@ import { logger } from '../modules/logger'
         if (!ucid && !handle) {
           const fb = vr.querySelector('a[href^="/channel/"]') as HTMLAnchorElement | null
           if (fb) {
-            try { const u = new URL(fb.getAttribute('href') || fb.href, location.origin); const uc = u.pathname.split('/')[2]; if (uc) ucid = uc } catch {}
+            try {
+              const u = new URL(fb.getAttribute('href') || fb.href, location.origin)
+              const uc = u.pathname.split('/')[2]
+              if (uc) {
+                ucid = uc
+                ytUrl = u.pathname
+              }
+            } catch {}
           }
         }
-        return { vr, nameAnchor, handle, ucid }
+        // Try to derive videoId for mapping lookup
+        let videoId: string | null = null
+        try {
+          const a = vr.querySelector('a[href^="/watch?v="]') as HTMLAnchorElement | null
+          if (a) {
+            const u = new URL(a.getAttribute('href') || a.href, location.origin)
+            videoId = u.searchParams.get('v')
+          }
+        } catch {}
+        return { vr, nameAnchor, handle, ucid, videoId, ytUrl } as any
       })
+      if (myGen !== overlayGeneration) return
 
       // Robust UC extraction helpers
       function extractUCFromAttrs(el: Element | null): string | null {
@@ -2178,6 +2566,20 @@ import { logger } from '../modules/logger'
       // Attempt to upgrade @handles to UC ids when possible (DOM hints only; no network)
       async function upgradeHandleToUC(ctx: VRCtx): Promise<string | null> {
         const vr = ctx.vr
+        // First check if we have this handle's URL cached
+        if (ctx.ytUrl && ytUrlResolvePageCache.has(ctx.ytUrl)) {
+          // We have the target cached; try to find the UC ID
+          const target = ytUrlResolvePageCache.get(ctx.ytUrl)
+          if (target) {
+            // Look for corresponding UC in ucResolvePageCache
+            for (const [uc, cachedTarget] of ucResolvePageCache.entries()) {
+              if (cachedTarget === target && uc.startsWith('UC')) {
+                if (WOL_DEBUG) dbg('[RESULTS][VR] Upgraded handle to UC from ytUrl cache:', uc)
+                return uc
+              }
+            }
+          }
+        }
         // DOM hint: serialized endpoints may contain browseId
         try {
           const epEl = vr.querySelector('[data-serialized-endpoint]') as HTMLElement | null
@@ -2191,48 +2593,286 @@ import { logger } from '../modules/logger'
           // Newer attributes
           const ucFromAttrs = extractUCFromAttrs(vr)
           if (ucFromAttrs) return ucFromAttrs
+          // Fallback: fetch mapped handle page to discover UC when available
+          if (ctx.handle) {
+            try {
+              // Always fetch using the @handle form; non-@ path may 404
+              const h = ctx.handle.startsWith('@') ? ctx.handle : ('@' + ctx.handle)
+              const href = `/${encodeURIComponent(h)}`
+              const controller = new AbortController()
+              const tid = setTimeout(() => controller.abort(), 1500)
+              const resp = await fetch(href, { credentials: 'same-origin', signal: controller.signal })
+              clearTimeout(tid)
+              if (resp.ok) {
+                const text = await resp.text()
+                const m = text.match(/\"channelId\"\s*:\s*\"(UC[^\"]+)\"/)
+                if (m && m[1]) return m[1]
+              }
+            } catch {}
+          }
         } catch {}
         return null
       }
 
-      for (const it of items) {
+      let vrDbgCount = 0
+      for (const it of items as any[]) {
         try {
-          if (!it.ucid && it.handle) it.ucid = await upgradeHandleToUC(it)
+          if (myGen !== overlayGeneration) return
+          if (!it.ucid && it.videoId && maps.videoToUC.has(it.videoId)) it.ucid = maps.videoToUC.get(it.videoId)
+          if (!it.ucid && it.handle) {
+            const norm = it.handle.startsWith('@') ? it.handle.slice(1) : it.handle
+            if (maps.handleToUC.has(norm)) it.ucid = maps.handleToUC.get(norm)
+            else it.ucid = await upgradeHandleToUC(it)
+          }
           if (!it.ucid) it.ucid = extractUCFromAny(it.vr)
-          if (WOL_DEBUG) dbg('[RESULTS][VR] renderer uc/handle:', it.ucid || '-', '/', it.handle || '-')
+          if (WOL_DEBUG) {
+            if (vrDbgCount < 20) dbg('[RESULTS][VR] renderer uc/handle:', it.ucid || '-', '/', it.handle || '-')
+            else if (vrDbgCount === 20) dbg('[RESULTS][VR] ... more renderers omitted')
+            vrDbgCount++
+          }
         } catch {}
       }
 
-      // Resolve unique UC channel ids in one call
-      const uniqueUC = Array.from(new Set(items.map(x => x.ucid).filter((x): x is string => !!x && x.startsWith('UC'))))
-      if (WOL_DEBUG) dbg('[RESULTS][VR] unique UC ids:', uniqueUC.length)
+      // Quick path: inject immediately for items we can resolve from page caches (YT URL/UC/handle)
+      const platform = targetPlatformSettings[settings.targetPlatform]
+      const quickInjected = new Set<HTMLElement>()
+      try {
+        for (const it of items) {
+          if (myGen !== overlayGeneration) break
+          let url: URL | null = null
+          let target: Target | null = null
+
+          // First try YouTube URL cache (most direct - no normalization needed)
+          if (!target && it.ytUrl && ytUrlResolvePageCache.has(it.ytUrl)) {
+            target = ytUrlResolvePageCache.get(it.ytUrl) || null
+            if (target) url = getOdyseeUrlByTarget(target)
+          }
+
+          // Then try UC cache
+          if (!target && it.ucid && ucResolvePageCache.has(it.ucid)) {
+            target = ucResolvePageCache.get(it.ucid) || null
+            if (target) {
+              url = getOdyseeUrlByTarget(target)
+              // Populate ytUrl cache for next time
+              try {
+                if (it.ytUrl && !ytUrlResolvePageCache.has(it.ytUrl)) ytUrlResolvePageCache.set(it.ytUrl, target)
+              } catch {}
+              // Also update handle cache if available
+              try {
+                if (it.handle) {
+                  const normH = it.handle.startsWith('@') ? it.handle.slice(1) : it.handle
+                  if (!handleResolvePageCache.has(normH)) handleResolvePageCache.set(normH, target)
+                }
+              } catch {}
+            }
+          }
+
+          // Finally try handle cache
+          if (!target && it.handle) {
+            const norm = it.handle.startsWith('@') ? it.handle.slice(1) : it.handle
+            if (handleResolvePageCache.has(norm)) {
+              target = handleResolvePageCache.get(norm) || null
+              if (target) {
+                url = getOdyseeUrlByTarget(target)
+                // Populate ytUrl cache for next time
+                try {
+                  if (it.ytUrl && !ytUrlResolvePageCache.has(it.ytUrl)) ytUrlResolvePageCache.set(it.ytUrl, target)
+                } catch {}
+              }
+            }
+          }
+          if (url) {
+            // Minimal injection to show chip quickly; full ensure logic runs later too
+            const vr = it.vr
+            const channelInfo = vr.querySelector('#channel-info') as HTMLElement | null
+            const thumbA = channelInfo?.querySelector('#channel-thumbnail') as HTMLElement | null
+            if (channelInfo) {
+              try { const cs = getComputedStyle(channelInfo); if (cs.display !== 'flex' && cs.display !== 'inline-flex') channelInfo.style.display = 'flex'; channelInfo.style.alignItems = 'center' } catch {}
+              const existing = channelInfo.querySelector('a[data-wol-inline-channel]') as HTMLElement | null
+              const inline = (resultsVideoChipState.get(vr)?.chip as HTMLElement) || existing || document.createElement('a')
+              if (!inline.hasAttribute('data-wol-inline-channel')) inline.setAttribute('data-wol-inline-channel', '1')
+              inline.href = url.href
+              inline.target = '_blank'
+              inline.title = `Open channel on ${platform.button.platformNameText}`
+              inline.style.display = 'inline-flex'
+              inline.style.alignItems = 'center'
+              inline.style.justifyContent = 'center'
+              inline.style.flex = '0 0 auto'
+              inline.style.marginRight = '6px'
+              inline.style.width = '22px'
+              inline.style.height = '22px'
+              inline.style.borderRadius = '11px'
+              inline.style.background = 'transparent'
+              inline.style.overflow = 'hidden'
+              inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(url!, 'user') })
+              let icon = inline.querySelector('img') as HTMLImageElement | null
+              if (!icon) { icon = document.createElement('img'); inline.appendChild(icon) }
+              icon.src = platform.button.icon
+              icon.style.width = '22px'
+              icon.style.height = '22px'
+              icon.style.display = 'block'
+              icon.style.pointerEvents = 'none'
+              if (thumbA && thumbA.parentElement === channelInfo) {
+                if (inline.parentElement !== channelInfo || inline.nextElementSibling !== thumbA) channelInfo.insertBefore(inline, thumbA)
+              } else {
+                if (inline.parentElement !== channelInfo || inline !== channelInfo.firstElementChild) channelInfo.insertBefore(inline, channelInfo.firstChild)
+              }
+              const prev = resultsVideoChipState.get(vr)
+              try { prev?.mo?.disconnect() } catch {}
+              try {
+                const mo = new MutationObserver(() => {
+                  if (overlayGeneration !== myGen) { try { mo.disconnect() } catch {}; return }
+                  if (!settings.resultsApplySelections || !settings.buttonChannelSub) return
+                  const cci = vr.querySelector('#channel-info') as HTMLElement | null
+                  const tta = cci?.querySelector('#channel-thumbnail') as HTMLElement | null
+                  if (!cci) return
+                  if (!inline.isConnected || inline.parentElement !== cci || (tta && inline.nextElementSibling !== tta)) {
+                    if (tta && tta.parentElement === cci) cci.insertBefore(inline, tta)
+                    else cci.insertBefore(inline, cci.firstChild)
+                  }
+                })
+                mo.observe(channelInfo, { childList: true, subtree: false })
+                resultsVideoChipState.set(vr, { chip: inline, mo })
+              } catch {}
+              quickInjected.add(vr)
+            }
+          }
+        }
+      } catch {}
+
+      // Resolve unique UC channel ids in one call (skip already cached ones)
+      const uniqueUC = Array.from(new Set(
+        items
+          .filter(x => !quickInjected.has(x.vr))
+          .map(x => x.ucid)
+          .filter((x): x is string => !!x && x.startsWith('UC') && !ucResolvePageCache.has(x))
+      ))
+      if (WOL_DEBUG) dbg('[RESULTS][VR] unique UC ids to resolve:', uniqueUC.length, 'cached:', items.filter(x => x.ucid && ucResolvePageCache.has(x.ucid)).length)
       let resolved: Record<string, Target | null> = {}
       if (uniqueUC.length > 0) {
         const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
         const srcs = uniqueUC.map(id => ({ platform: srcPlatform, id, type: 'channel' as const, url: new URL(location.href), time: null }))
         resolved = await getTargetsBySources(...srcs)
+        if (myGen !== overlayGeneration) return
+        // Timing: batch UC resolution completed
+        try {
+          const since = Date.now() - overlayGenerationBumpedAt
+          const m = navGenMetrics.get(myGen) || {}
+          if (!m.ucBatchAt) {
+            m.ucBatchAt = since
+            navGenMetrics.set(myGen, m)
+            logger.log(`[TIMING] UC batch resolved +${since}ms (gen ${myGen})`)
+          }
+        } catch {}
+        // Share resolved UC targets with the page-level cache for CR reuse
+        try {
+          uniqueUC.forEach(uc => {
+            const target = resolved[uc] ?? null
+            ucResolvePageCache.set(uc, target)
+            // Also populate ytUrl cache for /channel/UC... URLs
+            const channelUrl = `/channel/${uc}`
+            ytUrlResolvePageCache.set(channelUrl, target)
+          })
+          // Nudge CR to update quickly now that UC targets are known (with anti-ping-pong guard)
+          const now = Date.now()
+          if (now - lastChipsToButtonsNudge > MIN_CROSS_NUDGE_INTERVAL) {
+            lastChipsToButtonsNudge = now
+            scheduleRefreshChannelButtons(50)
+            scheduleRefreshChannelButtons(220)
+            if (WOL_DEBUG) dbg('[RESULTS][VR] nudging channel buttons after UC batch resolve')
+          } else if (WOL_DEBUG) {
+            dbg('[RESULTS][VR] skipping buttons nudge (too soon,', now - lastChipsToButtonsNudge, 'ms ago)')
+          }
+        } catch {}
       }
-      const platform = targetPlatformSettings[settings.targetPlatform]
 
+      // If none of the channels resolved, schedule controlled retries with exponential backoff
+      let gotAny = false
+      try { gotAny = Object.values(resolved).some(Boolean) } catch {}
+      try {
+        const key = `${overlayGeneration}|${location.href}`
+        if (!gotAny && uniqueUC.length > 0) {
+          if (resultsChipsRetryKey !== key) {
+            resultsChipsRetryKey = key
+            resultsChipsBackoffMs = 1000
+          } else {
+            resultsChipsBackoffMs = Math.min(resultsChipsBackoffMs ? resultsChipsBackoffMs * 2 : 1000, 15000)
+          }
+          const delay1 = resultsChipsBackoffMs
+          const delay2 = Math.min(resultsChipsBackoffMs + 1500, 18000)
+          scheduleRefreshResultsChips(delay1)
+          scheduleRefreshResultsChips(delay2)
+        } else {
+          // Progress made; reset backoff
+          resultsChipsBackoffMs = 0
+          resultsChipsRetryKey = null
+        }
+      } catch {}
       // Inject or ensure an inline chip in each renderer
+      let skipDbgCount = 0
       for (const it of items) {
         try {
+          if (quickInjected.has(it.vr)) continue
+          if (myGen !== overlayGeneration) { resultsVideoChipRunning = false; return }
           const vr = it.vr
           const channelInfo = vr.querySelector('#channel-info') as HTMLElement | null
           const thumbA = channelInfo?.querySelector('#channel-thumbnail') as HTMLElement | null
           // If we already manage a chip for this renderer, update and ensure placement
           const managed = resultsVideoChipState.get(vr)
-          // Compute target URL for channel: REQUIRE resolved UC; otherwise do not inject
+          // Compute target URL for channel: check both batch resolution and page cache
           let chUrl: URL | null = null
-          if (it.ucid && resolved[it.ucid]) chUrl = getOdyseeUrlByTarget(resolved[it.ucid]!)
+          if (it.ucid) {
+            // First check if we just resolved it in this batch
+            let t = resolved[it.ucid] || null
+            // If not in batch, check page cache
+            if (!t && ucResolvePageCache.has(it.ucid)) {
+              t = ucResolvePageCache.get(it.ucid) || null
+            }
+            if (t) {
+              chUrl = getOdyseeUrlByTarget(t)
+              // Populate all caches for faster lookups next time
+              try {
+                if (it.handle) {
+                  const normH = it.handle.startsWith('@') ? it.handle.slice(1) : it.handle
+                  if (!handleResolvePageCache.has(normH)) handleResolvePageCache.set(normH, t)
+                }
+                if (it.ytUrl && !ytUrlResolvePageCache.has(it.ytUrl)) ytUrlResolvePageCache.set(it.ytUrl, t)
+              } catch {}
+            }
+          }
+          if (!chUrl && it.handle) {
+            try {
+              const normH = it.handle.startsWith('@') ? it.handle.slice(1) : it.handle
+              const t = handleResolvePageCache.get(normH)
+              if (t) {
+                chUrl = getOdyseeUrlByTarget(t)
+                // Populate ytUrl cache for next time
+                try {
+                  if (it.ytUrl && !ytUrlResolvePageCache.has(it.ytUrl)) ytUrlResolvePageCache.set(it.ytUrl, t)
+                } catch {}
+              }
+            } catch {}
+          }
           if (!chUrl) {
-            if (WOL_DEBUG) dbg('[RESULTS][VR] skip chip (no resolved) for renderer channel uc:', it.ucid)
+            if (WOL_DEBUG && skipDbgCount < 8) { dbg('[RESULTS][VR] skip chip (no resolved) for renderer channel uc:', it.ucid); skipDbgCount++ }
             // Remove any previous chip we might have injected for this renderer
             try { resultsVideoChipState.get(vr)?.chip?.remove() } catch {}
             try { resultsVideoChipState.delete(vr) } catch {}
+            // Also sweep and remove any leftover chips in the renderer (e.g., from previous page)
+            try { vr.querySelectorAll('a[data-wol-inline-channel]').forEach(el => el.remove()) } catch {}
             continue
           } else {
             if (WOL_DEBUG) dbg('[RESULTS][VR] inject chip ->', chUrl.href)
+            // Timing: first chip injection since navigation
+            try {
+              const since = Date.now() - overlayGenerationBumpedAt
+              const m = navGenMetrics.get(myGen) || {}
+              if (!m.chipsFirstAt) {
+                m.chipsFirstAt = since
+                navGenMetrics.set(myGen, m)
+                logger.log(`[TIMING] Chips first injection +${since}ms (gen ${myGen})`)
+              }
+            } catch {}
           }
 
           // Helper to (re)mount the chip once the host nodes exist
@@ -2304,6 +2944,7 @@ import { logger } from '../modules/logger'
             try { prev?.mo?.disconnect() } catch {}
             try {
               const mo = new MutationObserver(() => {
+                if (overlayGeneration !== myGen) { try { mo.disconnect() } catch {}; return }
                 // Keep chip present and before avatar as row churns
                 if (!settings.resultsApplySelections || !settings.buttonChannelSub) return
                 const cci = vr.querySelector('#channel-info') as HTMLElement | null
@@ -2326,6 +2967,7 @@ import { logger } from '../modules/logger'
             try { prev?.mo?.disconnect() } catch {}
             try {
               const mo = new MutationObserver(() => {
+                if (overlayGeneration !== myGen) { try { mo.disconnect() } catch {}; return }
                 if (!settings.resultsApplySelections || !settings.buttonChannelSub) return
                 if (ensureMount()) { try { mo.disconnect() } catch {} }
               })
@@ -2393,6 +3035,22 @@ import { logger } from '../modules/logger'
         } catch {}
       }
     } catch {}
+    finally {
+      lastResultsChipsAt = Date.now()
+      // Quiet window after unchanged/no-progress runs
+      try {
+        if (resultsChipsBackoffMs > 0) {
+          resultsChipsQuietUntil = Date.now() + Math.max(800, Math.min(resultsChipsBackoffMs, 5000))
+        } else {
+          resultsChipsQuietUntil = 0
+        }
+      } catch {}
+      resultsVideoChipRunning = false
+      if (resultsVideoChipPendingRerun && overlayGeneration === overlayGeneration) {
+        resultsVideoChipPendingRerun = false
+        scheduleRefreshResultsChips(120)
+      }
+    }
   }
 
   // Smart overlay management that preserves existing overlays when possible
@@ -3353,8 +4011,8 @@ import { logger } from '../modules/logger'
 
           const icon = document.createElement('img')
           icon.src = platform.button.icon
-          icon.style.height = '14px'
-          icon.style.width = '14px'
+          icon.style.height = '20px'
+          icon.style.width = '20px'
 
           const text = document.createElement('span')
           text.textContent = 'Channel'
@@ -4422,7 +5080,38 @@ import { logger } from '../modules/logger'
             const ownerHref = document.querySelector<HTMLAnchorElement>(selector)?.href
             if (ownerHref) {
               try {
-                const p = new URL(ownerHref, location.origin).pathname.split('/')
+                const u = new URL(ownerHref, location.origin)
+                const ytPath = u.pathname
+
+                // Check if we already have this channel cached by YouTube URL
+                if (ytUrlResolvePageCache.has(ytPath)) {
+                  // We have the target cached; extract UC ID if it's in the URL
+                  const p = ytPath.split('/')
+                  if (p[1] === 'channel' && p[2]?.startsWith('UC')) {
+                    channelId = p[2]
+                    if (WOL_DEBUG) dbg('[VIDEO] Found channel UC from ytUrl cache:', channelId)
+                    break
+                  }
+                  // For handle URLs, we need to upgrade to UC for sourcesToResolve
+                  if (p[1]?.startsWith('@')) {
+                    // Try handle cache first
+                    const handle = p[1].substring(1)
+                    if (handleResolvePageCache.has(handle)) {
+                      // Look for UC in ucResolvePageCache by iterating (since we need the key)
+                      for (const [uc, target] of ucResolvePageCache.entries()) {
+                        if (target && handleResolvePageCache.get(handle) === target && uc.startsWith('UC')) {
+                          channelId = uc
+                          if (WOL_DEBUG) dbg('[VIDEO] Found channel UC from handle cache:', channelId)
+                          break
+                        }
+                      }
+                      if (channelId) break
+                    }
+                  }
+                }
+
+                // If not in cache, extract UC ID the normal way
+                const p = u.pathname.split('/')
                 if (p[1] === 'channel' && p[2]?.startsWith('UC')) { channelId = p[2]; break }
                 if (p[1]?.startsWith('@')) {
                   const html = await (await fetch(ownerHref, { credentials: 'same-origin' })).text()
@@ -4458,6 +5147,49 @@ import { logger } from '../modules/logger'
         lastResolveAt = Date.now()
         logger.log('Resolved results for:', sig, Object.keys(resolved))
         settingsDirty = false
+
+        // Populate cross-page caches so channels are available in future searches
+        try {
+          for (const src of sourcesToResolve) {
+            const target = resolved[src.id] || null
+            if (src.type === 'channel' && src.id.startsWith('UC')) {
+              ucResolvePageCache.set(src.id, target)
+              if (WOL_DEBUG) dbg('[CACHE] Stored UC', src.id, 'in page cache:', !!target)
+
+              // Cache by YouTube channel URL (/channel/UC...)
+              const channelUrl = `/channel/${src.id}`
+              ytUrlResolvePageCache.set(channelUrl, target)
+              if (WOL_DEBUG) dbg('[CACHE] Stored YT URL', channelUrl, 'in page cache:', !!target)
+
+              // Also try to cache by handle if we can extract it from the page
+              try {
+                const handleAnchor = (
+                  document.querySelector('ytd-page-header-renderer a[href^="/@"]') as HTMLAnchorElement | null
+                ) || (
+                  document.querySelector('yt-page-header-view-model a[href^="/@"]') as HTMLAnchorElement | null
+                ) || (
+                  document.querySelector('#channel-header a[href^="/@"]') as HTMLAnchorElement | null
+                ) || (
+                  document.querySelector('#channel-header-container a[href^="/@"]') as HTMLAnchorElement | null
+                )
+
+                if (handleAnchor) {
+                  const handleHref = handleAnchor.getAttribute('href') || ''
+                  const handleText = handleAnchor.textContent?.trim() || ''
+                  const handle = (handleHref.startsWith('/@') ? handleHref.substring(2) : '') || (handleText.startsWith('@') ? handleText.substring(1) : '')
+                  if (handle) {
+                    handleResolvePageCache.set(handle, target)
+                    const handleUrl = `/@${handle}`
+                    ytUrlResolvePageCache.set(handleUrl, target)
+                    if (WOL_DEBUG) dbg('[CACHE] Stored handle @' + handle, 'and YT URL', handleUrl, 'in page cache:', !!target)
+                  }
+                }
+              } catch {}
+            }
+          }
+        } catch (e) {
+          if (WOL_DEBUG) dbg('[CACHE] Error populating page cache:', e)
+        }
       } else {
         dbg(`[CHANNEL-DEBUG] Using cached resolution for:`, sig)
         resolved = lastResolved
