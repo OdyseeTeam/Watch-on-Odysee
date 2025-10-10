@@ -332,17 +332,18 @@ import { logger } from '../modules/logger'
       overlayGeneration++
       logger.log('⬆️ Bumped generation to', overlayGeneration)
 
-      // CRITICAL FIX: Wait for cleanup to complete before proceeding (makes it synchronous)
-      await triggerCleanupOverlays()
-      await triggerCleanupResultsChannelButtons()
-      await triggerCleanupResultsVideoChips({ disconnectOnly: true })
+      // CRITICAL FIX: Don't await cleanup - let it run async to avoid blocking navigation
+      // The generation bump will cause any running enhancement to exit early
+      triggerCleanupOverlays().catch(e => logger.error('Cleanup overlays failed:', e))
+      triggerCleanupResultsChannelButtons().catch(e => logger.error('Cleanup channel buttons failed:', e))
+      triggerCleanupResultsVideoChips({ disconnectOnly: true }).catch(e => logger.error('Cleanup chips failed:', e))
 
       // Clear enhanced flags so anchors can be re-processed on the new page
       document.querySelectorAll('a[data-wol-enhanced="done"]').forEach(el => {
         (el as HTMLElement).removeAttribute('data-wol-enhanced')
       })
 
-      logger.log('🧹 Cleanup complete')
+      logger.log('🧹 Cleanup triggered (async)')
 
       resetRelatedBatch()
       lastEnhanceTime = 0; lastEnhanceUrl = ''
@@ -680,7 +681,8 @@ import { logger } from '../modules/logger'
   }
 
   // Generic: sync an arbitrary container (and its anchors) to match a reference element's height
-  function syncContainerHeightToReference(container: HTMLElement, refEl: HTMLElement | null) {
+  // Optional min allows shrinking below DEFAULT_PILL_HEIGHT when needed (e.g., watch title line ~28px)
+  function syncContainerHeightToReference(container: HTMLElement, refEl: HTMLElement | null, min: number = DEFAULT_PILL_HEIGHT) {
     if (!refEl) return
     // Avoid showing a too-small pill: keep container hidden until we apply a non-zero height at least once
     let revealed = false
@@ -697,7 +699,8 @@ import { logger } from '../modules/logger'
     }
     hideIfNeeded()
     const apply = (h: number) => {
-      const use = (!h || h <= 0) ? DEFAULT_PILL_HEIGHT : Math.max(h, DEFAULT_PILL_HEIGHT)
+      const floor = typeof min === 'number' ? min : DEFAULT_PILL_HEIGHT
+      const use = (!h || h <= 0) ? floor : Math.max(h, floor)
       const hpx = `${Math.round(use)}px`
       container.style.height = hpx
       container.style.minHeight = `${DEFAULT_PILL_HEIGHT}px`
@@ -776,11 +779,47 @@ import { logger } from '../modules/logger'
     try {
       const cs = getComputedStyle(el)
       const lh = cs.lineHeight
-      if (lh && lh.endsWith('px')) return Math.max(parseFloat(lh) || 0, DEFAULT_PILL_HEIGHT)
+      if (lh && lh.endsWith('px')) {
+        const v = parseFloat(lh)
+        return Number.isFinite(v) && v > 0 ? Math.round(v) : null
+      }
       const fs = parseFloat(cs.fontSize || '0') || 0
-      if (fs > 0) return Math.max(Math.round(fs * 1.3), DEFAULT_PILL_HEIGHT)
+      if (fs > 0) return Math.round(fs * 1.3)
     } catch {}
-    return DEFAULT_PILL_HEIGHT
+    return null
+  }
+
+  // Ensure the watch-page buttons (Channel/Watch) match the title height precisely
+  function ensureWatchButtonsMatchTitleHeight() {
+    try {
+      const h1 = (document.querySelector('ytd-watch-metadata #title h1') as HTMLElement | null)
+        || (document.querySelector('ytd-watch-metadata h1') as HTMLElement | null)
+      if (!h1) return
+      const apply = () => {
+        try {
+          const lh = getLineHeightPx(h1) || (h1.clientHeight || h1.offsetHeight || DEFAULT_PILL_HEIGHT)
+          const h = Math.max(1, Math.round(lh))
+          // Set group container height and inner anchors heights directly
+          buttonMountPoint.style.height = `${h}px`
+          const anchors = buttonMountPoint.querySelectorAll('a[role="button"], a') as unknown as HTMLElement[]
+          anchors.forEach(a => {
+            a.style.height = `${h}px`
+            a.style.lineHeight = 'normal'
+            a.style.display = 'inline-flex'
+            a.style.alignItems = 'center'
+            a.style.boxSizing = 'border-box'
+          })
+        } catch {}
+      }
+      apply()
+      try {
+        const ro = new ResizeObserver(() => apply())
+        ro.observe(h1)
+        setTimeout(() => { try { ro.disconnect() } catch {} }, 4000)
+      } catch {}
+      // Double-tap after paint in case fonts settle late
+      try { setTimeout(apply, 0); setTimeout(apply, 160) } catch {}
+    } catch {}
   }
 
   // Find the actual Subscribe button element (not just the host) for reliable height
@@ -798,23 +837,23 @@ import { logger } from '../modules/logger'
     return q
   }
 
-  function WatchOnOdyseeButtons({ source, targets, compact }: { source?: Source, targets?: Target[], compact?: boolean }) {
+  function WatchOnOdyseeButtons({ source, targets, compact, fillHeight }: { source?: Source, targets?: Target[], compact?: boolean, fillHeight?: boolean }) {
     if (!source || !targets || targets.length === 0) return null
     return <div style={{ display: 'inline-flex' }}>
       {targets.map((target) => {
     const url = getOdyseeUrlByTarget(target)
         const isChannel = target.type === 'channel'
         return (
-          <div style={{ display: 'flex', height: '100%', alignItems: 'center', alignContent: 'center', minWidth: 'fit-content', marginRight: '6px'}}>
+          <div style={{ display: 'flex', height: '100%', alignItems: fillHeight ? 'stretch' : 'center', alignContent: 'center', minWidth: 'fit-content', marginRight: '6px'}}>
       <a href={`${url.href}`} target='_blank' role='button'
         style={{
-                display: 'flex', alignItems: 'center', gap: compact ? '0' : '6px', borderRadius: '16px', padding: compact ? '0 4px' : '0 12px', height: '100%', minHeight: `${DEFAULT_PILL_HEIGHT}px`,
+                display: 'flex', alignItems: 'center', gap: compact ? '0' : '6px', borderRadius: '16px', padding: compact ? '0 4px' : '0 12px', ...(fillHeight ? {} : { minHeight: '36px' }),
                 // Match YouTube subscribe control sizing
                 boxSizing: 'border-box',
                 lineHeight: 'normal',
                 fontWeight: 500, border: '0', color: 'whitesmoke', fontSize: compact ? '0' : '14px', textDecoration: 'none',
                 backgroundColor: target.platform.theme, backgroundImage: target.platform.theme,
-                minWidth: isChannel ? '100px' : '85px',
+                minWidth: isChannel ? '115px' : '100px',
                 width: 'auto',
           ...target.platform.button.style?.button,
         }}
@@ -1039,14 +1078,15 @@ import { logger } from '../modules/logger'
                 titleMount.style.zIndex = '4'
                 titleHost.appendChild(titleMount)
               }
-              // Match the visual line height of the first title line for vertical alignment
+              // Match the actual h1 height including padding
+              // Prefer the title's visual first-line height and align from the title's own padding/margin
               const lh = getLineHeightPx(h1) || DEFAULT_PILL_HEIGHT
               const h1Styles = getComputedStyle(h1)
               const h1PaddingTop = parseFloat(h1Styles.paddingTop) || 0
               const h1MarginTop = parseFloat(h1Styles.marginTop) || 0
-
-              // Position buttons to align with the baseline of the first line of title text
-              titleMount.style.height = `${Math.max(lh, DEFAULT_PILL_HEIGHT)}px`
+              // Set the strip height to the title line-height so chips align with the first text line (allow < 36px)
+              titleMount.style.height = `${Math.round(lh)}px`
+              // Offset by the padding and margin that sit above the first line
               titleMount.style.top = `${h1PaddingTop + h1MarginTop}px`
 
               // Render buttons
@@ -1054,14 +1094,16 @@ import { logger } from '../modules/logger'
                 titleMount.appendChild(buttonMountPoint)
               }
               buttonMountPoint.style.display = 'inline-flex'
-              buttonMountPoint.style.alignItems = 'center'
+              buttonMountPoint.style.alignItems = 'stretch'
+              buttonMountPoint.style.height = '100%'
               buttonMountPoint.style.marginLeft = '8px'
               buttonMountPoint.style.marginRight = '0'
               ;(buttonMountPoint.style as any).order = '1000'
               buttonMountPoint.style.flex = '0 0 auto'
               buttonMountPoint.setAttribute('data-id', params.source.id)
-              render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
+              render(<WatchOnOdyseeButtons fillHeight targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
               try { lockButtonWidthsIn(buttonMountPoint) } catch {}
+              ensureWatchButtonsMatchTitleHeight()
 
               // Add padding to h1 to prevent text from going behind buttons
               // Wait for buttons to render to get accurate width
@@ -1102,8 +1144,13 @@ import { logger } from '../modules/logger'
             if (!rightWrapper.contains(buttonMountPoint)) rightWrapper.appendChild(buttonMountPoint)
             if (rightWrapper.parentElement !== actionsContainer) actionsContainer.appendChild(rightWrapper)
 
-            // Height sync with Subscribe for visual alignment
-            try { syncHeightToReference(mountBefore as HTMLElement) } catch {}
+            // Height sync: prefer matching the title (H1) height even if we aren't mounted under it
+            try {
+              const h1Ref = (document.querySelector('ytd-watch-metadata #title h1') as HTMLElement | null)
+                || (document.querySelector('ytd-watch-metadata h1') as HTMLElement | null)
+              if (h1Ref) syncContainerHeightToReference(buttonMountPoint, h1Ref, 0)
+              else syncHeightToReference(mountBefore as HTMLElement)
+            } catch {}
             buttonMountPoint.style.display = 'inline-flex'
             buttonMountPoint.style.alignItems = 'center'
             buttonMountPoint.style.alignSelf = 'center'
@@ -1113,18 +1160,22 @@ import { logger } from '../modules/logger'
             buttonMountPoint.style.flex = '0 0 auto'
             ;(buttonMountPoint.style as any).order = '1000'
             buttonMountPoint.setAttribute('data-id', params.source.id)
-            render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
+            render(<WatchOnOdyseeButtons fillHeight targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
             try { lockButtonWidthsIn(buttonMountPoint) } catch {}
+            ensureWatchButtonsMatchTitleHeight()
 
             // Precise vertical alignment: match the visual center of the first action icon
             const alignToRow = () => {
               try {
-                // Prefer the primary actions row in watch metadata
-              const row = document.querySelector('#actions #top-level-buttons-computed') as HTMLElement | null
+                // Prefer the title height for overall group height, even when mounted in actions row
+                const h1Ref = (document.querySelector('ytd-watch-metadata #title h1') as HTMLElement | null)
+                  || (document.querySelector('ytd-watch-metadata h1') as HTMLElement | null)
+                // Also read a reference action button to fine tune baseline alignment
+                const row = document.querySelector('#actions #top-level-buttons-computed') as HTMLElement | null
                 const refBtn = (row?.querySelector('button, a, yt-button-shape button, yt-button-shape a, ytd-toggle-button-renderer button, segmented-like-dislike-button-view-model button, ytd-segmented-like-dislike-button-renderer button') as HTMLElement | null)
                   || (actionsContainer.querySelector('button, a') as HTMLElement | null)
-                if (!refBtn) return
-                const refRect = refBtn.getBoundingClientRect()
+                if (!refBtn && !h1Ref) return
+                const refRect = (h1Ref || refBtn)!.getBoundingClientRect()
                 const ourRect = buttonMountPoint.getBoundingClientRect()
                 if (refRect.height > 0 && ourRect.height > 0) {
                   const h = Math.round(refRect.height)
@@ -1154,7 +1205,12 @@ import { logger } from '../modules/logger'
                 buttonMountPoint.setAttribute('data-id', params.source.id)
                 ;(mountBefore as HTMLElement).insertAdjacentElement('afterend', buttonMountPoint)
               }
-              try { syncHeightToReference(mountBefore as HTMLElement) } catch {}
+              try {
+                const h1Ref = (document.querySelector('ytd-watch-metadata #title h1') as HTMLElement | null)
+                  || (document.querySelector('ytd-watch-metadata h1') as HTMLElement | null)
+                if (h1Ref) syncContainerHeightToReference(buttonMountPoint, h1Ref, 0)
+                else syncHeightToReference(mountBefore as HTMLElement)
+              } catch {}
               buttonMountPoint.style.display = 'inline-flex'
               buttonMountPoint.style.alignItems = 'center'
               buttonMountPoint.style.alignSelf = 'center'
@@ -1163,13 +1219,16 @@ import { logger } from '../modules/logger'
               buttonMountPoint.style.marginTop = '0'
               buttonMountPoint.style.flex = '0 0 auto'
               ;(buttonMountPoint.style as any).order = '1000'
-              render(<WatchOnOdyseeButtons targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
+              render(<WatchOnOdyseeButtons fillHeight targets={params.buttonTargets ?? undefined} source={params.source} />, buttonMountPoint)
               try { lockButtonWidthsIn(buttonMountPoint) } catch {}
+              ensureWatchButtonsMatchTitleHeight()
 
               // Fallback alignment relative to Subscribe element
               const alignToSub = () => {
                 try {
-                  const refRect = (mountBefore as HTMLElement).getBoundingClientRect()
+                  const h1Ref = (document.querySelector('ytd-watch-metadata #title h1') as HTMLElement | null)
+                    || (document.querySelector('ytd-watch-metadata h1') as HTMLElement | null)
+                  const refRect = (h1Ref || (mountBefore as HTMLElement)).getBoundingClientRect()
                   const ourRect = buttonMountPoint.getBoundingClientRect()
                   if (refRect.height > 0 && ourRect.height > 0) {
                     const h = Math.round(refRect.height)
@@ -1708,11 +1767,14 @@ import { logger } from '../modules/logger'
   let hoverMoTimerMap = new WeakMap<HTMLElement, number>()
   let hoverFloatCleanupMap = new WeakMap<HTMLElement, () => void>()
   // Results page: track channel renderer button + observer to avoid duplicates across toggles
-  const channelRendererState = new WeakMap<HTMLElement, { btn: HTMLElement, mo: MutationObserver | null }>()
+  // Use Map (not WeakMap) so we can iterate and reliably disconnect observers during cleanup
+  const channelRendererState = new Map<HTMLElement, { btn: HTMLElement, mo: MutationObserver | null }>()
   // Version counter to invalidate old observers for channel renderers (prevents duplicate reinserts)
   let channelRendererButtonVersion = 0
+  let channelRendererButtonRunning = false
   // Results page: track per-video renderer compact channel chip + observer
-  const resultsVideoChipState = new WeakMap<HTMLElement, { chip: HTMLElement, mo: MutationObserver | null }>()
+  // Use Map (not WeakMap) for the same reason as above
+  const resultsVideoChipState = new Map<HTMLElement, { chip: HTMLElement, mo: MutationObserver | null }>()
   // Local resolve cache for listing pages (video/channel -> Target|null)
   const resolvedLocal = new Map<string, Target | null>()
   // Persist preferred anchor per video id to keep overlay in the same area across re-renders
@@ -1732,34 +1794,30 @@ import { logger } from '../modules/logger'
   // Cleanup helper for channel buttons on results page to avoid duplicate reinsertion
   async function cleanupResultsChannelButtons(options?: { disconnectOnly?: boolean }) {
     try {
-      // Early return if not on results page to avoid expensive querySelector on channel pages
-      if (location.pathname !== '/results') {
-        // Still disconnect any existing observers
-        for (const [cr, st] of channelRendererState.entries()) {
-          if (st?.mo) try { st.mo.disconnect() } catch {}
-          channelRendererState.delete(cr)
-        }
-        return
-      }
-
-      // Remove all injected channel buttons and disconnect observers when asked
-      const nodes = Array.from(document.querySelectorAll('ytd-channel-renderer')) as HTMLElement[]
-      for (let i = 0; i < nodes.length; i++) {
-        const cr = nodes[i]
-        const st = channelRendererState.get(cr)
-        if (st?.mo) {
-          try { st.mo.disconnect() } catch {}
-        }
+      // Phase 1: disconnect and remove based on tracked state (covers stale nodes across navigations)
+      let idx = 0
+      for (const [cr, st] of channelRendererState.entries()) {
+        try { st?.mo?.disconnect() } catch {}
         if (!options?.disconnectOnly) {
-          try { st?.btn.remove() } catch {}
-          const btns = Array.from(cr.querySelectorAll('[data-wol-results-channel-btn]'))
-          for (const btn of btns) btn.remove()
+          try { st?.btn?.remove() } catch {}
           try { cr.removeAttribute('data-wol-channel-button') } catch {}
         }
-        // Always clear state to avoid stale reinserts
-        try { channelRendererState.delete(cr) } catch {}
-        // Yield every 10 items
-        if ((i + 1) % 10 === 0) await idleYield(30)
+        channelRendererState.delete(cr)
+        if ((++idx) % 10 === 0) await idleYield(30)
+      }
+
+      // Phase 2: sweep DOM (handles any wrappers that were not tracked for any reason)
+      const renderers = Array.from(document.querySelectorAll('ytd-channel-renderer')) as HTMLElement[]
+      for (let i = 0; i < renderers.length; i++) {
+        const cr = renderers[i]
+        if (!options?.disconnectOnly) {
+          try {
+            cr.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove())
+            cr.removeAttribute('data-wol-channel-button')
+            cr.removeAttribute('data-wol-channel-button-pending')
+          } catch {}
+        }
+        if ((i + 1) % 12 === 0) await idleYield(25)
       }
     } catch {}
   }
@@ -1767,28 +1825,24 @@ import { logger } from '../modules/logger'
   // Cleanup helper for inline channel chips in video results to avoid stale observers
   async function cleanupResultsVideoChips(options?: { disconnectOnly?: boolean }) {
     try {
-      // Early return if not on results page to avoid expensive querySelector on channel pages
-      if (location.pathname !== '/results') {
-        // Still disconnect any existing observers
-        for (const [vr, st] of resultsVideoChipState.entries()) {
-          if (st?.mo) try { st.mo.disconnect() } catch {}
-          resultsVideoChipState.delete(vr)
+      // Phase 1: disconnect and clear from tracked state
+      let idx = 0
+      for (const [vr, st] of resultsVideoChipState.entries()) {
+        try { st?.mo?.disconnect() } catch {}
+        if (!options?.disconnectOnly) {
+          try { st?.chip?.remove() } catch {}
         }
-        return
+        resultsVideoChipState.delete(vr)
+        if ((++idx) % 15 === 0) await idleYield(30)
       }
 
+      // Phase 2: sweep DOM for any leftover chips
       const vrs = Array.from(document.querySelectorAll('ytd-video-renderer')) as HTMLElement[]
       for (let i = 0; i < vrs.length; i++) {
         const vr = vrs[i]
-        const st = resultsVideoChipState.get(vr)
-        if (st?.mo) { try { st.mo.disconnect() } catch {} }
         if (!options?.disconnectOnly) {
-          try { st?.chip.remove() } catch {}
-          const chips = Array.from(vr.querySelectorAll('[data-wol-inline-channel]'))
-          for (const chip of chips) chip.remove()
+          try { vr.querySelectorAll('[data-wol-inline-channel]').forEach(el => el.remove()) } catch {}
         }
-        try { resultsVideoChipState.delete(vr) } catch {}
-        // Yield every 15 items
         if ((i + 1) % 15 === 0) await idleYield(30)
       }
     } catch {}
@@ -1810,9 +1864,27 @@ import { logger } from '../modules/logger'
       if (location.pathname !== '/results') return
       if (!settings.resultsApplySelections || !settings.buttonChannelSub) return
 
+      if (WOL_DEBUG) dbg('[RESULTS][CR] begin, selections:', settings.resultsApplySelections, 'buttonChannelSub:', settings.buttonChannelSub)
+
+      // Prevent concurrent executions
+      if (channelRendererButtonRunning) return
+      channelRendererButtonRunning = true
+
       const platform = targetPlatformSettings[settings.targetPlatform]
       const renderers = Array.from(document.querySelectorAll('ytd-channel-renderer')) as HTMLElement[]
-      for (const cr of renderers) {
+      if (WOL_DEBUG) dbg('[RESULTS][CR] renderers:', renderers.length)
+
+      // Early return if no channel renderers to process
+      if (renderers.length === 0) {
+        channelRendererButtonRunning = false
+        return
+      }
+
+      for (let i = 0; i < renderers.length; i++) {
+        const cr = renderers[i]
+        // CRITICAL FIX: Yield before processing each renderer to prevent freezing
+        await new Promise(resolve => setTimeout(resolve, 0))
+
         // Bump version to invalidate any old observers tied to this renderer
         const ver = String(++channelRendererButtonVersion)
         cr.setAttribute('data-wol-channel-btn-ver', ver)
@@ -1867,27 +1939,55 @@ import { logger } from '../modules/logger'
           if (!ucid && hA) {
             try { const u = new URL(hA.getAttribute('href') || hA.href, location.origin); handle = u.pathname.substring(1) } catch {}
           }
+          // Deep scan: endpoint-like attributes on the renderer
+          if (!ucid) {
+            const attrNodes = cr.querySelectorAll('[data-serialized-endpoint],[data-innertube-command],[data-endpoint],[endpoint]')
+            for (const el of Array.from(attrNodes)) {
+              try {
+                const raw = (el as HTMLElement).getAttribute('data-serialized-endpoint')
+                  || (el as HTMLElement).getAttribute('data-innertube-command')
+                  || (el as HTMLElement).getAttribute('data-endpoint')
+                  || (el as HTMLElement).getAttribute('endpoint')
+                if (!raw) continue
+                const data = JSON.parse(raw)
+                const bid = data?.browseEndpoint?.browseId
+                  || data?.commandMetadata?.webCommandMetadata?.browseEndpoint?.browseId
+                  || data?.webCommandMetadata?.browseEndpoint?.browseId
+                  || data?.browseId
+                if (typeof bid === 'string' && bid.startsWith('UC')) { ucid = bid; break }
+              } catch {}
+            }
+          }
+          // Fallback regex in text
+          if (!ucid) {
+            try { const m = (cr.textContent || '').match(/UC[a-zA-Z0-9_-]{22}/); if (m) ucid = m[0] } catch {}
+          }
         } catch {}
         if (ucid) {
+          if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'ucid:', ucid, 'handle:', handle || '-')
           try {
             const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
             const res = await getTargetsBySources({ platform: srcPlatform, id: ucid, type: 'channel', url: new URL(location.href), time: null })
+            // Yield after API call to prevent blocking
+            await new Promise(resolve => setTimeout(resolve, 0))
             const t = res[ucid] || null
-            if (t) chUrl = getOdyseeUrlByTarget(t)
+            if (t) {
+              chUrl = getOdyseeUrlByTarget(t)
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'resolved ->', chUrl.href)
+            } else {
+              if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'resolver returned null')
+            }
           } catch {}
         }
-        if (!chUrl && handle) {
-          // Handle already includes @ symbol if present, normalize it
-          const normalizedHandle = handle.startsWith('@') ? handle.slice(1) : handle
-          const baseUrl = platform.domainPrefix.replace(/\/+$/, '') // Remove trailing slashes
-          try { chUrl = new URL(`${baseUrl}/@${normalizedHandle}`) } catch {}
-        }
+        // On results page, only inject a channel button when resolver returns a unique Odysee URL
         if (!chUrl) {
-          const nameText = (cr.querySelector('#channel-title')?.textContent || cr.textContent || '').trim()
-          const q = encodeURIComponent(nameText)
-          try { chUrl = new URL(`${platform.domainPrefix}/$/search?q=${q}`) } catch {}
+          if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'skip inject (no chUrl)')
+          cr.removeAttribute('data-wol-channel-button-pending')
+          try { cr.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove()) } catch {}
+          try { const st = channelRendererState.get(cr); st?.mo?.disconnect(); channelRendererState.delete(cr) } catch {}
+          cr.removeAttribute('data-wol-channel-button')
+          continue
         }
-        if (!chUrl) { cr.removeAttribute('data-wol-channel-button-pending'); continue }
 
         // Inject compact button next to subscribe row
         const buttonsContainer = (cr.querySelector('#buttons') as HTMLElement | null)
@@ -1933,6 +2033,7 @@ import { logger } from '../modules/logger'
         }
         // Update href every pass
         if (link) link.href = chUrl.href
+        if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'href set', chUrl.href)
 
         if (buttonsContainer) {
           if (subscribeButton && subscribeButton.parentElement === buttonsContainer) buttonsContainer.insertBefore(wrapper, subscribeButton)
@@ -1972,6 +2073,9 @@ import { logger } from '../modules/logger'
           }
         } catch {}
 
+        // Yield after expensive DOM/style calculations
+        await new Promise(resolve => setTimeout(resolve, 0))
+
         // Keep present during renderer churn
         try {
           let mo: MutationObserver | null = null
@@ -1997,6 +2101,9 @@ import { logger } from '../modules/logger'
         } catch {}
       }
     } catch {}
+    finally {
+      channelRendererButtonRunning = false
+    }
   }
 
   // Proactively (re)inject compact channel chips beside each video result on /results
@@ -2012,6 +2119,7 @@ import { logger } from '../modules/logger'
 
       // Collect channel anchors from video result renderers
       const vrs = Array.from(document.querySelectorAll('ytd-video-renderer')) as HTMLElement[]
+      if (WOL_DEBUG) dbg('[RESULTS][VR] video renderers:', vrs.length)
       type VRCtx = { vr: HTMLElement, nameAnchor: HTMLAnchorElement | null, handle: string | null, ucid: string | null }
       const items: VRCtx[] = vrs.map(vr => {
         const nameAnchor = vr.querySelector('#channel-info #channel-name a[href], ytd-channel-name#channel-name a[href]') as HTMLAnchorElement | null
@@ -2034,6 +2142,39 @@ import { logger } from '../modules/logger'
         return { vr, nameAnchor, handle, ucid }
       })
 
+      // Robust UC extraction helpers
+      function extractUCFromAttrs(el: Element | null): string | null {
+        if (!el) return null
+        const attrs = ['data-serialized-endpoint','data-innertube-command','data-endpoint','endpoint'] as const
+        for (const a of attrs) {
+          const raw = (el as HTMLElement).getAttribute(a as any)
+          if (!raw) continue
+          try {
+            const data = JSON.parse(raw)
+            const bid = data?.browseEndpoint?.browseId
+              || data?.commandMetadata?.webCommandMetadata?.browseEndpoint?.browseId
+              || data?.webCommandMetadata?.browseEndpoint?.browseId
+              || data?.browseId
+            if (typeof bid === 'string' && bid.startsWith('UC')) return bid
+          } catch {}
+        }
+        return null
+      }
+      function extractUCFromAny(vr: HTMLElement): string | null {
+        // Check any element in renderer with endpoint-like JSON
+        const candidates = vr.querySelectorAll('[data-serialized-endpoint],[data-innertube-command],[data-endpoint],[endpoint]')
+        for (const el of Array.from(candidates)) {
+          const id = extractUCFromAttrs(el)
+          if (id) return id
+        }
+        // As a last resort, scan text content for UC… pattern (cheap compared to innerHTML)
+        try {
+          const m = (vr.textContent || '').match(/UC[a-zA-Z0-9_-]{22}/)
+          if (m) return m[0]
+        } catch {}
+        return null
+      }
+
       // Attempt to upgrade @handles to UC ids when possible (DOM hints only; no network)
       async function upgradeHandleToUC(ctx: VRCtx): Promise<string | null> {
         const vr = ctx.vr
@@ -2047,18 +2188,24 @@ import { logger } from '../modules/logger'
               if (typeof browseId === 'string' && browseId.startsWith('UC')) return browseId
             } catch {}
           }
+          // Newer attributes
+          const ucFromAttrs = extractUCFromAttrs(vr)
+          if (ucFromAttrs) return ucFromAttrs
         } catch {}
         return null
       }
 
       for (const it of items) {
-        if (!it.ucid && it.handle) {
-          try { it.ucid = await upgradeHandleToUC(it) } catch {}
-        }
+        try {
+          if (!it.ucid && it.handle) it.ucid = await upgradeHandleToUC(it)
+          if (!it.ucid) it.ucid = extractUCFromAny(it.vr)
+          if (WOL_DEBUG) dbg('[RESULTS][VR] renderer uc/handle:', it.ucid || '-', '/', it.handle || '-')
+        } catch {}
       }
 
       // Resolve unique UC channel ids in one call
       const uniqueUC = Array.from(new Set(items.map(x => x.ucid).filter((x): x is string => !!x && x.startsWith('UC'))))
+      if (WOL_DEBUG) dbg('[RESULTS][VR] unique UC ids:', uniqueUC.length)
       let resolved: Record<string, Target | null> = {}
       if (uniqueUC.length > 0) {
         const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
@@ -2075,17 +2222,18 @@ import { logger } from '../modules/logger'
           const thumbA = channelInfo?.querySelector('#channel-thumbnail') as HTMLElement | null
           // If we already manage a chip for this renderer, update and ensure placement
           const managed = resultsVideoChipState.get(vr)
-          // Compute target URL for channel: prefer resolved UC -> handle -> search
+          // Compute target URL for channel: REQUIRE resolved UC; otherwise do not inject
           let chUrl: URL | null = null
           if (it.ucid && resolved[it.ucid]) chUrl = getOdyseeUrlByTarget(resolved[it.ucid]!)
-          if (!chUrl && it.handle) {
-            try { chUrl = new URL(`${platform.domainPrefix}/@${it.handle}`.replace('/@/@','/@')) } catch {}
-          }
           if (!chUrl) {
-            const q = encodeURIComponent(it.nameAnchor?.textContent?.trim() || it.handle || it.ucid || '')
-            if (q) { try { chUrl = new URL(`${platform.domainPrefix}/$/search?q=${q}`) } catch {} }
+            if (WOL_DEBUG) dbg('[RESULTS][VR] skip chip (no resolved) for renderer channel uc:', it.ucid)
+            // Remove any previous chip we might have injected for this renderer
+            try { resultsVideoChipState.get(vr)?.chip?.remove() } catch {}
+            try { resultsVideoChipState.delete(vr) } catch {}
+            continue
+          } else {
+            if (WOL_DEBUG) dbg('[RESULTS][VR] inject chip ->', chUrl.href)
           }
-          if (!chUrl) continue
 
           // Helper to (re)mount the chip once the host nodes exist
           const ensureMount = () => {
@@ -2115,9 +2263,10 @@ import { logger } from '../modules/logger'
             inline.style.justifyContent = 'center'
             inline.style.flex = '0 0 auto'
             inline.style.marginRight = '6px'
-            inline.style.width = '22px'
-            inline.style.height = '22px'
-            inline.style.borderRadius = '11px'
+            inline.style.marginTop = '-2px'
+            inline.style.width = '23px'
+            inline.style.height = '23px'
+            inline.style.borderRadius = '11.5px'
             inline.style.background = 'transparent'
             inline.style.overflow = 'hidden'
             inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
@@ -2703,7 +2852,10 @@ import { logger } from '../modules/logger'
         !anchor.closest('#secondary') &&
         anchor.closest('#above-the-fold, #below-the-fold')
 
-      return !isMainVideo && !isMainVideoInfo
+      // Exclude comments and comment headers entirely on watch pages
+      const isInComments = !!anchor.closest('#comments, ytd-comments, ytd-item-section-renderer#sections, ytd-comment-thread-renderer, ytd-comments-header-renderer')
+
+      return !isMainVideo && !isMainVideoInfo && !isInComments
     })
 
     overlayDbg(`[DEBUG] Found ${allAnchors.length} total anchors, ${filteredAnchors.length} after filtering, ${uniqueAnchors.length} unique anchors`)
@@ -2711,6 +2863,7 @@ import { logger } from '../modules/logger'
 
     const toProcess: { a: HTMLAnchorElement, id: string, type: 'video' | 'channel' }[] = []
     let skippedAlreadyEnhanced = 0
+    const currentWatchVid = (() => { try { const u = new URL(location.href); return (location.pathname === '/watch') ? (u.searchParams.get('v') || null) : null } catch { return null } })()
     for (const a of uniqueAnchors) {
       // Skip anchors we already enhanced to avoid duplicate listeners/overlays
       if ((a as any).dataset && (a as any).dataset.wolEnhanced === 'done') {
@@ -2750,6 +2903,11 @@ import { logger } from '../modules/logger'
           vid = identifier
           type = 'channel'
         }
+      }
+
+      // Skip rendering overlays for the same video as the current watch page
+      if (currentWatchVid && type === 'video' && vid === currentWatchVid) {
+        continue
       }
 
       // Upgrade channel @handle to channelId (UC...) when available in the same renderer
@@ -2939,27 +3097,30 @@ import { logger } from '../modules/logger'
 
     // Process anchors with yielding to prevent blocking
     let processedCount = 0
-    // More aggressive yielding for watch pages with related content
-    const yieldFrequency = location.pathname === '/watch' ? 20 : 50
-    const yieldTimeout = location.pathname === '/watch' ? 50 : 80
+    // Detect if we're on a channel page (which can have many videos)
+    const isChannelPage = location.pathname.includes('/@') || location.pathname.includes('/channel/') ||
+                          location.pathname.includes('/c/') || location.pathname.includes('/user/')
 
-    overlayDbg(`[DEBUG] Starting processing loop for ${normalizedToProcess.length} items`)
+    // CRITICAL: On channel pages, process in smaller batches to prevent freezing
+    const batchSize = isChannelPage ? 2 : 10
+
+    overlayDbg(`[DEBUG] Starting processing loop for ${normalizedToProcess.length} items (channel page: ${isChannelPage}, batch size: ${batchSize})`)
 
     for (const { a, id, type } of normalizedToProcess) {
+      // CRITICAL: Check generation at start of EVERY iteration for fast cancellation
       if (gen !== overlayGeneration) {
         overlayDbg(`[DEBUG] Breaking processing loop - generation changed from ${gen} to ${overlayGeneration}`)
         break
       }
 
-      // Yield control back to the browser periodically to prevent long blocking tasks
+      // Yield control back to the browser after every batch
       processedCount++
-      if (processedCount % 10 === 0) {
-        overlayDbg(`[DEBUG] Processing progress: ${processedCount}/${normalizedToProcess.length} items`)
-      }
-      if (processedCount % yieldFrequency === 0) {
-        await idleYield(yieldTimeout)
-        // Check generation again after yield
+      if (processedCount % batchSize === 0) {
+        overlayDbg(`[DEBUG] Processing progress: ${processedCount}/${normalizedToProcess.length} items (yielding)`)
+        await idleYield(0)
         if (gen !== overlayGeneration) break
+      } else if (processedCount % 10 === 0) {
+        overlayDbg(`[DEBUG] Processing progress: ${processedCount}/${normalizedToProcess.length} items`)
       }
 
       const res = resolvedLocal.get(`${type}:${id}`) ?? null
@@ -3134,8 +3295,7 @@ import { logger } from '../modules/logger'
           const existingState = channelRendererState.get(channelRenderer)
           if (existingState?.btn) {
             try {
-              const link = existingState.btn.querySelector('a') as HTMLAnchorElement | null
-              if (link) link.href = url.href
+              // Do not set href here (URL computed below). Ensure node is attached; sizing updated later.
               if (!existingState.btn.isConnected) {
                 const subBtn = channelRenderer.querySelector('#subscribe-button') as HTMLElement | null
                 const btns = (channelRenderer.querySelector('#buttons') as HTMLElement | null)
@@ -3148,8 +3308,7 @@ import { logger } from '../modules/logger'
                 }
               }
               channelRenderer.setAttribute('data-wol-channel-button', '1')
-              ;(a as any).dataset.wolEnhanced = 'done'
-              continue
+              // Do not continue; href + sizing will be set once chUrl is computed below
             } catch {}
           }
           // Look for potential action containers in various layouts (search results, channel lists)
@@ -3319,10 +3478,23 @@ import { logger } from '../modules/logger'
        // If a pinned overlay for this id is already active anywhere (e.g., during hover), skip
        try {
          const pinnedExisting = document.querySelector(`[data-wol-overlay="${id}"][data-wol-pinned="1"]`)
-         if (pinnedExisting) { (a as any).dataset.wolEnhanced = 'done'; continue }
-       } catch {}
+       if (pinnedExisting) { (a as any).dataset.wolEnhanced = 'done'; continue }
+      } catch {}
 
-       // Find the best host element for the overlay - prioritize the actual thumbnail/video area
+      // Hard de-dupe: if multiple overlays with the same id exist (e.g., from hover/floating races),
+      // keep the one attached to a thumbnail-like container and remove the rest before proceeding.
+      try {
+        const dups = Array.from(document.querySelectorAll(`[data-wol-overlay="${id}"]`)) as HTMLElement[]
+        if (dups.length > 1) {
+          const preferred = dups.find(el => !!(el.closest('ytd-thumbnail, yt-thumbnail-view-model, a#thumbnail, .yt-lockup-view-model-wiz__content-image, .ytThumbnailViewModelImage')))
+            || dups[0]
+          for (const el of dups) {
+            if (el !== preferred) { try { el.remove() } catch {} }
+          }
+        }
+      } catch {}
+
+      // Find the best host element for the overlay - prioritize the actual thumbnail/video area
       const thumb = a.closest('ytd-thumbnail') as HTMLElement | null
       const compactVideo = a.closest('ytd-compact-video-renderer') as HTMLElement | null
       const richItem = a.closest('ytd-rich-item-renderer') as HTMLElement | null
@@ -3384,14 +3556,19 @@ import { logger } from '../modules/logger'
         }
       }
 
-      // 3. For rich items, find the thumbnail area
+      // 3. For rich items (homepage/feed), find the thumbnail area
       if (!host && richItem) {
-        const richThumb = richItem.querySelector('ytd-thumbnail #thumbnail') as HTMLElement
+        // Try multiple selectors for homepage rich items
+        const richThumb = (richItem.querySelector('ytd-thumbnail #thumbnail') as HTMLElement)
+          || (richItem.querySelector('a#thumbnail') as HTMLElement)
+          || (richItem.querySelector('ytd-thumbnail a') as HTMLElement)
+          || (richItem.querySelector('ytd-thumbnail') as HTMLElement)
         if (richThumb) {
           host = richThumb
-        } else {
-          host = richItem.querySelector('ytd-thumbnail') as HTMLElement || richItem
         }
+        // Do NOT fall back to the entire rich item container here; allow the
+        // lockup-based selectors (3.5) to pick the actual image container on
+        // the new homepage markup. Fallback to tile container happens later.
       }
 
       // 3.5. New lockup-based UI (yt-lockup-view-model + yt-thumbnail-view-model)
@@ -3399,10 +3576,18 @@ import { logger } from '../modules/logger'
         const lockupAnchor = (a.matches('.yt-lockup-view-model-wiz__content-image') ? (a as unknown as HTMLElement) : (a.closest('.yt-lockup-view-model-wiz__content-image') as HTMLElement | null))
         const ytThumbVM = (lockupAnchor?.querySelector('yt-thumbnail-view-model') as HTMLElement | null) || (a.closest('yt-thumbnail-view-model') as HTMLElement | null)
         const ytThumbImg = ytThumbVM?.querySelector('.ytThumbnailViewModelImage') as HTMLElement | null
+        // New homepage image host (img.ytCoreImageHost)
+        const ytCoreImg = (lockupAnchor?.querySelector('img.ytCoreImageHost') as HTMLElement | null)
+          || ((a.closest('ytd-rich-item-renderer') as HTMLElement | null)?.querySelector('img.ytCoreImageHost') as HTMLElement | null)
         // Prefer stable anchor container first so overlay persists across inline preview DOM rewrites
         if (lockupAnchor) host = lockupAnchor
         else if (ytThumbVM) host = ytThumbVM
         else if (ytThumbImg) host = ytThumbImg
+        else if (ytCoreImg) {
+          // Prefer an ancestor that represents the clickable thumbnail area
+          const container = (ytCoreImg.closest('a#thumbnail, .yt-lockup-view-model-wiz__content-image, yt-thumbnail-view-model, ytd-thumbnail, .yt-img-shadow, .yt-image') as HTMLElement | null)
+          host = container || (ytCoreImg.parentElement as HTMLElement | null)
+        }
         const lockupVm = a.closest('yt-lockup-view-model') as HTMLElement | null
         const lockupWiz = a.closest('.yt-lockup-view-model-wiz') as HTMLElement | null
         if (!tileContainer) tileContainer = (lockupVm || lockupWiz || lockupAnchor || ytThumbVM || host) as HTMLElement | null
@@ -3896,9 +4081,9 @@ import { logger } from '../modules/logger'
         host.style.position = 'relative'
       }
 
-      // Check if we already have an overlay for this video ID
-      const existingOverlayId = `${id}-${host.offsetLeft}-${host.offsetTop}`
-      const existingOverlay = overlayState.get(existingOverlayId)
+      // Check if we already have an overlay for this video ID (key by video id only)
+      const existingOverlayId = id
+      const existingOverlay = overlayState.get(id)
 
       if (existingOverlay && existingOverlay.element.parentElement === host) {
         // Update the existing overlay's lastSeen timestamp
@@ -3932,9 +4117,31 @@ import { logger } from '../modules/logger'
         // This can happen when YouTube has multiple anchor elements for the same video
         const existingGlobal = document.querySelector(`[data-wol-overlay="${id}"]`) as HTMLElement | null
         if (existingGlobal && existingGlobal !== already) {
-          if (existingGlobal.isConnected && existingGlobal.offsetWidth > 0) {
-            overlayDbg(`[DEBUG] Overlay ${id} already exists globally, skipping duplicate creation`)
-            ; (a as any).dataset.wolEnhanced = 'done'; continue
+          if (existingGlobal.isConnected) {
+            // If a global overlay exists but is attached to a different host, reattach it here
+            try {
+              if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
+              if (existingGlobal.parentElement !== host) {
+                overlayDbg(`[DEBUG] Moving existing global overlay ${id} to correct host`)
+                host.appendChild(existingGlobal)
+              }
+              ; (a as any).dataset.wolEnhanced = 'done'
+              // Also update state to point at the current host
+              const st = overlayState.get(id)
+              if (st) {
+                st.host = host
+                st.element = existingGlobal as HTMLElement
+                st.lastSeen = Date.now()
+                st.generation = gen
+                overlayState.set(id, st)
+              }
+              // Dedupe: if any extra nodes exist with the same id, remove them now
+              try {
+                const also = Array.from(document.querySelectorAll(`[data-wol-overlay="${id}"]`)) as HTMLElement[]
+                for (const el of also) { if (el !== existingGlobal) try { el.remove() } catch {} }
+              } catch {}
+              continue
+            } catch {}
           } else {
             // Existing global overlay is disconnected or invisible, remove it
             overlayDbg(`[DEBUG] Removing disconnected global overlay ${id}`)
@@ -3966,8 +4173,8 @@ import { logger } from '../modules/logger'
       // Store this overlay in our global state, and keep it alive during DOM churn
       let mo: MutationObserver | null = null
       // Skip heavy per-tile observers on search results AND channel pages to prevent CPU spikes and lockups
-      const isChannelPage = location.pathname.includes('/@') || location.pathname.includes('/channel/')
-      if (location.pathname !== '/results' && !isChannelPage) {
+      const skipObserver = isChannelPage || location.pathname === '/results'
+      if (!skipObserver) {
         mo = new MutationObserver(() => {
           // CRITICAL: Check generation first and disconnect immediately if stale
           if (gen !== overlayGeneration) { try { mo?.disconnect() } catch {} ; return }
@@ -4032,7 +4239,7 @@ import { logger } from '../modules/logger'
         } catch {}
       }
 
-      overlayState.set(existingOverlayId, {
+      overlayState.set(id, {
         videoId: id,
         element: mount,
         host: host,
@@ -4100,9 +4307,9 @@ import { logger } from '../modules/logger'
 
       // Retry logic for channel pages: if we found very few videos on initial load,
       // YouTube might still be rendering. Retry a few times with increasing delays.
-      const isChannelPage = location.href.includes('/@') || location.href.includes('/channel/') ||
+      const isChannelPageRetry = location.href.includes('/@') || location.href.includes('/channel/') ||
                             location.href.includes('/c/') || location.href.includes('/user/')
-      if (isChannelPage) {
+      if (isChannelPageRetry) {
         const videoCount = overlayState.size
 
         // Reset attempts if this is a new generation
