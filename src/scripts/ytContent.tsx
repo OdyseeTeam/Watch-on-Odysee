@@ -3027,14 +3027,20 @@ import { channelCache } from '../modules/yt/channelCache'
 
           // First try YouTube URL cache (most direct - no normalization needed)
           if (!target && it.ytUrl && ytUrlResolvePageCache.has(it.ytUrl)) {
-            target = ytUrlResolvePageCache.get(it.ytUrl) || null
-            if (target) url = getOdyseeUrlByTarget(target)
+            const cached = ytUrlResolvePageCache.get(it.ytUrl)
+            // Only use if it's a valid target (not null)
+            if (cached) {
+              target = cached
+              url = getOdyseeUrlByTarget(target)
+            }
           }
 
           // Then try UC cache
           if (!target && it.ucid && ucResolvePageCache.has(it.ucid)) {
-            target = ucResolvePageCache.get(it.ucid) || null
-            if (target) {
+            const cached = ucResolvePageCache.get(it.ucid)
+            // Only use if it's a valid target (not null)
+            if (cached) {
+              target = cached
               url = getOdyseeUrlByTarget(target)
               // Populate ytUrl cache for next time
               try {
@@ -3054,8 +3060,10 @@ import { channelCache } from '../modules/yt/channelCache'
           if (!target && it.handle) {
             const norm = it.handle.startsWith('@') ? it.handle.slice(1) : it.handle
             if (handleResolvePageCache.has(norm)) {
-              target = handleResolvePageCache.get(norm) || null
-              if (target) {
+              const cached = handleResolvePageCache.get(norm)
+              // Only use if it's a valid target (not null)
+              if (cached) {
+                target = cached
                 url = getOdyseeUrlByTarget(target)
                 // Populate ytUrl cache for next time
                 try {
@@ -3065,6 +3073,42 @@ import { channelCache } from '../modules/yt/channelCache'
             }
           }
           if (url) {
+            // Extract video ID from the renderer for debugging
+            const videoLink = it.vr.querySelector('a[href*="/watch?v="], a[href*="/shorts/"]') as HTMLAnchorElement | null
+            let videoId = 'unknown'
+            if (videoLink) {
+              try {
+                const match = videoLink.href.match(/[?&]v=([^&]+)/) || videoLink.href.match(/\/shorts\/([^?&\/]+)/)
+                if (match) videoId = match[1]
+              } catch {}
+            }
+
+            if (WOL_DEBUG) {
+              dbg('[RESULTS][VR] QUICK inject:', {
+                videoId: videoId,
+                url: url.href,
+                ucid: it.ucid,
+                handle: it.handle,
+                ytUrl: it.ytUrl,
+                target: target,
+                cacheSource: !target ? 'none' : (it.ytUrl && ytUrlResolvePageCache.has(it.ytUrl)) ? 'ytUrl' :
+                            (it.ucid && ucResolvePageCache.has(it.ucid)) ? 'uc' : 'handle'
+              })
+            }
+
+            // Debug specific problematic videos
+            if (videoId === '-zDqghyM_H0' || videoId === '_b4uZhW-wYI' || videoId === 'RDZxYZkz20lYA') {
+              logger.log(`[VR CHIP DEBUG] Video ${videoId} getting channel chip:`, {
+                videoId,
+                channelUrl: url.href,
+                ucid: it.ucid,
+                handle: it.handle,
+                ytUrl: it.ytUrl,
+                target,
+                cacheSource: !target ? 'none' : (it.ytUrl && ytUrlResolvePageCache.has(it.ytUrl)) ? 'ytUrl' :
+                            (it.ucid && ucResolvePageCache.has(it.ucid)) ? 'uc' : 'handle'
+              })
+            }
             // Minimal injection to show chip quickly; full ensure logic runs later too
             const vr = it.vr
             const channelInfo = vr.querySelector('#channel-info') as HTMLElement | null
@@ -3239,13 +3283,23 @@ import { channelCache } from '../modules/yt/channelCache'
           const managed = resultsVideoChipState.get(vr)
           // Compute target URL for channel: check both batch resolution and page cache
           let chUrl: URL | null = null
+          let resolveSource: string | null = null  // Track where we got the resolution from
+
           if (it.ucid) {
             // First check if we just resolved it in this batch
             let t = resolved[it.ucid] || null
-            // If not in batch, check page cache
-            if (!t && ucResolvePageCache.has(it.ucid)) {
-              t = ucResolvePageCache.get(it.ucid) || null
+            if (t) {
+              resolveSource = 'batch'
+            } else if (ucResolvePageCache.has(it.ucid)) {
+              // If not in batch, check page cache
+              const cached = ucResolvePageCache.get(it.ucid)
+              // Only use if it's a valid target (not null)
+              if (cached) {
+                t = cached
+                resolveSource = 'ucCache'
+              }
             }
+
             if (t) {
               chUrl = getOdyseeUrlByTarget(t)
               // Populate all caches for faster lookups next time
@@ -3258,21 +3312,34 @@ import { channelCache } from '../modules/yt/channelCache'
               } catch {}
             }
           }
+
           if (!chUrl && it.handle) {
             try {
               const normH = it.handle.startsWith('@') ? it.handle.slice(1) : it.handle
-              const t = handleResolvePageCache.get(normH)
-              if (t) {
-                chUrl = getOdyseeUrlByTarget(t)
-                // Populate ytUrl cache for next time
-                try {
-                  if (it.ytUrl && !ytUrlResolvePageCache.has(it.ytUrl)) ytUrlResolvePageCache.set(it.ytUrl, t)
-                } catch {}
+              if (handleResolvePageCache.has(normH)) {
+                const cached = handleResolvePageCache.get(normH)
+                // Only use if it's a valid target (not null)
+                if (cached) {
+                  chUrl = getOdyseeUrlByTarget(cached)
+                  resolveSource = 'handleCache'
+                  // Populate ytUrl cache for next time
+                  try {
+                    if (it.ytUrl && !ytUrlResolvePageCache.has(it.ytUrl)) ytUrlResolvePageCache.set(it.ytUrl, cached)
+                  } catch {}
+                }
               }
             } catch {}
           }
+
           if (!chUrl) {
-            if (WOL_DEBUG && skipDbgCount < 8) { dbg('[RESULTS][VR] skip chip (no resolved) for renderer channel uc:', it.ucid); skipDbgCount++ }
+            if (WOL_DEBUG && skipDbgCount < 8) {
+              dbg('[RESULTS][VR] skip chip - no resolution for:', {
+                ucid: it.ucid,
+                handle: it.handle,
+                ytUrl: it.ytUrl
+              })
+              skipDbgCount++
+            }
             // Remove any previous chip we might have injected for this renderer
             try { resultsVideoChipState.get(vr)?.chip?.remove() } catch {}
             try { resultsVideoChipState.delete(vr) } catch {}
@@ -3280,7 +3347,42 @@ import { channelCache } from '../modules/yt/channelCache'
             try { vr.querySelectorAll('a[data-wol-inline-channel]').forEach(el => el.remove()) } catch {}
             continue
           } else {
-            if (WOL_DEBUG) dbg('[RESULTS][VR] inject chip ->', chUrl.href)
+            // Extract video ID from the renderer for debugging
+            const videoLink = vr.querySelector('a[href*="/watch?v="], a[href*="/shorts/"]') as HTMLAnchorElement | null
+            let videoId = 'unknown'
+            if (videoLink) {
+              try {
+                const match = videoLink.href.match(/[?&]v=([^&]+)/) || videoLink.href.match(/\/shorts\/([^?&\/]+)/)
+                if (match) videoId = match[1]
+              } catch {}
+            }
+
+            if (WOL_DEBUG) {
+              dbg('[RESULTS][VR] INJECTING chip:', {
+                videoId: videoId,
+                url: chUrl.href,
+                source: resolveSource,
+                ucid: it.ucid,
+                handle: it.handle,
+                ytUrl: it.ytUrl
+              })
+            }
+
+            // Debug specific problematic videos
+            if (videoId === '-zDqghyM_H0' || videoId === '_b4uZhW-wYI' || videoId === 'RDZxYZkz20lYA') {
+              logger.log(`[VR CHIP DEBUG FULL] Video ${videoId} getting channel chip:`, {
+                videoId,
+                channelUrl: chUrl.href,
+                source: resolveSource,
+                ucid: it.ucid,
+                handle: it.handle,
+                ytUrl: it.ytUrl,
+                batchResolved: resolved[it.ucid || ''],
+                ucCacheHas: it.ucid ? ucResolvePageCache.has(it.ucid) : false,
+                ucCacheValue: it.ucid ? ucResolvePageCache.get(it.ucid) : null,
+                generation: myGen
+              })
+            }
             // Timing: first chip injection since navigation
             try {
               const since = Date.now() - overlayGenerationBumpedAt
@@ -4037,6 +4139,15 @@ import { channelCache } from '../modules/yt/channelCache'
         }
         continue
       }
+      if (WOL_DEBUG && (vid === '-zDqghyM_H0' || vid === '_b4uZhW-wYI' || vid === 'RDZxYZkz20lYA')) {
+        logger.log(`[TOPROCESS DEBUG] Found video ${vid}:`, {
+          vid,
+          type,
+          href,
+          pathname: u.pathname,
+          generation: gen
+        })
+      }
       toProcess.push({ a, id: vid, type })
     }
 
@@ -4108,6 +4219,19 @@ import { channelCache } from '../modules/yt/channelCache'
       overlayDbg(`[DEBUG] Unique video IDs:`, Array.from(byId.keys()))
     } else {
       overlayDbg(`[DEBUG] First 10 video IDs:`, Array.from(byId.keys()).slice(0, 10))
+    }
+
+    // OPTIMIZATION: On /results pages, we already know which videos have Odysee targets from resolvedLocal
+    // Filter to only process videos that have targets - no point processing videos that don't exist on Odysee
+    if (location.pathname === '/results') {
+      const beforeFilter = dedupedToProcess.length
+      dedupedToProcess = dedupedToProcess.filter(item => {
+        const key = `${item.type}:${item.id}`
+        return resolvedLocal.has(key) && resolvedLocal.get(key) !== null
+      })
+      if (beforeFilter !== dedupedToProcess.length) {
+        overlayDbg(`[DEBUG] Filtered out ${beforeFilter - dedupedToProcess.length} videos with no Odysee targets`)
+      }
     }
 
     dbg(`Enhancing ${toProcess.length} tiles with Odysee overlays (videos and channels)`)
@@ -4189,6 +4313,15 @@ import { channelCache } from '../modules/yt/channelCache'
       for (const x of toResolveItems) {
         const t = results[x.id] ?? null
         resolvedLocal.set(keyOf(x), t)
+        if (WOL_DEBUG && (x.id === '-zDqghyM_H0' || x.id === '_b4uZhW-wYI' || x.id === 'RDZxYZkz20lYA')) {
+          logger.log(`[RESOLVED DEBUG] Adding to resolvedLocal:`, {
+            id: x.id,
+            type: x.type,
+            key: keyOf(x),
+            target: t,
+            generation: gen
+          })
+        }
       }
     }
 
@@ -4269,6 +4402,31 @@ import { channelCache } from '../modules/yt/channelCache'
       }
     }
 
+    // CRITICAL: Clean up stale overlays for videos that don't have Odysee targets
+    // Do this once before processing to avoid expensive per-video querySelectorAll calls
+    try {
+      const allExistingOverlays = document.querySelectorAll('[data-wol-overlay]')
+      const validVideoIds = new Set<string>()
+      for (const [key, target] of resolvedLocal.entries()) {
+        if (target && key.startsWith('video:')) {
+          validVideoIds.add(key.substring(6)) // Remove 'video:' prefix
+        }
+      }
+      let removedCount = 0
+      for (const overlay of allExistingOverlays) {
+        const videoId = overlay.getAttribute('data-wol-overlay')
+        if (videoId && !validVideoIds.has(videoId)) {
+          try { overlay.remove(); removedCount++ } catch {}
+          try { overlayState.delete(videoId) } catch {}
+        }
+      }
+      if (removedCount > 0) {
+        logger.log(`🗑️ Removed ${removedCount} stale overlay(s) with no Odysee target`)
+      }
+    } catch (e) {
+      logger.error('Error cleaning stale overlays:', e)
+    }
+
     // CRITICAL: On channel pages, process in smaller batches to prevent freezing
     const batchSize = isChannelPage ? 2 : 10
 
@@ -4297,7 +4455,20 @@ import { channelCache } from '../modules/yt/channelCache'
       // For non-results pages we require a resolved target; for results page we may still
       // inject channel chips for video tiles even when the video itself did not resolve.
       let url: URL | null = null
-      if (res) url = getOdyseeUrlByTarget(res)
+      if (res) {
+        url = getOdyseeUrlByTarget(res)
+        if (WOL_DEBUG && (id === '-zDqghyM_H0' || id === '_b4uZhW-wYI' || id === 'RDZxYZkz20lYA')) {
+          logger.log(`[OVERLAY URL DEBUG] Video ${id} resolved to:`, {
+            type,
+            id,
+            res,
+            url: url?.href,
+            resolvedLocalKey: `${type}:${id}`,
+            resolvedLocalHas: resolvedLocal.has(`${type}:${id}`),
+            generation: gen
+          })
+        }
+      }
       if (!res && location.pathname !== '/results') {
         continue
       }
