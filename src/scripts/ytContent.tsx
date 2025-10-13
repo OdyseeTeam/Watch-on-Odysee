@@ -2078,6 +2078,35 @@ import { channelCache } from '../modules/yt/channelCache'
     generation: number,
     observer?: MutationObserver | null
   }>()
+
+  function dedupeOverlaysById(id: string, prefer?: HTMLElement | null) {
+    try {
+      const all = Array.from(document.querySelectorAll(`[data-wol-overlay="${CSS.escape(id)}"]`)) as HTMLElement[]
+      if (all.length <= 1) return
+      // Decide canonical element to keep
+      let keep: HTMLElement | null = prefer || null
+      if (!keep) {
+        // Prefer connected element from overlayState
+        const st = overlayState.get(id)
+        if (st && st.element?.isConnected) keep = st.element
+      }
+      if (!keep) {
+        // Fallback to first connected element
+        keep = all.find(el => el.isConnected) || all[0]
+      }
+      for (const el of all) {
+        if (el === keep) continue
+        try { el.remove() } catch {}
+      }
+      // Sync overlayState to kept element
+      const st = overlayState.get(id)
+      if (st && keep) {
+        st.element = keep
+        st.lastSeen = Date.now()
+        overlayState.set(id, st)
+      }
+    } catch {}
+  }
   // Hover-scoped observers (used outside results only)
   let hoverMoMap = new WeakMap<HTMLElement, MutationObserver>()
   let hoverMoTimerMap = new WeakMap<HTMLElement, number>()
@@ -4702,6 +4731,13 @@ import { channelCache } from '../modules/yt/channelCache'
         if (gen !== overlayGeneration) break
       }
 
+      // EARLY GLOBAL DEDUPE: If an overlay for this id already exists anywhere (host or body-pinned),
+      // do not attempt to create another from this anchor.
+      try {
+        const anyExisting = document.querySelector(`[data-wol-overlay="${id}"]`) as HTMLElement | null
+        if (anyExisting) { (a as any).dataset.wolEnhanced = 'done'; continue }
+      } catch {}
+
       const res = resolvedLocal.get(`${type}:${id}`) ?? null
       // Results page: do not hide or remove result tiles. Settings only control overlay/button UI.
       // Any attributes previously used to hide are cleared elsewhere when toggles change.
@@ -5061,30 +5097,11 @@ import { channelCache } from '../modules/yt/channelCache'
         // It has been removed to reduce CPU overhead on large result sets.
       }
 
-       // Only create overlays if buttonOverlay setting is enabled
-       if (!settings.buttonOverlay) {
-         ; (a as any).dataset.wolEnhanced = 'done'
-         continue
-       }
-
-       // If a pinned overlay for this id is already active anywhere (e.g., during hover), skip
-       try {
-         const pinnedExisting = document.querySelector(`[data-wol-overlay="${id}"][data-wol-pinned="1"]`)
-       if (pinnedExisting) { (a as any).dataset.wolEnhanced = 'done'; continue }
-      } catch {}
-
-      // Hard de-dupe: if multiple overlays with the same id exist (e.g., from hover/floating races),
-      // keep the one attached to a thumbnail-like container and remove the rest before proceeding.
-      try {
-        const dups = Array.from(document.querySelectorAll(`[data-wol-overlay="${id}"]`)) as HTMLElement[]
-        if (dups.length > 1) {
-          const preferred = dups.find(el => !!(el.closest('ytd-thumbnail, yt-thumbnail-view-model, a#thumbnail, .yt-lockup-view-model-wiz__content-image, .ytThumbnailViewModelImage')))
-            || dups[0]
-          for (const el of dups) {
-            if (el !== preferred) { try { el.remove() } catch {} }
-          }
-        }
-      } catch {}
+      // Only create overlays if buttonOverlay setting is enabled
+      if (!settings.buttonOverlay) {
+        ; (a as any).dataset.wolEnhanced = 'done'
+        continue
+      }
 
       // Find the best host element for the overlay - prioritize the actual thumbnail/video area
       const thumb = a.closest('ytd-thumbnail') as HTMLElement | null
@@ -5555,6 +5572,7 @@ import { channelCache } from '../modules/yt/channelCache'
         if (wolPinned) return
         wolPinned = true
         try {
+          try { dedupeOverlaysById(id, mount) } catch {}
           // Cancel any in-flight floating logic/timers/observers for this mount
           try { const t = hoverMoTimerMap.get(mount); if (t) { clearTimeout(t as any) } } catch {}
           try { hoverMoTimerMap.delete(mount) } catch {}
@@ -5615,6 +5633,7 @@ import { channelCache } from '../modules/yt/channelCache'
             mount.style.top = ''
             mount.style.left = '6px'
           }
+          try { dedupeOverlaysById(id, mount) } catch {}
           mount.removeAttribute('data-wol-pinned')
           try {
             const tileRoot = (a.closest('ytd-video-renderer') as HTMLElement | null)
@@ -5710,24 +5729,10 @@ import { channelCache } from '../modules/yt/channelCache'
         const existingGlobal = document.querySelector(`[data-wol-overlay="${id}"]`) as HTMLElement | null
         if (existingGlobal && existingGlobal !== already) {
           if (existingGlobal.isConnected) {
-            // If a global overlay exists but is attached to a different host, reattach it here
-            try {
-              if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
-              if (existingGlobal.parentElement !== host) {
-                host.appendChild(existingGlobal)
-              }
-              ; (a as any).dataset.wolEnhanced = 'done'
-              // Also update state to point at the current host
-              const st = overlayState.get(id)
-              if (st) {
-                st.host = host
-                st.element = existingGlobal as HTMLElement
-                st.lastSeen = Date.now()
-                st.generation = gen
-                overlayState.set(id, st)
-              }
-              continue
-            } catch {}
+            // A valid overlay exists elsewhere (body or another host). Do not recreate or reattach.
+            ; (a as any).dataset.wolEnhanced = 'done'
+            try { dedupeOverlaysById(id, existingGlobal) } catch {}
+            continue
           } else {
             // Existing global overlay is disconnected or invisible, remove it
             try { existingGlobal.remove() } catch {}
@@ -5742,6 +5747,8 @@ import { channelCache } from '../modules/yt/channelCache'
           }
         }
       } catch {}
+
+      // Proceed to create; global presence checks above ensure no duplicates
 
       // Add data attribute for identification
       mount.setAttribute('data-wol-overlay', id)
@@ -5831,6 +5838,7 @@ import { channelCache } from '../modules/yt/channelCache'
       if (mount.parentElement !== host) {
         host.appendChild(mount)
       }
+      // Mounted; no extra dedupe needed here (handled by pin/unpin and global checks)
       // Avoid extra hover listeners on results; rely on host mouseenter handler above
 
       // Watch-page related sidebar: container-level batch reveal
