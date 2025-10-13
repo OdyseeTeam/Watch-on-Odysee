@@ -1,5 +1,4 @@
 import { chunk } from "lodash"
-import path from "path"
 import { getExtensionSettingsAsync, ytUrlResolversSettings } from "../../settings"
 import { odyseeUrlCache } from "./urlCache"
 
@@ -43,7 +42,13 @@ export async function resolveById(params: Paramaters, progressCallback?: (progre
         if (params.length === 0) return results
 
         const url = new URL(`${urlResolverSetting.href}`)
-        url.pathname = path.join(url.pathname, '/resolve')
+        // Ensure we append "/resolve" to the configured base path without
+        // using Node's path.join (which can drop the base path when the
+        // second segment starts with "/"). This guarantees
+        // https://api.odysee.com/yt -> https://api.odysee.com/yt/resolve
+        // and https://api.odysee.com/yt/ -> https://api.odysee.com/yt/resolve
+        const basePath = url.pathname.endsWith('/') ? url.pathname.slice(0, -1) : url.pathname
+        url.pathname = `${basePath}/resolve`
         url.searchParams.set('video_ids', params.filter((item) => item.type === 'video').map((item) => item.id).join(','))
         url.searchParams.set('channel_ids', params.filter((item) => item.type === 'channel').map((item) => item.id).join(','))
 
@@ -75,6 +80,56 @@ export async function resolveById(params: Paramaters, progressCallback?: (progre
     for (const chunk of chunks) {
         if (progressCallback) progressCallback(++i / (chunks.length + 1))
         Object.assign(results, await requestChunk(chunk))
+    }
+
+    if (progressCallback) progressCallback(1)
+    return results
+}
+
+// Force network resolve for given ids, bypassing local cache reads.
+// Writes fresh results back into the cache after a successful fetch.
+export async function resolveByIdForce(params: Paramaters, progressCallback?: (progress: number) => void): Promise<Results> {
+    const { urlResolver: urlResolverSettingName } = await getExtensionSettingsAsync()
+    const urlResolverSetting = ytUrlResolversSettings[urlResolverSettingName]
+
+    async function requestChunkForce(params: Paramaters) {
+        const results: Results = {}
+
+        if (params.length === 0) return results
+
+        const url = new URL(`${urlResolverSetting.href}`)
+        const basePath = url.pathname.endsWith('/') ? url.pathname.slice(0, -1) : url.pathname
+        url.pathname = `${basePath}/resolve`
+        url.searchParams.set('video_ids', params.filter((item) => item.type === 'video').map((item) => item.id).join(','))
+        url.searchParams.set('channel_ids', params.filter((item) => item.type === 'channel').map((item) => item.id).join(','))
+
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 5000)
+        const apiResponse = await fetch(url.toString(), { cache: 'no-store', signal: controller.signal })
+        clearTimeout(timeoutId)
+
+        if (apiResponse.ok) {
+            const response: ApiResponse = await apiResponse.json()
+            for (const item of params) {
+                const odyseeUrl = (item.type === 'channel' ? response.data.channels : response.data.videos)?.[item.id]?.replaceAll('#', ':') ?? null
+                // Update cache with the fresh value (including null)
+                await odyseeUrlCache.put(odyseeUrl, item.id)
+
+                if (odyseeUrl) results[item.id] = { id: odyseeUrl, type: item.type }
+            }
+        }
+
+        return results
+    }
+
+    const results: Results = {}
+    const chunks = chunk(params, QUERY_CHUNK_SIZE)
+
+    let i = 0
+    if (progressCallback) progressCallback(0)
+    for (const chunk of chunks) {
+        if (progressCallback) progressCallback(++i / (chunks.length + 1))
+        Object.assign(results, await requestChunkForce(chunk))
     }
 
     if (progressCallback) progressCallback(1)

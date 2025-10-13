@@ -1,7 +1,8 @@
-import { resolveById } from "../modules/yt/urlResolve"
+import { resolveById, resolveByIdForce } from "../modules/yt/urlResolve"
 import { logger } from "../modules/logger"
 
 const onGoingOdyseePathnameRequest: Record<string, ReturnType<typeof resolveById>> = {}
+const onGoingOdyseePathnameRequestForce: Record<string, ReturnType<typeof resolveByIdForce>> = {}
 const openTabGuard = new Map<string, number>() // href -> lastOpenTs
 // Track worker start time to distinguish pre-reload vs post-reload messages
 const workerStartAt = Date.now()
@@ -78,6 +79,19 @@ chrome.runtime.onMessage.addListener(({ method, data }, _sender, sendResponse) =
         }
         finally {
           delete onGoingOdyseePathnameRequest[data]
+        }
+        break
+      case 'resolveUrlForce':
+        try {
+          const params: Parameters<typeof resolveByIdForce> = JSON.parse(data)
+          const key = `force:${data}`
+          const promise = onGoingOdyseePathnameRequestForce[key] ?? (onGoingOdyseePathnameRequestForce[key] = resolveByIdForce(...params))
+          resolve(await promise)
+        } catch (error) {
+          sendResponse(`error: ${(error as any).toString()}`)
+          logger.error(error)
+        } finally {
+          delete onGoingOdyseePathnameRequestForce[`force:${data}`]
         }
         break
     }

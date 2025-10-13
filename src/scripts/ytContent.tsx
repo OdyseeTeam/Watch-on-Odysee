@@ -41,10 +41,18 @@ import { channelCache } from '../modules/yt/channelCache'
   let lastResolveAt = 0
   let lastVideoPageChannelId: string | null = null
   let lastShortsChannelId: string | null = null
+  // Track current channel page UC to aggressively invalidate per-page resolution state
+  let lastChannelPageUC: string | null = null
+  // Track previous channel page's resolved mapping to detect suspicious carry-over
+  let prevChannelResolvedUC: string | null = null
+  let prevChannelResolvedPath: string | null = null
 
   // Track redirected URLs to prevent multiple redirects for the same URL
   const redirectedUrls = new Set<string>()
   let lastRedirectTime = 0
+
+  // Single-shot retry guard for channel pages when initial resolve returns null
+  let channelResolveRetryGen: number | null = null
 
   // Performance optimization: Task scheduler to coalesce heavy work
   const scheduledTasks = new Map<string, number>()
@@ -390,9 +398,28 @@ import { channelCache } from '../modules/yt/channelCache'
           entries.slice(-50).forEach(([k, v]) => ytUrlResolvePageCache.set(k, v))
           logger.log('🗑️ Trimmed ytUrlResolvePageCache from', entries.length, 'to 50 entries')
         }
-        logger.log('💾 Preserved caches: UC=', ucResolvePageCache.size, 'handles=', handleResolvePageCache.size, 'ytUrls=', ytUrlResolvePageCache.size)
+        // Trim in-memory UC maps
+        if (handleToUCPageCache.size > 300) {
+          const entries = Array.from(handleToUCPageCache.entries())
+          handleToUCPageCache.clear()
+          entries.slice(-150).forEach(([k, v]) => handleToUCPageCache.set(k, v))
+          logger.log('🗑️ Trimmed handleToUCPageCache from', entries.length, 'to 150 entries')
+        }
+        if (ytUrlToUCPageCache.size > 300) {
+          const entries = Array.from(ytUrlToUCPageCache.entries())
+          ytUrlToUCPageCache.clear()
+          entries.slice(-150).forEach(([k, v]) => ytUrlToUCPageCache.set(k, v))
+          logger.log('🗑️ Trimmed ytUrlToUCPageCache from', entries.length, 'to 150 entries')
+        }
+        logger.log('💾 Preserved caches: UC=', ucResolvePageCache.size, 'handles=', handleResolvePageCache.size, 'ytUrls=', ytUrlResolvePageCache.size, 'handle→UC=', handleToUCPageCache.size, 'ytUrl→UC=', ytUrlToUCPageCache.size)
       } catch {}
       logger.log('🧽 Cleared results caches (resolvedLocal, initialData mappings, retries)')
+
+      // Remove any leftover channel action wrappers/buttons from previous page headers
+      try {
+        document.querySelectorAll('div[data-wol-channel-action="1"]').forEach(el => el.remove())
+        document.querySelectorAll('#owner a[role="button"][href^="https://odysee.com/"]').forEach(el => el.remove())
+      } catch {}
 
       // CRITICAL FIX: Don't await cleanup - let it run async to avoid blocking navigation
       // The generation bump will cause any running enhancement to exit early
@@ -1441,7 +1468,7 @@ import { channelCache } from '../modules/yt/channelCache'
   }
 
   async function getSourceByUrl(url: URL): Promise<Source | null> {
-    const platform = getSourcePlatfromSettingsFromHostname(new URL(location.href).hostname)
+    const platform = getSourcePlatfromSettingsFromHostname(url.hostname)
     if (!platform) return null
     // Store channel id early from ytInitialPlayerResponse if present on watch pages
     if (url.pathname === '/watch') {
@@ -1525,8 +1552,12 @@ import { channelCache } from '../modules/yt/channelCache'
       return { platform, id: videoId, type: 'video', url, time }
     }
     else if (url.pathname.startsWith('/channel/')) {
+      // Robustly extract UC id even when there is a trailing segment like /videos, /shorts, etc.
+      const segs = url.pathname.split('/')
+      const id = segs.length >= 3 ? segs[2] : null
+      if (!id || !id.startsWith('UC')) return null
       return {
-        id: url.pathname.substring("/channel/".length),
+        id,
         platform,
         time: null,
         type: 'channel',
@@ -1553,17 +1584,87 @@ import { channelCache } from '../modules/yt/channelCache'
       if (altRss?.href) {
         try { id = new URL(altRss.href).searchParams.get('channel_id') } catch { }
       }
-      // Fallback: fetch page HTML and parse
+
+      // Strong signal from ytInitialData if available
       if (!id) {
-      const content = await (await fetch(location.href)).text()
-      const prefix = `https://www.youtube.com/feeds/videos.xml?channel_id=`
-      const suffix = `"`
-        const startsAt = content.indexOf(prefix)
-        if (startsAt >= 0) {
-          const after = startsAt + prefix.length
-          const endsAt = content.indexOf(suffix, after)
-          if (endsAt > after) id = content.substring(after, endsAt)
+        try {
+          const yti = getYtInitialData()
+          const metaExt = yti?.metadata?.channelMetadataRenderer?.externalId
+          const headerCid = yti?.header?.c4TabbedHeaderRenderer?.channelId
+          const guess = (typeof metaExt === 'string' && metaExt.startsWith('UC')) ? metaExt
+                      : (typeof headerCid === 'string' && headerCid.startsWith('UC')) ? headerCid
+                      : null
+          if (guess) id = guess
+        } catch {}
+      }
+
+      // Robust DOM-based fallbacks (avoid relying on potentially stale fetches)
+      if (!id) {
+        const tryGetUCFromAttrs = (root: ParentNode) => {
+          const candidates = Array.from(root.querySelectorAll('[data-serialized-endpoint],[data-innertube-command],[data-endpoint],[endpoint]'))
+          for (const el of candidates) {
+            const attrs = ['data-serialized-endpoint','data-innertube-command','data-endpoint','endpoint'] as const
+            for (const a of attrs) {
+              const raw = (el as HTMLElement).getAttribute(a as any)
+              if (!raw) continue
+              try {
+                const data = JSON.parse(raw)
+                const bid = data?.browseEndpoint?.browseId
+                  || data?.commandMetadata?.webCommandMetadata?.browseEndpoint?.browseId
+                  || data?.webCommandMetadata?.browseEndpoint?.browseId
+                  || data?.browseId
+                if (typeof bid === 'string' && bid.startsWith('UC')) return bid
+              } catch {}
+            }
+          }
+          return null
         }
+
+        // 1) Try attributes within header-only roots (avoid scanning entire document)
+        const headerRoots: (HTMLElement | null)[] = [
+          document.querySelector('ytd-page-header-renderer'),
+          document.querySelector('yt-page-header-view-model'),
+          document.querySelector('#channel-header'),
+          document.querySelector('#channel-header-container'),
+          document.querySelector('ytd-c4-tabbed-header-renderer'),
+        ]
+        for (const root of headerRoots) {
+          if (!root) continue
+          id = tryGetUCFromAttrs(root)
+          if (id) break
+        }
+
+        // 2) Try explicit channel anchors
+        if (!id) {
+          const chA = (document.querySelector('#channel-header a[href^="/channel/"]') as HTMLAnchorElement | null)
+            || (document.querySelector('#channel-header-container a[href^="/channel/"]') as HTMLAnchorElement | null)
+            || (document.querySelector('ytd-page-header-renderer a[href^="/channel/"]') as HTMLAnchorElement | null)
+            || (document.querySelector('yt-page-header-view-model a[href^="/channel/"]') as HTMLAnchorElement | null)
+          if (chA) {
+            try { const u = new URL(chA.getAttribute('href') || chA.href, location.origin); const cid = u.pathname.split('/')[2]; if (cid?.startsWith('UC')) id = cid } catch {}
+          }
+        }
+
+                // Avoid script-wide channelId scans; too noisy on channel pages
+
+      }
+
+      // As a last resort, fetch a fresh copy of the page (no-store) and parse
+      if (!id) {
+        try {
+          const content = await (await fetch(url.href, { credentials: 'same-origin', cache: 'no-store' })).text()
+          const prefix = `https://www.youtube.com/feeds/videos.xml?channel_id=`
+          const idx = content.indexOf(prefix)
+          if (idx >= 0) {
+            const after = idx + prefix.length
+            const end = content.indexOf('"', after)
+            if (end > after) id = content.substring(after, end)
+          }
+          if (!id) {
+            const m = content.match(/"channelId"\s*:\s*"([A-Za-z0-9_-]+)"/)
+            if (m?.[1]?.startsWith('UC')) id = m[1]
+          }
+        } catch {}
       }
       if (!id) return null
       return {
@@ -1633,6 +1734,58 @@ import { channelCache } from '../modules/yt/channelCache'
     return null
   }
 
+  // Derive a strict UC for a channel handle URL by preferring persistent cache,
+  // but validating via a fresh no-store fetch of the page when possible.
+  async function getStrictUCForHandleUrl(url: URL): Promise<string | null> {
+    try {
+      if (!url.pathname.startsWith('/@')) return null
+      const handle = url.pathname.slice(2)
+      if (!handle) return null
+      const ytUrl = `/@${handle}`
+
+      // 1) Persistent caches first
+      let cacheUC: string | null | undefined = await channelCache.getYtUrl(ytUrl)
+      if (!cacheUC) cacheUC = await channelCache.getHandle(handle)
+
+      // 2) Fresh fetch (no-store) to confirm UC for this handle URL
+      let pageUC: string | null = null
+      try {
+        const text = await (await fetch(url.href, { credentials: 'same-origin', cache: 'no-store' })).text()
+        const prefix = 'https://www.youtube.com/feeds/videos.xml?channel_id='
+        const i = text.indexOf(prefix)
+        if (i >= 0) {
+          const after = i + prefix.length
+          const end = text.indexOf('"', after)
+          if (end > after) pageUC = text.substring(after, end)
+        }
+        if (!pageUC) {
+          const m = text.match(/"channelId"\s*:\s*"([A-Za-z0-9_-]+)"/)
+          if (m?.[1]?.startsWith('UC')) pageUC = m[1]
+        }
+      } catch {}
+
+      // 3) If fetch provided a UC, prefer it; also fix caches if they disagree
+      if (pageUC && pageUC.startsWith('UC')) {
+        if (cacheUC && cacheUC !== pageUC) {
+          try { channelCache.putHandle(handle, pageUC) } catch {}
+          try { channelCache.putYtUrl(ytUrl, pageUC) } catch {}
+          dbg('[CHANNEL-DEBUG] Updated handle caches for', handle, 'from', cacheUC, 'to', pageUC)
+        } else if (!cacheUC) {
+          try { channelCache.putHandle(handle, pageUC) } catch {}
+          try { channelCache.putYtUrl(ytUrl, pageUC) } catch {}
+        }
+        return pageUC
+      }
+
+      // 4) Fall back to cache UC if present
+      if (cacheUC && typeof cacheUC === 'string' && cacheUC.startsWith('UC')) return cacheUC
+
+      return null
+    } catch {
+      return null
+    }
+  }
+
   async function getTargetsBySources(...sources: Source[]) {
     const params: Parameters<typeof requestResolveById>[0] = sources.map((source) => ({ id: source.id, type: source.type }))
     const platform = targetPlatformSettings[settings.targetPlatform]
@@ -1690,6 +1843,49 @@ import { channelCache } from '../modules/yt/channelCache'
       logger.error("Error communicating with background script:", error)
       throw error
     }
+  }
+
+  // Force-resolve variant that bypasses background cache for the given ids
+  async function requestResolveByIdForce(...params: Parameters<typeof resolveById>): Promise<ReturnType<typeof resolveById> | null> {
+    try {
+      const response = await new Promise<string | null | 'error'>((resolve, reject) => {
+        chrome.runtime.sendMessage({ method: 'resolveUrlForce', data: JSON.stringify(params) }, (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message))
+          } else {
+            resolve(response)
+          }
+        })
+      })
+      if (response?.startsWith('error:')) {
+        logger.error("Background error on (force):", params)
+        throw new Error(`Background error. ${response ?? ''}`)
+      }
+      return response ? JSON.parse(response) : null
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('Extension context invalidated')) {
+        logger.warn('Extension context invalidated - please reload the page to re-enable Watch on Odysee functionality (force)')
+        extensionContextInvalidated = true
+        return null
+      }
+      logger.error("Error communicating with background script (force):", error)
+      throw error
+    }
+  }
+
+  async function getTargetsBySourcesForce(...sources: Source[]) {
+    const params: Parameters<typeof requestResolveByIdForce>[0] = sources.map((source) => ({ id: source.id, type: source.type }))
+    const platform = targetPlatformSettings[settings.targetPlatform]
+    const results = await requestResolveByIdForce(params)
+    if (!results) return Object.fromEntries(sources.map(source => [source.id, null]))
+    const targets: Record<string, Target | null> = Object.fromEntries(
+      sources.map((source) => {
+        const result = results[source.id]
+        if (!result) return [source.id, null]
+        return [source.id, { type: result.type, odyseePathname: result.id, platform, time: source.time }]
+      })
+    )
+    return targets
   }
 
   // Request new tab
@@ -1905,6 +2101,9 @@ import { channelCache } from '../modules/yt/channelCache'
   let resultsChipsQuietUntil = 0
   let resultsChipsBackoffMs = 0
   let resultsChipsRetryKey: string | null = null
+  // In-memory mappings for quick lookups (ytUrl/handle → UC)
+  const handleToUCPageCache = new Map<string, string>()
+  const ytUrlToUCPageCache = new Map<string, string>()
   // Cross-refresh tracking to prevent ping-pong loops between CR and VR refreshers
   let lastChipsToButtonsNudge = 0
   let lastButtonsToChipsNudge = 0
@@ -1921,6 +2120,62 @@ import { channelCache } from '../modules/yt/channelCache'
   const overlayAnchorPrefs = new Map<string, { anchor: 'top-left' | 'bottom-left', x: number, y: number }>()
   // Channel main page action placement version guard (prevents stale scheduled attempts)
   let channelMainActionVersion = 0
+
+  // Helper: normalize a @handle (strip leading @)
+  function normalizeHandle(h: string | null | undefined): string | null {
+    if (!h) return null
+    return h.startsWith('@') ? h.slice(1) : h
+  }
+
+  // Helper: convert a minimal cached target into a full Target with platform
+  function asFullTarget(simple: { id: string, type: 'video' | 'channel' } | null | undefined, time: number | null = null): Target | null {
+    if (!simple) return null
+    return { type: simple.type, odyseePathname: simple.id, platform: targetPlatformSettings[settings.targetPlatform], time }
+  }
+
+  // Prefer handle-based cache lookups when on handle URLs to avoid UC cross-over
+  async function getChannelTargetFromHandleCaches(handle: string): Promise<Target | null> {
+    try {
+      const norm = normalizeHandle(handle)!
+      const ytUrl = `/@${norm}`
+      // In-memory per-page caches first
+      if (ytUrlResolvePageCache.has(ytUrl)) {
+        const t = ytUrlResolvePageCache.get(ytUrl) || null
+        if (t) return t
+      }
+      if (handleResolvePageCache.has(norm)) {
+        const t = handleResolvePageCache.get(norm) || null
+        if (t) return t
+      }
+      // Persistent: ytUrl -> UC, then UC -> Target
+      try {
+        const uc = await channelCache.getYtUrl(ytUrl)
+        if (uc && typeof uc === 'string') {
+          if (ucResolvePageCache.has(uc)) {
+            const t = ucResolvePageCache.get(uc) || null
+            if (t) return t
+          }
+          const t2 = await channelCache.getUC(uc)
+          const full = asFullTarget(t2, null)
+          if (full) return full
+        }
+      } catch {}
+      // Persistent: handle -> UC
+      try {
+        const uc = await channelCache.getHandle(norm)
+        if (uc && typeof uc === 'string') {
+          if (ucResolvePageCache.has(uc)) {
+            const t = ucResolvePageCache.get(uc) || null
+            if (t) return t
+          }
+          const t2 = await channelCache.getUC(uc)
+          const full = asFullTarget(t2, null)
+          if (full) return full
+        }
+      } catch {}
+    } catch {}
+    return null
+  }
 
   // Cached mappings from ytInitialData on results pages
   let initialDataMapCache: {
@@ -2418,15 +2673,20 @@ import { channelCache } from '../modules/yt/channelCache'
         if (!ucid && handle && ytUrl) {
           const normHandle = handle.startsWith('@') ? handle.slice(1) : handle
 
-          // Step 1: Check in-memory ytUrl cache first (fastest)
-          if (ytUrlResolvePageCache.has(ytUrl)) {
+          // Step 1: Check in-memory ytUrl→UC cache first (fastest)
+          if (ytUrlToUCPageCache.has(ytUrl)) {
+            ucid = ytUrlToUCPageCache.get(ytUrl) || null
+            if (WOL_DEBUG && ucid) dbg('[RESULTS][CR]', i, '✅ found UC via in-memory ytUrl→UC cache:', ucid, 'for', ytUrl)
+          }
+          // Step 1b: Check in-memory ytUrl→Target cache
+          if (!ucid && ytUrlResolvePageCache.has(ytUrl)) {
             const target = ytUrlResolvePageCache.get(ytUrl)
             if (target) {
               // Found in ytUrl cache, now get the UC from UC cache
               for (const [uc, cachedTarget] of ucResolvePageCache.entries()) {
                 if (cachedTarget === target && uc.startsWith('UC')) {
                   ucid = uc
-                  if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '✅ found UC via in-memory ytUrl cache:', ucid, 'for', ytUrl)
+                  if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '✅ found UC via in-memory ytUrl→Target cache:', ucid, 'for', ytUrl)
                   break
                 }
               }
@@ -2434,6 +2694,10 @@ import { channelCache } from '../modules/yt/channelCache'
           }
 
           // Step 2: Check in-memory handle cache
+          if (!ucid && handleToUCPageCache.has(normHandle)) {
+            ucid = handleToUCPageCache.get(normHandle) || null
+            if (WOL_DEBUG && ucid) dbg('[RESULTS][CR]', i, '✅ found UC via in-memory handle→UC cache:', ucid, 'for @' + normHandle)
+          }
           if (!ucid && handleResolvePageCache.has(normHandle)) {
             const target = handleResolvePageCache.get(normHandle)
             if (target) {
@@ -2457,6 +2721,7 @@ import { channelCache } from '../modules/yt/channelCache'
               if (persistedUC && persistedUC.startsWith('UC')) {
                 ucid = persistedUC
                 if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '✅ found UC via PERSISTENT ytUrl cache:', ucid, 'for', ytUrl)
+                try { ytUrlToUCPageCache.set(ytUrl, ucid) } catch {}
               }
             } catch (err) {
               if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '❌ ERROR checking persistent ytUrl cache:', err)
@@ -2472,6 +2737,7 @@ import { channelCache } from '../modules/yt/channelCache'
               if (persistedUC && persistedUC.startsWith('UC')) {
                 ucid = persistedUC
                 if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '✅ found UC via PERSISTENT handle cache:', ucid, 'for @' + normHandle)
+                try { handleToUCPageCache.set(normHandle, ucid) } catch {}
               }
             } catch (err) {
               if (WOL_DEBUG) dbg('[RESULTS][CR]', i, '❌ ERROR checking persistent handle cache:', err)
@@ -2501,6 +2767,12 @@ import { channelCache } from '../modules/yt/channelCache'
               dbg('[RESULTS][CR]', i, 'YtUrl cache contents:', Array.from(ytUrlResolvePageCache.keys()))
             }
           }
+          // Seed in-memory UC caches for handles/ytUrls for future fast lookup
+          try {
+            const normH = handle ? (handle.startsWith('@') ? handle.slice(1) : handle) : null
+            if (normH && ucid) handleToUCPageCache.set(normH, ucid)
+            if (ytUrl && ucid) ytUrlToUCPageCache.set(ytUrl, ucid)
+          } catch {}
           try {
             // First try ytUrl cache (most direct - no UC/handle mismatch issues)
             if (!chUrl && ytUrl && ytUrlResolvePageCache.has(ytUrl)) {
@@ -2684,6 +2956,10 @@ import { channelCache } from '../modules/yt/channelCache'
         // Update href every pass
         if (myGen !== overlayGeneration) return
         if (link) link.href = chUrl.href
+        if (link && !(link as any).dataset.wolClick) {
+          link.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+          ;(link as any).dataset.wolClick = '1'
+        }
         if (WOL_DEBUG) dbg('[RESULTS][CR]', i, 'href set', chUrl.href)
 
         if (buttonsContainer) {
@@ -2798,23 +3074,7 @@ import { channelCache } from '../modules/yt/channelCache'
       const maps = getInitialDataMappings()
       if (myGen !== overlayGeneration) { resultsVideoChipRunning = false; return }
 
-      // Compute a simple signature of what's on the page and already known
-      try {
-        const now0 = Date.now()
-        if (now0 < resultsChipsQuietUntil) { resultsVideoChipRunning = false; return }
-        const ucids = new Set(items.map(x => x.ucid).filter((x): x is string => !!x))
-        let ucResolved = 0
-        for (const uc of ucids) { const t = ucResolvePageCache.get(uc); if (t) ucResolved++ }
-        let handleMatches = 0
-        for (const it of items) { const h = it.handle ? (it.handle.startsWith('@') ? it.handle.slice(1) : it.handle) : null; if (h && handleResolvePageCache.has(h)) handleMatches++ }
-        const sig = `${location.href}|${ucids.size}|${ucResolved}|${handleMatches}`
-        const now = Date.now()
-        if (lastResultsChipsSig === sig && (now - lastResultsChipsAt) < 1200) {
-          resultsVideoChipRunning = false
-          return
-        }
-        lastResultsChipsSig = sig
-      } catch {}
+      // Note: signature check moved to after items are collected
 
       // Collect channel anchors from video result renderers
       const vrs = Array.from(document.querySelectorAll('ytd-video-renderer')) as HTMLElement[]
@@ -2858,6 +3118,24 @@ import { channelCache } from '../modules/yt/channelCache'
         } catch {}
         return { vr, nameAnchor, handle, ucid, videoId, ytUrl } as any
       })
+
+      // Compute a simple signature of what's on the page and already known
+      try {
+        const now0 = Date.now()
+        if (now0 < resultsChipsQuietUntil) { resultsVideoChipRunning = false; return }
+        const ucids = new Set(items.map(x => x.ucid).filter((x): x is string => !!x))
+        let ucResolved = 0
+        for (const uc of ucids) { const t = ucResolvePageCache.get(uc); if (t) ucResolved++ }
+        let handleMatches = 0
+        for (const it of items) { const h = it.handle ? (it.handle.startsWith('@') ? it.handle.slice(1) : it.handle) : null; if (h && handleResolvePageCache.has(h)) handleMatches++ }
+        const sig = `${location.href}|${ucids.size}|${ucResolved}|${handleMatches}`
+        const now = Date.now()
+        if (lastResultsChipsSig === sig && (now - lastResultsChipsAt) < 1200) {
+          resultsVideoChipRunning = false
+          return
+        }
+        lastResultsChipsSig = sig
+      } catch {}
       if (myGen !== overlayGeneration) return
 
       // Robust UC extraction helpers
@@ -3001,6 +3279,12 @@ import { channelCache } from '../modules/yt/channelCache'
       for (const it of items as any[]) {
         try {
           if (myGen !== overlayGeneration) return
+          // Use in-memory UC caches before attempting upgrades
+          if (!it.ucid && it.ytUrl && ytUrlToUCPageCache.has(it.ytUrl)) it.ucid = ytUrlToUCPageCache.get(it.ytUrl) || null
+          if (!it.ucid && it.handle) {
+            const norm = it.handle.startsWith('@') ? it.handle.slice(1) : it.handle
+            if (handleToUCPageCache.has(norm)) it.ucid = handleToUCPageCache.get(norm) || null
+          }
           if (!it.ucid && it.videoId && maps.videoToUC.has(it.videoId)) it.ucid = maps.videoToUC.get(it.videoId)
           if (!it.ucid && it.handle) {
             const norm = it.handle.startsWith('@') ? it.handle.slice(1) : it.handle
@@ -3131,7 +3415,10 @@ import { channelCache } from '../modules/yt/channelCache'
               inline.style.borderRadius = '11px'
               inline.style.background = 'transparent'
               inline.style.overflow = 'hidden'
-              inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(url!, 'user') })
+              if (!(inline as any).dataset.wolClick) {
+                inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(url!, 'user') })
+                ;(inline as any).dataset.wolClick = '1'
+              }
               let icon = inline.querySelector('img') as HTMLImageElement | null
               if (!icon) { icon = document.createElement('img'); inline.appendChild(icon) }
               icon.src = platform.button.icon
@@ -3429,7 +3716,10 @@ import { channelCache } from '../modules/yt/channelCache'
             inline.style.borderRadius = '11.5px'
             inline.style.background = 'transparent'
             inline.style.overflow = 'hidden'
-            inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+            if (!(inline as any).dataset.wolClick) {
+              inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+              ;(inline as any).dataset.wolClick = '1'
+            }
             let icon = inline.querySelector('img') as HTMLImageElement | null
             if (!icon) { icon = document.createElement('img'); inline.appendChild(icon) }
             icon.src = platform.button.icon
@@ -3518,7 +3808,10 @@ import { channelCache } from '../modules/yt/channelCache'
           // Transparent background; let the icon fill the chip
           inline.style.background = 'transparent'
           inline.style.overflow = 'hidden'
-          inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+          if (!(inline as any).dataset.wolClick) {
+            inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+            ;(inline as any).dataset.wolClick = '1'
+          }
           // Ensure we have a single icon child, sized to fill
           let icon = inline.querySelector('img') as HTMLImageElement | null
           if (!icon) {
@@ -3566,7 +3859,7 @@ import { channelCache } from '../modules/yt/channelCache'
         }
       } catch {}
       resultsVideoChipRunning = false
-      if (resultsVideoChipPendingRerun && overlayGeneration === overlayGeneration) {
+      if (resultsVideoChipPendingRerun) {
         resultsVideoChipPendingRerun = false
         scheduleRefreshResultsChips(120)
       }
@@ -4132,13 +4425,7 @@ import { channelCache } from '../modules/yt/channelCache'
         }
       }
 
-      if (!vid) {
-        // Debug: log anchors that didn't match any pattern
-        if (toProcess.length < 10) {  // Only log for first few to avoid spam
-          overlayDbg(`[DEBUG] Skipped anchor with href: ${href} (pathname: ${u.pathname})`)
-        }
-        continue
-      }
+      if (!vid) continue
       if (WOL_DEBUG && (vid === '-zDqghyM_H0' || vid === '_b4uZhW-wYI' || vid === 'RDZxYZkz20lYA')) {
         logger.log(`[TOPROCESS DEBUG] Found video ${vid}:`, {
           vid,
@@ -4150,8 +4437,6 @@ import { channelCache } from '../modules/yt/channelCache'
       }
       toProcess.push({ a, id: vid, type })
     }
-
-    overlayDbg(`[DEBUG] After processing: ${toProcess.length} items to process, skipped ${skippedAlreadyEnhanced} already enhanced`)
 
     if (toProcess.length === 0) return
 
@@ -4174,7 +4459,6 @@ import { channelCache } from '../modules/yt/channelCache'
     for (const item of toProcess) {
       // CRITICAL FIX: Check generation during dedup to abort if navigation happened
       if (gen !== overlayGeneration) {
-        overlayDbg(`[DEBUG] Aborting dedup - generation changed from ${gen} to ${overlayGeneration}`)
         enhancementRunning = false
         return
       }
@@ -4185,11 +4469,7 @@ import { channelCache } from '../modules/yt/channelCache'
       } else {
         const ns = scoreAnchor(item.a)
         const ps = scoreAnchor(prev.a)
-        const inSecNew = !!(item.a.closest('#secondary') || item.a.closest('#related'))
-        const inSecPrev = !!(prev.a.closest('#secondary') || prev.a.closest('#related'))
-        overlayDbg(`[DEBUG] Dedup for ${item.id}: new score=${ns} (inSec=${inSecNew}) vs old score=${ps} (inSec=${inSecPrev})`)
         if (ns > ps) {
-          overlayDbg(`[DEBUG] Dedup replaced for ${item.id}: new score=${ns} (inSec=${inSecNew}) vs old score=${ps} (inSec=${inSecPrev})`)
           byId.set(item.id, item)
         }
       }
@@ -4200,38 +4480,19 @@ import { channelCache } from '../modules/yt/channelCache'
     // These are likely from a hidden sidebar and shouldn't be processed
     const isWatchPage = location.pathname === '/watch'
     if (!isWatchPage) {
-      const beforeFilter = dedupedToProcess.length
       dedupedToProcess = dedupedToProcess.filter(item => {
         const inSecondary = !!(item.a.closest('#secondary') || item.a.closest('#related'))
-        if (inSecondary) {
-          overlayDbg(`[DEBUG] Filtering out ${item.id} - best anchor is in #secondary on non-watch page`)
-          return false
-        }
-        return true
+        return !inSecondary
       })
-      if (beforeFilter !== dedupedToProcess.length) {
-        overlayDbg(`[DEBUG] Filtered out ${beforeFilter - dedupedToProcess.length} videos with #secondary anchors on non-watch page`)
-      }
-    }
-
-    overlayDbg(`[DEBUG] Deduplication: ${toProcess.length} anchors -> ${dedupedToProcess.length} unique video IDs`)
-    if (dedupedToProcess.length <= 10) {
-      overlayDbg(`[DEBUG] Unique video IDs:`, Array.from(byId.keys()))
-    } else {
-      overlayDbg(`[DEBUG] First 10 video IDs:`, Array.from(byId.keys()).slice(0, 10))
     }
 
     // OPTIMIZATION: On /results pages, we already know which videos have Odysee targets from resolvedLocal
     // Filter to only process videos that have targets - no point processing videos that don't exist on Odysee
     if (location.pathname === '/results') {
-      const beforeFilter = dedupedToProcess.length
       dedupedToProcess = dedupedToProcess.filter(item => {
         const key = `${item.type}:${item.id}`
         return resolvedLocal.has(key) && resolvedLocal.get(key) !== null
       })
-      if (beforeFilter !== dedupedToProcess.length) {
-        overlayDbg(`[DEBUG] Filtered out ${beforeFilter - dedupedToProcess.length} videos with no Odysee targets`)
-      }
     }
 
     dbg(`Enhancing ${toProcess.length} tiles with Odysee overlays (videos and channels)`)
@@ -4428,25 +4689,17 @@ import { channelCache } from '../modules/yt/channelCache'
     }
 
     // CRITICAL: On channel pages, process in smaller batches to prevent freezing
-    const batchSize = isChannelPage ? 2 : 10
-
-    overlayDbg(`[DEBUG] Starting processing loop for ${normalizedToProcess.length} items (channel page: ${isChannelPage}, batch size: ${batchSize})`)
+    const batchSize = isChannelPage ? 3 : 15
 
     for (const { a, id, type } of normalizedToProcess) {
       // CRITICAL: Check generation at start of EVERY iteration for fast cancellation
-      if (gen !== overlayGeneration) {
-        overlayDbg(`[DEBUG] Breaking processing loop - generation changed from ${gen} to ${overlayGeneration}`)
-        break
-      }
+      if (gen !== overlayGeneration) break
 
       // Yield control back to the browser after every batch
       processedCount++
       if (processedCount % batchSize === 0) {
-        overlayDbg(`[DEBUG] Processing progress: ${processedCount}/${normalizedToProcess.length} items (yielding)`)
         await idleYield(0)
         if (gen !== overlayGeneration) break
-      } else if (processedCount % 10 === 0) {
-        overlayDbg(`[DEBUG] Processing progress: ${processedCount}/${normalizedToProcess.length} items`)
       }
 
       const res = resolvedLocal.get(`${type}:${id}`) ?? null
@@ -5461,7 +5714,6 @@ import { channelCache } from '../modules/yt/channelCache'
             try {
               if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
               if (existingGlobal.parentElement !== host) {
-                overlayDbg(`[DEBUG] Moving existing global overlay ${id} to correct host`)
                 host.appendChild(existingGlobal)
               }
               ; (a as any).dataset.wolEnhanced = 'done'
@@ -5474,16 +5726,10 @@ import { channelCache } from '../modules/yt/channelCache'
                 st.generation = gen
                 overlayState.set(id, st)
               }
-              // Dedupe: if any extra nodes exist with the same id, remove them now
-              try {
-                const also = Array.from(document.querySelectorAll(`[data-wol-overlay="${id}"]`)) as HTMLElement[]
-                for (const el of also) { if (el !== existingGlobal) try { el.remove() } catch {} }
-              } catch {}
               continue
             } catch {}
           } else {
             // Existing global overlay is disconnected or invisible, remove it
-            overlayDbg(`[DEBUG] Removing disconnected global overlay ${id}`)
             try { existingGlobal.remove() } catch {}
           }
         }
@@ -5492,7 +5738,6 @@ import { channelCache } from '../modules/yt/channelCache'
         const existingState = overlayState.get(id)
         if (existingState && existingState.generation === gen) {
           if (existingState.element.isConnected && existingState.element.offsetWidth > 0) {
-            overlayDbg(`[DEBUG] Overlay ${id} already in overlayState, skipping duplicate`)
             ; (a as any).dataset.wolEnhanced = 'done'; continue
           }
         }
@@ -5524,7 +5769,6 @@ import { channelCache } from '../modules/yt/channelCache'
               const box = mount.getBoundingClientRect()
               // If overlay is visible and in correct position, don't touch it
               if (box.width > 0 && box.height > 0) {
-                overlayDbg(`[DEBUG] Overlay ${id} already correctly positioned, skipping reattach`)
                 ensureOverlayVisibility()
                 return
               }
@@ -5537,7 +5781,6 @@ import { channelCache } from '../modules/yt/channelCache'
             const containerRoot = tileContainer || host.parentElement || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null)
 
             if (!host.isConnected || (containerRoot && !containerRoot.contains(host))) {
-              overlayDbg(`[DEBUG] Host disconnected for ${id}, searching for new host`)
               let newHost: HTMLElement | null = null
               const candidates = [
                 containerRoot?.querySelector('ytd-thumbnail #thumbnail') as HTMLElement | null,
@@ -5557,18 +5800,12 @@ import { channelCache } from '../modules/yt/channelCache'
               }
               // Fallback: the anchor itself
               if (!newHost) newHost = a as unknown as HTMLElement
-              if (newHost) {
-                overlayDbg(`[DEBUG] Found new host for ${id}, reattaching`)
-                host = newHost
-              }
+              if (newHost) host = newHost
             }
 
             // Only append if not already in host
             if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
-            if (!host.contains(mount)) {
-              overlayDbg(`[DEBUG] Reattaching overlay ${id} to host`)
-              host.appendChild(mount)
-            }
+            if (!host.contains(mount)) host.appendChild(mount)
           } catch {}
           ensureOverlayVisibility()
         })
@@ -5720,7 +5957,7 @@ import { channelCache } from '../modules/yt/channelCache'
         }
       }
 
-       const source = await getSourceByUrl(urlNow)
+       let source = await getSourceByUrl(urlNow)
        lastLoggedHref = urlNow.href
        if (!source) {
          // No page-level source (e.g., /results). Still refresh overlays and results chips.
@@ -5733,7 +5970,34 @@ import { channelCache } from '../modules/yt/channelCache'
          return
        }
 
-      // Compute targets: resolve both the primary item and (if video) the channel in a single call
+      // If we navigated to a new channel page, invalidate per-page resolution state to avoid stale targets
+      if (source.type === 'channel') {
+        if (lastChannelPageUC !== source.id) {
+          lastChannelPageUC = source.id
+          settingsDirty = true
+          lastResolveSig = null
+          lastResolved = {}
+        }
+      } else {
+        // Reset when leaving channel pages
+        if (lastChannelPageUC) lastChannelPageUC = null
+      }
+
+      // Strict UC normalization for @handle pages to prevent cross-over
+      if (source.type === 'channel' && urlNow.pathname.startsWith('/@')) {
+        try {
+          const strictUC = await getStrictUCForHandleUrl(urlNow)
+          if (strictUC && strictUC !== source.id) {
+            dbg('[CHANNEL-DEBUG] Overriding channel UC from', source.id, 'to', strictUC, 'for', urlNow.pathname)
+            source = { ...source, id: strictUC }
+            settingsDirty = true
+            lastResolveSig = null
+            lastResolved = {}
+          }
+        } catch {}
+      }
+
+      // Compute targets: resolve both the primary item and (if video/channel) also the canonical channel UC in a single call
       let subscribeTargets: Target[] = []
       let playerTarget: Target | null = null
       const sourcesToResolve: Source[] = [source]
@@ -5810,6 +6074,48 @@ import { channelCache } from '../modules/yt/channelCache'
           lastVideoPageChannelId = channelId
         }
       }
+      // If we are on a channel page using a @handle URL, try to derive its UC id from DOM and include it
+      else if (source.type === 'channel') {
+        try {
+          const isHandleUrl = urlNow.pathname.startsWith('/@')
+          if (isHandleUrl) {
+            const tryGetUCFromAttrs = (root: ParentNode) => {
+              const candidates = Array.from(root.querySelectorAll('[data-serialized-endpoint],[data-innertube-command],[data-endpoint],[endpoint]'))
+              for (const el of candidates) {
+                const attrs = ['data-serialized-endpoint','data-innertube-command','data-endpoint','endpoint'] as const
+                for (const a of attrs) {
+                  const raw = (el as HTMLElement).getAttribute(a as any)
+                  if (!raw) continue
+                  try {
+                    const data = JSON.parse(raw)
+                    const bid = data?.browseEndpoint?.browseId
+                      || data?.commandMetadata?.webCommandMetadata?.browseEndpoint?.browseId
+                      || data?.webCommandMetadata?.browseEndpoint?.browseId
+                      || data?.browseId
+                    if (typeof bid === 'string' && bid.startsWith('UC')) return bid
+                  } catch {}
+                }
+              }
+              return null
+            }
+            let ucGuess: string | null = null
+            ucGuess = tryGetUCFromAttrs(document)
+            if (!ucGuess) {
+              // Look for explicit /channel/UC… anchors in header areas
+              const chA = (document.querySelector('#channel-header a[href^="/channel/"]') as HTMLAnchorElement | null)
+                || (document.querySelector('#channel-header-container a[href^="/channel/"]') as HTMLAnchorElement | null)
+                || (document.querySelector('ytd-page-header-renderer a[href^="/channel/"]') as HTMLAnchorElement | null)
+                || (document.querySelector('yt-page-header-view-model a[href^="/channel/"]') as HTMLAnchorElement | null)
+              if (chA) {
+                try { const u = new URL(chA.getAttribute('href') || chA.href, location.origin); const id = u.pathname.split('/')[2]; if (id?.startsWith('UC')) ucGuess = id } catch {}
+              }
+            }
+            if (ucGuess && ucGuess !== source.id) {
+              sourcesToResolve.push({ platform: source.platform, id: ucGuess, type: 'channel', url: urlNow, time: null })
+            }
+          }
+        } catch {}
+      }
 
       // Resolve all at once (only if signature changed or periodic refresh needed)
       const sig = sourcesToResolve.map(s => `${s.type}:${s.id}`).sort().join(',')
@@ -5820,7 +6126,12 @@ import { channelCache } from '../modules/yt/channelCache'
       if (needsResolve) {
         if (!resolveLogCache.has(sig)) { resolveLogCache.add(sig); logger.log('Resolving ids:', sig) }
         dbg(`[CHANNEL-DEBUG] Starting API resolution for:`, sig)
-        resolved = await getTargetsBySources(...sourcesToResolve)
+        // On channel pages, bypass the local resolver cache to avoid stale cross-channel pollution
+        if (source.type === 'channel') {
+          resolved = await getTargetsBySourcesForce(...sourcesToResolve)
+        } else {
+          resolved = await getTargetsBySources(...sourcesToResolve)
+        }
         const resolveEndTime = performance.now()
         dbg(`[CHANNEL-DEBUG] API resolution completed in ${(resolveEndTime - resolveStartTime).toFixed(2)}ms`)
         lastResolved = resolved
@@ -5890,7 +6201,20 @@ import { channelCache } from '../modules/yt/channelCache'
                     if (WOL_DEBUG) dbg('[CACHE] Failed to extract handle from anchor or no target')
                   }
                 } else {
-                  if (WOL_DEBUG) dbg('[CACHE] No handle anchor found on page')
+                  // No anchor visible; fall back to current path if it's a handle URL
+                  const p = location.pathname
+                  if (p.startsWith('/@') && target) {
+                    const handle = p.slice(2)
+                    handleResolvePageCache.set(handle, target)
+                    const handleUrl = `/@${handle}`
+                    ytUrlResolvePageCache.set(handleUrl, target)
+                    if (WOL_DEBUG) dbg('[CACHE] Path-based handle cache set for', handle, '→ UC', src.id)
+                    // Persist minimal mappings for later loads
+                    try { channelCache.putHandle(handle, src.id) } catch {}
+                    try { channelCache.putYtUrl(handleUrl, src.id) } catch {}
+                  } else if (WOL_DEBUG) {
+                    dbg('[CACHE] No handle anchor found on page')
+                  }
                 }
               } catch (e) {
                 if (WOL_DEBUG) dbg('[CACHE] Error caching handle:', e)
@@ -5913,53 +6237,84 @@ import { channelCache } from '../modules/yt/channelCache'
         dbg(`[CHANNEL-DEBUG] Processing channel page for ${source.id}`)
         dbg(`[CHANNEL-DEBUG] Has primaryTarget from API:`, !!primaryTarget)
 
-        // If no direct Odysee mapping yet, derive a deterministic fallback target
-        if (!primaryTarget) {
-          try {
-            // Prefer @handle in the header
-            const handleAnchor = (
-              document.querySelector('ytd-page-header-renderer a[href^="/@"]') as HTMLAnchorElement | null
-            ) || (
-              document.querySelector('yt-page-header-view-model a[href^="/@"]') as HTMLAnchorElement | null
-            ) || (
-              document.querySelector('#channel-header a[href^="/@"]') as HTMLAnchorElement | null
-            ) || (
-              document.querySelector('#channel-header-container a[href^="/@"]') as HTMLAnchorElement | null
-            )
-            dbg(`[CHANNEL-DEBUG] Found handleAnchor:`, !!handleAnchor, handleAnchor?.getAttribute('href'))
+        // IMPORTANT: Do not use any fallback (handle or search) for channel buttons.
+        // Only show a channel button when the resolve API returned a valid Odysee mapping.
+        // This prevents linking to Odysee search results or non-root paths like /@handle/community.
+        // Prefer freshly resolved mapping; fall back to UC→Target page cache if present
+        let resolvedChannelTarget = resolved[source.id] ?? null
 
-            const handleHref = handleAnchor?.getAttribute('href') || ''
-            const handleText = handleAnchor?.textContent?.trim() || ''
-            const handle = (handleHref.startsWith('/@') ? handleHref.substring(2) : '') || (handleText.startsWith('@') ? handleText.substring(1) : '')
-            dbg(`[CHANNEL-DEBUG] Extracted handle: "${handle}"`)
-
-            const nameEl = (document.querySelector('ytd-page-header-renderer #channel-name #text') as HTMLElement | null)
-              || (document.querySelector('yt-page-header-view-model #channel-name #text') as HTMLElement | null)
-              || (document.querySelector('#text-container #text') as HTMLElement | null)
-            const channelName = nameEl?.textContent?.trim() || ''
-            dbg(`[CHANNEL-DEBUG] Channel name: "${channelName}"`)
-
-            const platform = targetPlatformSettings[settings.targetPlatform]
-            // Try direct Odysee handle first
-            if (handle) {
-              primaryTarget = { platform, type: 'channel', odyseePathname: `@${handle}`, time: null }
-              dbg(`[CHANNEL-DEBUG] Created primaryTarget with handle: @${handle}`)
-            } else {
-              // Fallback to search by name or UC id
-              const q = channelName || source.id
-              primaryTarget = { platform, type: 'channel', odyseePathname: `$/search?q=${encodeURIComponent(q)}` , time: null }
-              dbg(`[CHANNEL-DEBUG] Created fallback primaryTarget with query: ${q}`)
+        // Prefer handle-based cached mapping if on a handle URL. If cache disagrees with API, trust cache.
+        try {
+          const path = source.url?.pathname || ''
+          if (path.startsWith('/@')) {
+            const h = path.slice(2)
+            const cachedByHandle = await getChannelTargetFromHandleCaches(h)
+            if (cachedByHandle && (!resolvedChannelTarget || cachedByHandle.odyseePathname !== resolvedChannelTarget.odyseePathname)) {
+              dbg(`[CHANNEL-DEBUG] Using handle-based cached mapping for @${h} (overriding API result if present)`)
+              resolvedChannelTarget = cachedByHandle
             }
-          } catch (e) {
-            dbg(`[CHANNEL-DEBUG] Error creating fallback target:`, e)
           }
+        } catch {}
+        if (!resolvedChannelTarget && source.id && source.id.startsWith('UC') && ucResolvePageCache.has(source.id)) {
+          const cached = ucResolvePageCache.get(source.id) || null
+          if (cached?.type === 'channel') resolvedChannelTarget = cached
         }
 
         const channelEndTime = performance.now()
         dbg(`[CHANNEL-DEBUG] Channel processing took ${(channelEndTime - channelStartTime).toFixed(2)}ms`)
-        dbg(`[CHANNEL-DEBUG] Final primaryTarget:`, primaryTarget)
+        dbg(`[CHANNEL-DEBUG] Resolved channel target:`, resolvedChannelTarget)
 
-        if (settings.buttonChannelSub && primaryTarget) subscribeTargets.push(primaryTarget)
+        // Detect suspicious stale carry-over: if the new channel UC differs from the previous
+        // channel UC, but the resolved Odysee pathname is identical to the previous
+        // channel's mapping, treat this as stale and force a re-resolve bypassing cache.
+        let usedForcedResolution = false
+        if (resolvedChannelTarget && prevChannelResolvedUC && prevChannelResolvedUC !== source.id && prevChannelResolvedPath && resolvedChannelTarget.odyseePathname === prevChannelResolvedPath) {
+          dbg(`[CHANNEL-DEBUG] Suspect stale mapping carry-over detected; forcing re-resolve for`, source.id)
+          try {
+            const forced = await getTargetsBySourcesForce({ ...source })
+            const fresh = forced[source.id] || null
+            if (fresh && fresh.odyseePathname !== resolvedChannelTarget.odyseePathname) {
+              dbg(`[CHANNEL-DEBUG] Forced re-resolve produced different mapping:`, fresh)
+              resolvedChannelTarget = fresh
+              usedForcedResolution = true
+            } else if (!fresh) {
+              dbg(`[CHANNEL-DEBUG] Forced re-resolve returned null; will defer button and retry via scheduled reprocess`)
+              resolvedChannelTarget = null
+            } else {
+              dbg(`[CHANNEL-DEBUG] Forced re-resolve returned same mapping; keeping current result`)
+            }
+          } catch (e) {
+            dbg(`[CHANNEL-DEBUG] Forced re-resolve failed:`, e)
+          }
+        }
+
+        if (settings.buttonChannelSub && resolvedChannelTarget) {
+          subscribeTargets.push(resolvedChannelTarget)
+        } else {
+          // If no mapping yet, schedule a single re-resolve after a short delay (once per generation)
+          try {
+            if (channelResolveRetryGen !== overlayGeneration) {
+              channelResolveRetryGen = overlayGeneration
+              setTimeout(() => {
+                // Only retry if we are still on a channel page for the same generation
+                if (overlayGeneration === channelResolveRetryGen && location.pathname.startsWith('/channel') || location.pathname.startsWith('/@')) {
+                  scheduleProcessCurrentPage(0)
+                }
+              }, 1200)
+            }
+          } catch {}
+        }
+
+        // Update previous-channel tracking if we used a valid mapping
+        if (resolvedChannelTarget && !usedForcedResolution) {
+          // normal path
+          prevChannelResolvedUC = source.id
+          prevChannelResolvedPath = resolvedChannelTarget.odyseePathname
+        } else if (resolvedChannelTarget && usedForcedResolution) {
+          // forced path mapping is authoritative
+          prevChannelResolvedUC = source.id
+          prevChannelResolvedPath = resolvedChannelTarget.odyseePathname
+        }
       } else if (source.type === 'video') {
         const vidTarget = resolved[source.id]
         const chTarget = channelIdForVideoPage ? resolved[channelIdForVideoPage] : null

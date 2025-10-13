@@ -95,7 +95,10 @@ async function putHandle(handle: string, ucId: string | null): Promise<void> {
     return await new Promise(async (resolve, reject) => {
         const store = (await db).transaction(HANDLE_STORE, "readwrite").objectStore(HANDLE_STORE)
         if (!store) return resolve()
-        const expireAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
+        // Shorter TTL for nulls to allow re-resolve sooner
+        const ttlOkMs = 7 * 24 * 60 * 60 * 1000 // 7 days
+        const ttlNullMs = 24 * 60 * 60 * 1000   // 24 hours
+        const expireAt = new Date(Date.now() + (ucId ? ttlOkMs : ttlNullMs))
         const request = store.put({ value: ucId, expireAt }, normHandle)
         logger.debug('caching handle', normHandle, '→', ucId, 'until:', expireAt)
         request.addEventListener('success', () => resolve())
@@ -127,7 +130,9 @@ async function putUC(ucId: string, target: Target | null): Promise<void> {
     return await new Promise(async (resolve, reject) => {
         const store = (await db).transaction(UC_STORE, "readwrite").objectStore(UC_STORE)
         if (!store) return resolve()
-        const expireAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
+        const ttlOkMs = 7 * 24 * 60 * 60 * 1000 // 7 days
+        const ttlNullMs = 24 * 60 * 60 * 1000   // 24 hours
+        const expireAt = new Date(Date.now() + (target ? ttlOkMs : ttlNullMs))
         const request = store.put({ value: target, expireAt }, ucId)
         logger.debug('caching UC', ucId, '→', target ? 'valid target' : 'null', 'until:', expireAt)
         request.addEventListener('success', () => resolve())
@@ -158,7 +163,9 @@ async function putYtUrl(ytUrl: string, ucId: string | null): Promise<void> {
     return await new Promise(async (resolve, reject) => {
         const store = (await db).transaction(YTURL_STORE, "readwrite").objectStore(YTURL_STORE)
         if (!store) return resolve()
-        const expireAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
+        const ttlOkMs = 7 * 24 * 60 * 60 * 1000 // 7 days
+        const ttlNullMs = 24 * 60 * 60 * 1000   // 24 hours
+        const expireAt = new Date(Date.now() + (ucId ? ttlOkMs : ttlNullMs))
         const request = store.put({ value: ucId, expireAt }, ytUrl)
         logger.debug('caching ytUrl', ytUrl, '→', ucId, 'until:', expireAt)
         request.addEventListener('success', () => resolve())
