@@ -31,6 +31,9 @@ import { channelCache } from '../modules/yt/channelCache'
   // Enhanced debug for overlay tracking (set localStorage.wolOverlayDebug = '1')
   const OVERLAY_DEBUG = (() => { try { return localStorage.getItem('wolOverlayDebug') === '1' } catch { return false } })()
   const overlayDbg = (...args: any[]) => { if (OVERLAY_DEBUG) try { console.log('[WOL-Overlay]', ...args) } catch {} }
+  // Optional perf-focused logs (set localStorage.wolPerfDebug = '1')
+  const PERF_DEBUG = (() => { try { return localStorage.getItem('wolPerfDebug') === '1' } catch { return false } })()
+  const perfDbg = (...args: any[]) => { if (PERF_DEBUG || OVERLAY_DEBUG || WOL_DEBUG) try { console.log('[WOL-Perf]', ...args) } catch {} }
   // Debug logging throttles
   let lastLoggedHref: string | null = null
   const resolveLogCache = new Set<string>()
@@ -161,6 +164,16 @@ import { channelCache } from '../modules/yt/channelCache'
   function scheduleBatchedCleanup(delay: number = 50) {
     scheduleTask('batchedCleanup', () => performBatchedCleanup(), delay)
   }
+
+  // Expose limited debug helpers in development
+  try {
+    if (OVERLAY_DEBUG || PERF_DEBUG || WOL_DEBUG) {
+      ;(window as any).__wolForceEnhance = (delay = 0) => {
+        try { lastEnhanceTime = 0; lastEnhanceUrl = '' } catch {}
+        scheduleEnhanceListings(delay, true)
+      }
+    }
+  } catch {}
 
   // Wrapper to call async cleanup functions (can optionally await)
   function triggerCleanupOverlays(): Promise<void> {
@@ -441,11 +454,11 @@ import { channelCache } from '../modules/yt/channelCache'
       resetRelatedBatch()
       lastEnhanceTime = 0; lastEnhanceUrl = ''
 
-      // Now schedule enhancement - longer delay for channel pages to let YouTube render all videos
-      // Channel pages with many videos need more time for initial render
+      // Now schedule enhancement - reduce initial delay for channel pages; rely on retry logic for late tiles
+      // Channel pages can still load gradually; our retry path below will fill in missing items
       const isChannelPage = currentUrl.includes('/@') || currentUrl.includes('/channel/') ||
                             currentUrl.includes('/c/') || currentUrl.includes('/user/')
-      const enhanceDelay = isChannelPage ? 800 : 300
+      const enhanceDelay = isChannelPage ? 350 : 300
 
       // Schedule overlay enhancement if overlays are enabled
       if (settings.buttonOverlay) {
@@ -2079,16 +2092,25 @@ import { channelCache } from '../modules/yt/channelCache'
     observer?: MutationObserver | null
   }>()
 
-  function dedupeOverlaysById(id: string, prefer?: HTMLElement | null) {
+  function dedupeOverlaysById(id: string, prefer?: HTMLElement | null, scope?: HTMLElement | null) {
     try {
-      const all = Array.from(document.querySelectorAll(`[data-wol-overlay="${CSS.escape(id)}"]`)) as HTMLElement[]
+      // Limit dedupe to a specific tile/container to allow per-tile overlays
+      let container: HTMLElement | Document = document
+      if (scope) container = scope
+      else if (prefer) {
+        // Try to find a stable tile container from the preferred element
+        const tc = (prefer.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null)
+        container = tc || document
+      }
+
+      const all = Array.from((container as Element | Document).querySelectorAll(`[data-wol-overlay="${CSS.escape(id)}"]`)) as HTMLElement[]
       if (all.length <= 1) return
       // Decide canonical element to keep
       let keep: HTMLElement | null = prefer || null
       if (!keep) {
-        // Prefer connected element from overlayState
+        // Prefer connected element from overlayState (may point to another tile; ignore if outside scope)
         const st = overlayState.get(id)
-        if (st && st.element?.isConnected) keep = st.element
+        if (st && st.element?.isConnected && (container === document || (container as Element).contains(st.element))) keep = st.element
       }
       if (!keep) {
         // Fallback to first connected element
@@ -2098,10 +2120,9 @@ import { channelCache } from '../modules/yt/channelCache'
         if (el === keep) continue
         try { el.remove() } catch {}
       }
-      // Sync overlayState to kept element
+      // If the kept element is the one tracked in overlayState, refresh timestamp
       const st = overlayState.get(id)
-      if (st && keep) {
-        st.element = keep
+      if (st && keep && st.element === keep) {
         st.lastSeen = Date.now()
         overlayState.set(id, st)
       }
@@ -4007,8 +4028,9 @@ import { channelCache } from '../modules/yt/channelCache'
     } else {
       logger.log('⚠️ Skipping global mutation observer on channel page to prevent lockups')
       // On channel pages, use scroll-based re-enhancement to catch newly loaded videos
-      scheduleEnhanceListings(1000) // Initial enhancement
-      scheduleEnhanceListings(2500) // Retry for slow-loading initial videos
+      // Start earlier, and still schedule a follow-up for slow initial renders
+      scheduleEnhanceListings(300)  // Initial enhancement (earlier)
+      scheduleEnhanceListings(1200) // Retry for slow-loading initial videos
 
       // Clean up old scroll handler if exists
       if (wolChannelScrollHandler) {
@@ -4023,9 +4045,9 @@ import { channelCache } from '../modules/yt/channelCache'
         scrollTimer = window.setTimeout(() => {
           if (location.pathname.includes('/@') || location.pathname.includes('/channel/') ||
               location.pathname.includes('/c/') || location.pathname.includes('/user/')) {
-            scheduleEnhanceListings(300)
+            scheduleEnhanceListings(120)
           }
-        }, 500)
+        }, 200)
       }
       window.addEventListener('scroll', wolChannelScrollHandler, { passive: true })
       logger.log('✅ Scroll-based enhancement enabled for channel page')
@@ -4092,6 +4114,26 @@ import { channelCache } from '../modules/yt/channelCache'
     try {
       const gen = overlayGeneration
       logger.log('🎨 enhanceVideoTilesOnListings START, gen:', gen, 'url:', location.href)
+      const runStart = performance.now()
+      const runUrl = window.location.href
+      const metrics: any = {
+        gen,
+        url: runUrl,
+        startAt: Date.now(),
+        page: { path: location.pathname },
+        pre: { totalAnchors: 0, filteredAnchors: 0, uniqueAnchors: 0 },
+        dedup: { before: 0, after: 0, duplicates: 0 },
+        counts: {
+          created: 0,
+          skippedAlreadyEnhanced: 0,
+          skipExistingOnHost: 0,
+          skipExistingGlobal: 0,
+          skipExistingInTile: 0,
+          skipExistingState: 0,
+          skipNoHost: 0
+        },
+        timing: { firstCreateMs: -1, totalMs: -1 }
+      }
 
       // Safety: prune any overlays from prior generations
       let prunedCount = 0
@@ -4117,7 +4159,10 @@ import { channelCache } from '../modules/yt/channelCache'
          const minGap = isWatch ? 600 : (isResults ? 400 : 300)
          // Allow immediate re-processing if URL changed
          if (now - lastEnhanceTime < minGap && currentUrl === lastEnhanceUrl) {
-           logger.log('⏳ Enhancement throttled, last run completed', now - lastEnhanceTime, 'ms ago')
+           const since = now - lastEnhanceTime
+           logger.log('⏳ Enhancement throttled, last run completed', since, 'ms ago')
+           overlayDbg(`[DEBUG] Throttle: sinceLast=${since}ms minGap=${minGap} urlSame=${currentUrl === lastEnhanceUrl}`)
+           perfDbg('Enhance throttled', { sinceMs: since, minGap, urlSame: currentUrl === lastEnhanceUrl, path: location.pathname })
            enhancementRunning = false
            return
          }
@@ -4381,6 +4426,11 @@ import { channelCache } from '../modules/yt/channelCache'
 
     overlayDbg(`[DEBUG] Found ${allAnchors.length} total anchors, ${filteredAnchors.length} after filtering, ${uniqueAnchors.length} unique anchors`)
     overlayDbg(`[DEBUG] Filtered out: hero=${filteredCount.hero}, playlist=${filteredCount.playlist}, playlistOnly=${filteredCount.playlistOnly}`)
+    try {
+      metrics.pre.totalAnchors = allAnchors.length
+      metrics.pre.filteredAnchors = filteredAnchors.length
+      metrics.pre.uniqueAnchors = uniqueAnchors.length
+    } catch {}
 
     const toProcess: { a: HTMLAnchorElement, id: string, type: 'video' | 'channel' }[] = []
     let skippedAlreadyEnhanced = 0
@@ -4389,6 +4439,7 @@ import { channelCache } from '../modules/yt/channelCache'
       // Skip anchors we already enhanced to avoid duplicate listeners/overlays
       if ((a as any).dataset && (a as any).dataset.wolEnhanced === 'done') {
         skippedAlreadyEnhanced++
+        try { (a as any).dataset.wolSkip = 'already-enhanced' } catch {}
         continue
       }
       const href = a.getAttribute('href') || ''
@@ -4504,6 +4555,12 @@ import { channelCache } from '../modules/yt/channelCache'
       }
     }
     let dedupedToProcess = Array.from(byId.values())
+    try {
+      metrics.dedup.before = toProcess.length
+      metrics.dedup.after = dedupedToProcess.length
+      metrics.dedup.duplicates = Math.max(0, (toProcess.length - dedupedToProcess.length))
+      if (metrics.dedup.duplicates > 0) overlayDbg(`[DEBUG] Dedup by id removed ${metrics.dedup.duplicates} duplicate anchors`)
+    } catch {}
 
     // Filter out videos where the best anchor is in #secondary on non-watch pages
     // These are likely from a hidden sidebar and shouldn't be processed
@@ -4731,14 +4788,19 @@ import { channelCache } from '../modules/yt/channelCache'
         if (gen !== overlayGeneration) break
       }
 
-      // EARLY GLOBAL DEDUPE: If an overlay for this id already exists anywhere (host or body-pinned),
-      // do not attempt to create another from this anchor.
+      // EARLY PER-TILE DEDUPE: allow one overlay per tile/container (not global)
       try {
-        const anyExisting = document.querySelector(`[data-wol-overlay="${id}"]`) as HTMLElement | null
-        if (anyExisting) { (a as any).dataset.wolEnhanced = 'done'; continue }
+        const containerRoot = (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null) || a.parentElement
+        if (containerRoot) {
+          const existingInTile = containerRoot.querySelector(`[data-wol-overlay="${id}"]`) as HTMLElement | null
+          if (existingInTile) { (a as any).dataset.wolEnhanced = 'done'; (a as any).dataset.wolSkip = 'existing-in-tile'; continue }
+        }
       } catch {}
 
       const res = resolvedLocal.get(`${type}:${id}`) ?? null
+      if ((OVERLAY_DEBUG || PERF_DEBUG) && !res && location.pathname !== '/results') {
+        overlayDbg('[DEBUG] unresolved id (no-target):', { id, type, key: `${type}:${id}` })
+      }
       // Results page: do not hide or remove result tiles. Settings only control overlay/button UI.
       // Any attributes previously used to hide are cleared elsewhere when toggles change.
       // For non-results pages we require a resolved target; for results page we may still
@@ -4759,6 +4821,10 @@ import { channelCache } from '../modules/yt/channelCache'
         }
       }
       if (!res && location.pathname !== '/results') {
+        try { (a as any).dataset.wolSkip = 'no-target' } catch {}
+        try { metrics.counts.skipNoTarget = (metrics.counts.skipNoTarget || 0) + 1 } catch {}
+        overlayDbg(`[DEBUG] Skipping ${id} - no Odysee target yet (will appear after resolve/cache)`)
+        ;(a as any).dataset.wolEnhanced = 'done'
         continue
       }
 
@@ -5240,6 +5306,8 @@ import { channelCache } from '../modules/yt/channelCache'
          host = gridShelfItem || gridShelf || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media') as HTMLElement | null) || (a as unknown as HTMLElement)
          if (!host) {
            overlayDbg(`[DEBUG] Skipping ${id} - no host element found for anchor:`, a.href, a.closest('*')?.tagName)
+           try { (a as any).dataset.wolSkip = 'no-host' } catch {}
+           try { metrics.counts.skipNoHost++ } catch {}
            continue
          }
        }
@@ -5700,6 +5768,8 @@ import { channelCache } from '../modules/yt/channelCache'
         // Update the existing overlay's lastSeen timestamp
         existingOverlay.lastSeen = Date.now()
           ; (a as any).dataset.wolEnhanced = 'done'
+        try { (a as any).dataset.wolSkip = 'existing-on-host' } catch {}
+        try { metrics.counts.skipExistingOnHost++ } catch {}
         continue
       }
 
@@ -5716,7 +5786,11 @@ import { channelCache } from '../modules/yt/channelCache'
           if (isProperlyAttached) {
             // Overlay is good, skip recreation
             overlayDbg(`[DEBUG] Overlay ${id} already exists on this host, skipping`)
-            ; (a as any).dataset.wolEnhanced = 'done'; continue
+            ; (a as any).dataset.wolEnhanced = 'done';
+            try { (a as any).dataset.wolSkip = 'existing-on-host' } catch {}
+            try { metrics.counts.skipExistingOnHost++ } catch {}
+            overlayDbg(`[DEBUG] Skipping ${id} - existing overlay on same host`)
+            continue
           } else {
             // Overlay exists but is disconnected or not visible - remove it and recreate
             already.remove()
@@ -5724,26 +5798,32 @@ import { channelCache } from '../modules/yt/channelCache'
           }
         }
 
-        // CRITICAL: Check if overlay exists elsewhere in the document (prevents duplicates from multiple anchors)
-        // This can happen when YouTube has multiple anchor elements for the same video
-        const existingGlobal = document.querySelector(`[data-wol-overlay="${id}"]`) as HTMLElement | null
-        if (existingGlobal && existingGlobal !== already) {
-          if (existingGlobal.isConnected) {
-            // A valid overlay exists elsewhere (body or another host). Do not recreate or reattach.
-            ; (a as any).dataset.wolEnhanced = 'done'
-            try { dedupeOverlaysById(id, existingGlobal) } catch {}
-            continue
-          } else {
-            // Existing global overlay is disconnected or invisible, remove it
-            try { existingGlobal.remove() } catch {}
+        // PER-TILE CHECK: if an overlay for this id exists inside the same tile/container, skip creating another
+        try {
+          const containerRoot = (tileContainer || host.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null) || host.parentElement
+          if (containerRoot) {
+            const existingInTile = containerRoot.querySelector(`[data-wol-overlay="${id}"]`) as HTMLElement | null
+            if (existingInTile && existingInTile !== already && existingInTile.isConnected) {
+              ; (a as any).dataset.wolEnhanced = 'done'
+              try { (a as any).dataset.wolSkip = 'existing-in-tile' } catch {}
+              try { metrics.counts.skipExistingInTile = (metrics.counts.skipExistingInTile || 0) + 1 } catch {}
+              try { dedupeOverlaysById(id, existingInTile, containerRoot) } catch {}
+              continue
+            }
           }
-        }
+        } catch {}
 
-        // Also check overlayState to see if we already have an overlay for this video
+        // Also check overlayState; only skip if the tracked overlay is inside the same tile container
         const existingState = overlayState.get(id)
         if (existingState && existingState.generation === gen) {
-          if (existingState.element.isConnected && existingState.element.offsetWidth > 0) {
-            ; (a as any).dataset.wolEnhanced = 'done'; continue
+          const containerRoot2 = (tileContainer || host.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null) || host.parentElement
+          const inSameTile = !!(containerRoot2 && containerRoot2.contains(existingState.element))
+          if (inSameTile && existingState.element.isConnected && existingState.element.offsetWidth > 0) {
+            ; (a as any).dataset.wolEnhanced = 'done';
+            try { (a as any).dataset.wolSkip = 'existing-state' } catch {}
+            try { metrics.counts.skipExistingState++ } catch {}
+            overlayDbg(`[DEBUG] Skipping ${id} - overlay exists in same tile (existing-state)`)
+            continue
           }
         }
       } catch {}
@@ -5832,14 +5912,36 @@ import { channelCache } from '../modules/yt/channelCache'
         observer: mo
       })
 
+      try {
+        if (metrics.timing.firstCreateMs === -1) metrics.timing.firstCreateMs = Math.round(performance.now() - runStart)
+        metrics.counts.created++
+      } catch {}
+
       // Append to thumbnail host to ensure initial placement inside the thumbnail
       if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
 
       if (mount.parentElement !== host) {
         host.appendChild(mount)
       }
+      overlayDbg(`[DEBUG] Created overlay ${id} (${type})`)
       // Mounted; no extra dedupe needed here (handled by pin/unpin and global checks)
       // Avoid extra hover listeners on results; rely on host mouseenter handler above
+
+      // Channel pages reflow tiles shortly after paint; lightly re-ensure visibility
+      try {
+        if (isChannelPage) {
+          const reattach = () => {
+            try {
+              if (!mount.isConnected) return
+              if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
+              if (mount.parentElement !== host) host.appendChild(mount)
+              ensureOverlayVisibility()
+            } catch {}
+          }
+          setTimeout(reattach, 250)
+          setTimeout(reattach, 800)
+        }
+      } catch {}
 
       // Watch-page related sidebar: container-level batch reveal
       if (isWatchPageForBatch && isRelatedContext && !relatedBatchRevealed) {
@@ -5888,6 +5990,16 @@ import { channelCache } from '../modules/yt/channelCache'
       // Update throttle timer AFTER work completes (not at start)
       // This allows mutation observer to trigger re-enhancement soon after initial processing
       lastEnhanceTime = Date.now()
+      try {
+        metrics.counts.skippedAlreadyEnhanced = skippedAlreadyEnhanced
+        metrics.timing.totalMs = Math.round(performance.now() - runStart)
+        ;(window as any).__wolOverlayRunStats = Array.isArray((window as any).__wolOverlayRunStats) ? (window as any).__wolOverlayRunStats : []
+        const arr = (window as any).__wolOverlayRunStats as any[]
+        arr.push(metrics)
+        while (arr.length > 20) arr.shift()
+        overlayDbg('[METRICS] Overlay enhancement run summary:', metrics)
+        perfDbg('Overlay enhance totals:', { path: location.pathname, created: metrics.counts.created, skippedAlreadyEnhanced, totalMs: metrics.timing.totalMs, firstCreateMs: metrics.timing.firstCreateMs })
+      } catch {}
 
       // Retry logic for channel pages: if we found very few videos on initial load,
       // YouTube might still be rendering. Retry a few times with increasing delays.

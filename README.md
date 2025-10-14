@@ -56,6 +56,18 @@ The extension will be installed, and will stay installed until you restart Firef
 
 Go to YouTube in your browser. When you load a video or channel, it will detect if it's also uploaded to the Odysee and the it will move you to odysee.com so you can watch the video on Odysee
 
+## Debugging (overlay timing and placement)
+
+If overlays on channel pages appear slowly or some tiles miss overlays, you can enable debug logs in the YouTube tab’s DevTools console:
+
+- Enable verbose logs: `localStorage.wolDebug = '1'`
+- Enable overlay-specific logs: `localStorage.wolOverlayDebug = '1'`
+- Enable perf summaries: `localStorage.wolPerfDebug = '1'`
+
+Reload the page. Look for `[WOL-Overlay]` and `[WOL-Perf]` logs. Each overlay pass also stores a compact summary in `window.__wolOverlayRunStats` (last 20 runs) that you can inspect.
+
+Disable logging by setting these keys to `'0'` (or removing them) and refreshing the page.
+
 ## Contributing
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
 
