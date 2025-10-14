@@ -615,6 +615,16 @@ import { channelCache } from '../modules/yt/channelCache'
                 // Disconnect any observers tied to channel renderers; clear state
                 triggerCleanupResultsChannelButtons()
                 triggerCleanupResultsVideoChips()
+                // Belt-and-suspenders: run a second sweep shortly after to catch any late reinserts
+                setTimeout(() => {
+                  try {
+                    document.querySelectorAll('a[data-wol-inline-channel]').forEach(el => el.remove())
+                    document.querySelectorAll('[data-wol-results-channel-btn]').forEach(el => el.remove())
+                    document.querySelectorAll('ytd-channel-renderer[data-wol-channel-button]')
+                      .forEach(el => (el as HTMLElement).removeAttribute('data-wol-channel-button'))
+                    enforceResultsChannelChipVisibility()
+                  } catch {}
+                }, 200)
                 // Shorts subscribe mount cleanup
                 try { render(<WatchOnOdyseeButtons />, shortsSubscribeMountPoint) } catch {}
                 // Strict enforcement: remove any stray chips
@@ -5233,7 +5243,9 @@ import { channelCache } from '../modules/yt/channelCache'
       const gridVideo = a.closest('ytd-grid-video-renderer') as HTMLElement | null
       const richGridMedia = a.closest('ytd-rich-grid-media') as HTMLElement | null
       const reelItem = a.closest('ytd-reel-item-renderer') as HTMLElement | null
-      const shortsLockup = a.closest('ytd-shorts-lockup-view-model') as HTMLElement | null
+      const shortsLockup = (a.closest('ytd-shorts-lockup-view-model') as HTMLElement | null)
+        || (a.closest('ytm-shorts-lockup-view-model') as HTMLElement | null)
+        || (a.closest('ytm-shorts-lockup-view-model-v2') as HTMLElement | null)
 
       // Detect if this tile is a Shorts tile regardless of current page path
       let isShortsHref = false
@@ -5257,12 +5269,21 @@ import { channelCache } from '../modules/yt/channelCache'
         const innerThumb = thumb.querySelector('#thumbnail') as HTMLElement | null
         host = innerThumb || thumb
       }
-      // Shorts reels without ytd-thumbnail: target reel item thumbnail or the reel item itself
+      // Shorts reels without ytd-thumbnail: target reel item thumbnail
       if (isShortsTile && !host && reelItem) {
         host = (reelItem.querySelector('#thumbnail') as HTMLElement | null)
           || (reelItem.querySelector('a#thumbnail') as HTMLElement | null)
           || (reelItem.querySelector('[id*="thumbnail"], .ytReelItemRendererThumbnail') as HTMLElement | null)
-          || reelItem
+          || null
+      }
+      // Shorts lockup tiles (ytm-shorts-lockup-view-model/v2)
+      if (isShortsTile && !host && shortsLockup) {
+        const root = shortsLockup as HTMLElement
+        host = (root.querySelector('.shortsLockupViewModelHostThumbnailContainer') as HTMLElement | null)
+          || (root.querySelector('.shortsLockupViewModelHostThumbnailParentContainer') as HTMLElement | null)
+          || (root.querySelector('img.shortsLockupViewModelHostThumbnail') as HTMLElement | null)
+          || (root.querySelector('img.ytCoreImageHost') as HTMLElement | null)
+          || null
       }
       // 2. Standard thumbnail handling for non-Shorts pages
       else if (thumb) {
@@ -5322,6 +5343,15 @@ import { channelCache } from '../modules/yt/channelCache'
         const lockupVm = a.closest('yt-lockup-view-model') as HTMLElement | null
         const lockupWiz = a.closest('.yt-lockup-view-model-wiz') as HTMLElement | null
         if (!tileContainer) tileContainer = (lockupVm || lockupWiz || lockupAnchor || ytThumbVM || host) as HTMLElement | null
+        // If we still don't have a host but have a lockup tile, look for an image area inside the tile
+        if (!host && (lockupVm || lockupWiz)) {
+          const root = (lockupVm || lockupWiz) as HTMLElement
+          const imgHost = (root.querySelector('.yt-lockup-view-model__content-image, .yt-lockup-view-model-wiz__content-image') as HTMLElement | null)
+            || (root.querySelector('yt-thumbnail-view-model .ytThumbnailViewModelImage') as HTMLElement | null)
+            || (root.querySelector('img.ytCoreImageHost') as HTMLElement | null)
+            || (root.querySelector('ytd-thumbnail #thumbnail, a#thumbnail') as HTMLElement | null)
+          if (imgHost) host = imgHost
+        }
       }
 
              // Prefer stable containers on /results page that survive hover autoplay
@@ -5356,10 +5386,17 @@ import { channelCache } from '../modules/yt/channelCache'
 
        // 5. No safe host found; skip to avoid misplacement (e.g., Play All)
        if (!host) {
+         // Special case: Shorts tiles without a visible thumbnail container — skip instead of mounting over title
+         if (isShortsTile) {
+           overlayDbg(`[DEBUG] Skipping ${id} (shorts) - no thumbnail host found in reel/lockup`)
+           ;(a as any).dataset.wolEnhanced = 'done'
+           try { (a as any).dataset.wolSkip = 'no-host-shorts' } catch {}
+           continue
+         }
          // Last-resort fallback: prefer visible tile container vs. anchor to avoid text spill
          const gridShelfItem = a.closest('[class*="ytGridShelfViewModelGridShelfItem"]') as HTMLElement | null
          const gridShelf = a.closest('yt-grid-shelf-view-model-wiz') as HTMLElement | null
-         host = gridShelfItem || gridShelf || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media') as HTMLElement | null) || (a as unknown as HTMLElement)
+         host = gridShelfItem || gridShelf || (a.closest('yt-lockup-view-model') as HTMLElement | null) || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media') as HTMLElement | null) || (a as unknown as HTMLElement)
          if (!host) {
            overlayDbg(`[DEBUG] Skipping ${id} - no host element found for anchor:`, a.href, a.closest('*')?.tagName)
            try { (a as any).dataset.wolSkip = 'no-host' } catch {}
@@ -5524,6 +5561,7 @@ import { channelCache } from '../modules/yt/channelCache'
               }
               if (preferredHost && mount.parentElement !== preferredHost) {
                 preferredHost.appendChild(mount)
+                try { const scope = (tileContainer || preferredHost.closest('ytd-video-renderer, ytd-compact-video-renderer, ytd-rich-grid-media') as HTMLElement | null) || preferredHost; dedupeOverlaysById(id, mount, scope as HTMLElement) } catch {}
               }
               ensureOverlayVisibility()
               return
@@ -5540,6 +5578,7 @@ import { channelCache } from '../modules/yt/channelCache'
               stableContainer.style.position = stableContainer.style.position || 'relative'
               if (mount.parentElement !== stableContainer) {
                 try { stableContainer.appendChild(mount) } catch {}
+                try { dedupeOverlaysById(id, mount, stableContainer) } catch {}
               }
               // Setup a short-lived MutationObserver while hovered to keep overlay on top
               const startHoverObserver = () => {
@@ -5550,7 +5589,10 @@ import { channelCache } from '../modules/yt/channelCache'
                   if (now - lastEnsure < 60) return
                   lastEnsure = now
                   try {
-                    if (mount.parentElement !== stableContainer) stableContainer.appendChild(mount)
+                    if (mount.parentElement !== stableContainer) {
+                      stableContainer.appendChild(mount)
+                      try { dedupeOverlaysById(id, mount, stableContainer) } catch {}
+                    }
                   } catch {}
                   ensureOverlayVisibility()
                 })
@@ -5561,29 +5603,36 @@ import { channelCache } from '../modules/yt/channelCache'
               }
               startHoverObserver()
 
-              // While on results, float the overlay as a fixed element so it stays above
-              // the autoplay preview regardless of DOM reparenting.
-              const preferred = (stableContainer.querySelector('a.yt-simple-endpoint.inline-block.style-scope.ytd-thumbnail, a#thumbnail.yt-simple-endpoint, ytd-thumbnail #thumbnail, #thumbnail') as HTMLElement | null) || host
-              // Compute frozen screen position once to prevent visible shifting during preview animation
-              let frozenTop = 0, frozenLeft = 0
-              const computeFrozen = () => {
-                try {
-                  const baseEl = (preferred && (preferred.offsetWidth || preferred.offsetHeight)) ? preferred : stableContainer
-                  const r = baseEl.getBoundingClientRect()
-                  frozenTop = Math.max(0, r.bottom - 26)
-                  frozenLeft = Math.max(0, r.left + 6)
-                } catch {}
+              // Only float-to-body on results pages; on watch keep overlay within the tile
+              if (isResultsPage) {
+                const preferred = (stableContainer.querySelector('a.yt-simple-endpoint.inline-block.style-scope.ytd-thumbnail, a#thumbnail.yt-simple-endpoint, ytd-thumbnail #thumbnail, #thumbnail') as HTMLElement | null) || host
+                // Compute frozen screen position once to prevent visible shifting during preview animation
+                let frozenTop = 0, frozenLeft = 0
+                const computeFrozen = () => {
+                  try {
+                    const baseEl = (preferred && (preferred.offsetWidth || preferred.offsetHeight)) ? preferred : stableContainer
+                    const r = baseEl.getBoundingClientRect()
+                    frozenTop = Math.max(0, r.bottom - 26)
+                    frozenLeft = Math.max(0, r.left + 6)
+                  } catch {}
+                }
+                computeFrozen()
+                const reposition = () => {
+                  try {
+                    mount.style.setProperty('position', 'fixed', 'important')
+                    mount.style.top = `${frozenTop}px`
+                    mount.style.left = `${frozenLeft}px`
+                    mount.style.bottom = 'auto'
+                  } catch {}
+                }
+                if (mount.parentElement !== document.body) document.body.appendChild(mount)
+                reposition()
+                // Keep it updated while hovered
+                const rafTick = () => { computeFrozen(); reposition() }
+                try { requestAnimationFrame(rafTick) } catch {}
+              } else {
+                ensureOverlayVisibility()
               }
-              computeFrozen()
-              const reposition = () => {
-                try {
-                  mount.style.setProperty('position', 'fixed', 'important')
-                  mount.style.top = `${frozenTop}px`
-                  mount.style.left = `${frozenLeft}px`
-                  mount.style.bottom = 'auto'
-                } catch {}
-              }
-              if (mount.parentElement !== document.body) document.body.appendChild(mount)
               reposition()
               const onScroll = () => updateOnViewportChange()
               try { window.addEventListener('scroll', onScroll, true) } catch {}
@@ -5856,7 +5905,7 @@ import { channelCache } from '../modules/yt/channelCache'
 
         // PER-TILE CHECK: if an overlay for this id exists inside the same tile/container, skip creating another
         try {
-          const containerRoot = (tileContainer || host.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null) || host.parentElement
+          const containerRoot = (tileContainer || host.closest('yt-lockup-view-model, .yt-lockup-view-model-wiz, ytm-shorts-lockup-view-model, ytm-shorts-lockup-view-model-v2, ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null) || host.parentElement
           if (containerRoot) {
             const existingInTile = containerRoot.querySelector(`[data-wol-overlay="${id}"]`) as HTMLElement | null
             if (existingInTile && existingInTile !== already && existingInTile.isConnected) {
@@ -5921,7 +5970,7 @@ import { channelCache } from '../modules/yt/channelCache'
             if (gen !== overlayGeneration) { try { mo?.disconnect() } catch {} ; return }
 
             // If original host is gone or no longer contains mount, try to locate a fresh host within the tile
-            const containerRoot = tileContainer || host.parentElement || (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null)
+        const containerRoot = tileContainer || host.parentElement || (a.closest('ytm-shorts-lockup-view-model, ytm-shorts-lockup-view-model-v2, ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null)
 
             if (!host.isConnected || (containerRoot && !containerRoot.contains(host))) {
               let newHost: HTMLElement | null = null
@@ -6035,6 +6084,12 @@ import { channelCache } from '../modules/yt/channelCache'
 
       // Ensure visible immediately elsewhere
       ensureOverlayVisibility()
+
+      // Final guard: dedupe inside the current tile/container to prevent rare races creating duplicates
+      try {
+        const containerRootFinal = (tileContainer || host.closest('yt-lockup-view-model, .yt-lockup-view-model-wiz, ytm-shorts-lockup-view-model, ytm-shorts-lockup-view-model-v2, ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null) || host.parentElement
+        if (containerRootFinal) dedupeOverlaysById(id, mount, containerRootFinal)
+      } catch {}
 
       // Avoid aggressive re-attachment loops; rely on cleanup + re-enhance instead
       ; (a as any).dataset.wolEnhanced = 'done'
