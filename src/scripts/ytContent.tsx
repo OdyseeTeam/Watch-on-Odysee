@@ -4520,7 +4520,7 @@ import { channelCache } from '../modules/yt/channelCache'
 
     if (toProcess.length === 0) return
 
-    // De-duplicate by resolved id to avoid processing the same video twice (thumbnail + title, etc.)
+    // De-duplicate per tile: allow multiple tiles for same id, but keep only one anchor per tile (thumbnail > title, etc.)
     const scoreAnchor = (a: HTMLAnchorElement): number => {
       let s = 0
       // Highest priority: anchors in secondary/related sections ONLY on watch pages
@@ -4535,7 +4535,25 @@ import { channelCache } from '../modules/yt/channelCache'
       if (a.closest('#dismissible')) s += 4
       return s
     }
-    const byId = new Map<string, { a: HTMLAnchorElement, id: string, type: 'video' | 'channel' }>()
+    // Identify a stable tile container for each anchor
+    const getTileContainerForAnchor = (a: HTMLAnchorElement): HTMLElement | null => (
+      (a.closest('ytd-video-renderer, ytd-grid-video-renderer, ytd-rich-grid-media, ytd-reel-item-renderer, ytd-shorts-lockup-view-model, ytd-rich-item-renderer, ytd-compact-video-renderer') as HTMLElement | null)
+      || (a.closest('yt-lockup-view-model, .yt-lockup-view-model-wiz') as HTMLElement | null)
+      || (a.closest('ytd-thumbnail') as HTMLElement | null)
+      || (a.parentElement as HTMLElement | null)
+    )
+    let tileKeyCounter = 0
+    const getTileKey = (tile: HTMLElement | null): string => {
+      if (!tile) return 'no-tile'
+      const k = tile.getAttribute('data-wol-tile-key')
+      if (k) return k
+      const nk = String(++tileKeyCounter)
+      try { tile.setAttribute('data-wol-tile-key', nk) } catch {}
+      return nk
+    }
+
+    // Deduplicate per (videoId, tileKey)
+    const byIdInTile = new Map<string, { a: HTMLAnchorElement, id: string, type: 'video' | 'channel' }>()
     for (const item of toProcess) {
       // CRITICAL FIX: Check generation during dedup to abort if navigation happened
       if (gen !== overlayGeneration) {
@@ -4543,18 +4561,21 @@ import { channelCache } from '../modules/yt/channelCache'
         return
       }
 
-      const prev = byId.get(item.id)
+      const tile = getTileContainerForAnchor(item.a)
+      const tileKey = getTileKey(tile)
+      const compositeKey = `${item.id}::${tileKey}`
+      const prev = byIdInTile.get(compositeKey)
       if (!prev) {
-        byId.set(item.id, item)
+        byIdInTile.set(compositeKey, item)
       } else {
         const ns = scoreAnchor(item.a)
         const ps = scoreAnchor(prev.a)
         if (ns > ps) {
-          byId.set(item.id, item)
+          byIdInTile.set(compositeKey, item)
         }
       }
     }
-    let dedupedToProcess = Array.from(byId.values())
+    let dedupedToProcess = Array.from(byIdInTile.values())
     try {
       metrics.dedup.before = toProcess.length
       metrics.dedup.after = dedupedToProcess.length
@@ -5940,6 +5961,22 @@ import { channelCache } from '../modules/yt/channelCache'
           }
           setTimeout(reattach, 250)
           setTimeout(reattach, 800)
+          // Short-lived IntersectionObserver to re-ensure when tile enters viewport during scroll
+          try {
+            const io = new IntersectionObserver((entries) => {
+              if (gen !== overlayGeneration) return
+              if (!entries || entries.length === 0) return
+              const anyIntersecting = entries.some(e => (e as any).isIntersecting)
+              if (!anyIntersecting) return
+              try {
+                if (getComputedStyle(host).position === 'static') host.style.position = 'relative'
+                if (!host.contains(mount)) host.appendChild(mount)
+                ensureOverlayVisibility()
+              } catch {}
+            }, { root: null, threshold: 0.01 })
+            try { io.observe(host) } catch {}
+            setTimeout(() => { try { io.disconnect() } catch {} }, 3000)
+          } catch {}
         }
       } catch {}
 
@@ -5975,11 +6012,30 @@ import { channelCache } from '../modules/yt/channelCache'
       const ovType = ov.element.getAttribute('data-wol-type') || 'video'
       const ovIdAttr = ov.element.getAttribute('data-wol-id') || ov.videoId
       const ovKey = `${ovType}:${ovIdAttr}`
-      // Remove only if overlay is from a prior generation or detached from DOM
-      if (ov.generation !== gen || !ov.element.isConnected) {
+      // Remove if overlay is from a prior generation; avoid flicker by not removing just because it's momentarily detached on channel pages
+      if (ov.generation !== gen) {
         try { ov.observer?.disconnect() } catch {}
-        ov.element.remove()
+        try { ov.element.remove() } catch {}
         overlayState.delete(key)
+        continue
+      }
+      // If detached, skip removal on channel pages (YouTube often reflows tiles during scroll)
+      if (!ov.element.isConnected) {
+        const isChannelPg = location.pathname.includes('/@') || location.pathname.includes('/channel/') || location.pathname.includes('/c/') || location.pathname.includes('/user/')
+        if (isChannelPg) {
+          // Try to re-attach to its host; channel pages frequently reflow tiles during scroll
+          try {
+            const h = (ov as any).host as HTMLElement | undefined
+            if (h && h.isConnected) {
+              if (getComputedStyle(h).position === 'static') h.style.position = 'relative'
+              h.appendChild(ov.element)
+            }
+          } catch {}
+        } else {
+          try { ov.observer?.disconnect() } catch {}
+          try { ov.element.remove() } catch {}
+          overlayState.delete(key)
+        }
         continue
       }
       // If overlay corresponds to a still-visible tile in this pass, refresh lastSeen
