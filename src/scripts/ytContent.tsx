@@ -188,6 +188,11 @@ import { channelCache } from '../modules/yt/channelCache'
     return cleanupResultsVideoChips(options).catch(e => { logger.error('Cleanup video chips failed:', e) })
   }
 
+  // Results: cleanup inline watch pills to avoid stale pills carrying across SPA searches
+  function triggerCleanupResultsWatchPills(): Promise<void> {
+    return cleanupResultsWatchPills().catch(e => { logger.error('Cleanup results watch pills failed:', e) })
+  }
+
   // Global mutation observer for video tile enhancement
   let wolMutationObserver: MutationObserver | null = null
   // Navigation polling interval
@@ -440,6 +445,8 @@ import { channelCache } from '../modules/yt/channelCache'
       triggerCleanupResultsChannelButtons().catch(e => logger.error('Cleanup channel buttons failed:', e))
       // Full cleanup of inline chips on navigation to avoid stale channel links
       triggerCleanupResultsVideoChips().catch(e => logger.error('Cleanup chips failed:', e))
+      // Also clear any results Watch pills to avoid SPA carry-over
+      triggerCleanupResultsWatchPills().catch(e => logger.error('Cleanup results watch pills failed:', e))
 
       // Immediately clear any page-level buttons to avoid showing stale targets during nav
       try { updateButtons(null) } catch {}
@@ -2390,6 +2397,17 @@ import { channelCache } from '../modules/yt/channelCache'
           try { vr.querySelectorAll('[data-wol-inline-channel]').forEach(el => el.remove()) } catch {}
         }
         if ((i + 1) % 15 === 0) await idleYield(30)
+      }
+    } catch {}
+  }
+
+  // Cleanup helper for results watch pills (video renderer)
+  async function cleanupResultsWatchPills(): Promise<void> {
+    try {
+      const pills = Array.from(document.querySelectorAll('ytd-video-renderer a[data-wol-inline-watch], .ytGridShelfViewModelGridShelfItem a[data-wol-inline-shorts-watch]')) as HTMLElement[]
+      for (let i = 0; i < pills.length; i++) {
+        try { pills[i].remove() } catch {}
+        if ((i + 1) % 20 === 0) await idleYield(20)
       }
     } catch {}
   }
@@ -4593,12 +4611,13 @@ import { channelCache } from '../modules/yt/channelCache'
       })
     }
 
-    // OPTIMIZATION: On /results pages, we already know which videos have Odysee targets from resolvedLocal
-    // Filter to only process videos that have targets - no point processing videos that don't exist on Odysee
+    // Results page gating: only skip items explicitly known to have no target
+    // Do not require a cache hit up front; allow this pass to resolve and inject immediately.
     if (location.pathname === '/results') {
       dedupedToProcess = dedupedToProcess.filter(item => {
         const key = `${item.type}:${item.id}`
-        return resolvedLocal.has(key) && resolvedLocal.get(key) !== null
+        // Keep if not in cache yet; skip only if cache says null
+        return !resolvedLocal.has(key) || resolvedLocal.get(key) !== null
       })
     }
 
@@ -4861,11 +4880,27 @@ import { channelCache } from '../modules/yt/channelCache'
             const videoRenderer = a.closest('ytd-video-renderer') as HTMLElement | null
             if (videoRenderer) {
               // 1) Inline "Watch on Odysee" pill to the right of the title/menu
-              if (settings.buttonVideoSub && url && !videoRenderer.querySelector('[data-wol-inline-watch]')) {
+              // If an existing pill is present for a different video id, update it in place
+              if (settings.buttonVideoSub && url) {
+                const existingWatch = videoRenderer.querySelector('a[data-wol-inline-watch]') as HTMLAnchorElement | null
+                if (existingWatch) {
+                  const existingId = existingWatch.getAttribute('data-wol-id')
+                  if (existingId && existingId !== id) {
+                    try {
+                      existingWatch.href = url.href
+                      existingWatch.setAttribute('data-wol-id', id)
+                      existingWatch.title = `Watch on ${platform.button.platformNameText}`
+                      if (WOL_DEBUG) dbg('WOL results inline watch updated', { from: existingId, to: id })
+                    } catch {}
+                  }
+                }
+              }
+              if (settings.buttonVideoSub && url && !videoRenderer.querySelector('a[data-wol-inline-watch]')) {
                 const titleWrapper = (videoRenderer.querySelector('#title-wrapper') as HTMLElement | null) || (videoRenderer.querySelector('#meta') as HTMLElement | null) || videoRenderer
                 const menu = videoRenderer.querySelector('#menu') as HTMLElement | null
                 const btn = document.createElement('a')
                 btn.setAttribute('data-wol-inline-watch', '1')
+                btn.setAttribute('data-wol-id', id)
                 btn.href = url.href
                 btn.target = '_blank'
                 btn.title = `Watch on ${platform.button.platformNameText}`
