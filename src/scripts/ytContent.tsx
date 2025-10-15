@@ -193,6 +193,31 @@ import { channelCache } from '../modules/yt/channelCache'
     return cleanupResultsWatchPills().catch(e => { logger.error('Cleanup results watch pills failed:', e) })
   }
 
+  // Ensure anchor clicks always use the element's current href (avoids stale closures)
+  function ensureAnchorOpensWithCurrentHref(anchor: HTMLAnchorElement) {
+    try {
+      if ((anchor as any).dataset?.wolClickCap === '1') return
+      anchor.addEventListener('click', (e) => {
+        try { e.preventDefault() } catch {}
+        try { e.stopImmediatePropagation() } catch {}
+        try { e.stopPropagation() } catch {}
+        try {
+          const hrefNow = (e.currentTarget as HTMLAnchorElement)?.href || anchor.getAttribute('href') || ''
+          if (hrefNow) {
+            const u = new URL(hrefNow, location.origin)
+            openNewTab(u, 'user')
+          }
+        } catch {}
+      }, { capture: true })
+      ;(anchor as any).dataset.wolClickCap = '1'
+    } catch {}
+  }
+
+  // Results pill debug helper (only logs when wolDebug=1)
+  function rd(action: string, info: any) {
+    try { if (WOL_DEBUG) logger.log(`[RESULTS][PILL] ${action}`, info) } catch {}
+  }
+
   // Global mutation observer for video tile enhancement
   let wolMutationObserver: MutationObserver | null = null
   // Navigation polling interval
@@ -208,6 +233,8 @@ import { channelCache } from '../modules/yt/channelCache'
   let relatedBatchOverlayCount = 0
   // Guard flag to prevent concurrent enhancement runs
   let enhancementRunning = false
+  // Cooperative cancellation token for enhancement runs across SPA navigations
+  let currentEnhanceRun = 0
 
   // Ensure a global stylesheet exists to keep overlays visible above YouTube hover/previews
   function ensureOverlayCssInjected() {
@@ -329,6 +356,8 @@ import { channelCache } from '../modules/yt/channelCache'
   let navigationLastHref = window.location.href
   // Guard flag to prevent concurrent navigation handlers
   let navigationHandlerRunning = false
+  // Quiet window to suppress fallback nav handling right after real yt-navigate events
+  let navigationQuietUntil = 0
 
   // Hook into YouTube SPA navigation events when available
   try {
@@ -369,6 +398,9 @@ import { channelCache } from '../modules/yt/channelCache'
       overlayGeneration++
       overlayGenerationBumpedAt = Date.now()
       logger.log('⬆️ Bumped generation to', overlayGeneration)
+      // Cancel any in-flight enhancement and allow a fresh run
+      try { enhancementRunning = false } catch {}
+      try { currentEnhanceRun++ } catch {}
 
       // Reset per-results caches/maps to avoid stale chips/buttons across channel/search changes
       try {
@@ -429,6 +461,12 @@ import { channelCache } from '../modules/yt/channelCache'
           entries.slice(-150).forEach(([k, v]) => ytUrlToUCPageCache.set(k, v))
           logger.log('🗑️ Trimmed ytUrlToUCPageCache from', entries.length, 'to 150 entries')
         }
+        // Reset results chips run state to avoid suppressing injections after navigation
+        resultsVideoChipRunning = false
+        resultsVideoChipPendingRerun = false
+        lastResultsChipsSig = ''
+        lastResultsChipsAt = 0
+        resultsChipsQuietUntil = 0
         logger.log('💾 Preserved caches: UC=', ucResolvePageCache.size, 'handles=', handleResolvePageCache.size, 'ytUrls=', ytUrlResolvePageCache.size, 'handle→UC=', handleToUCPageCache.size, 'ytUrl→UC=', ytUrlToUCPageCache.size)
       } catch {}
       logger.log('🧽 Cleared results caches (resolvedLocal, initialData mappings, retries)')
@@ -494,6 +532,7 @@ import { channelCache } from '../modules/yt/channelCache'
         logger.log('✅ Navigation handler complete, returning control to browser')
       } finally {
         navigationHandlerRunning = false
+        try { navigationQuietUntil = Date.now() + 2500 } catch {}
       }
     }
     document.addEventListener('yt-navigate-finish', bumpGen as EventListener)
@@ -754,6 +793,26 @@ import { channelCache } from '../modules/yt/channelCache'
   shortsSideButtonMountPoint.style.zIndex = '10'
   const shortsSubscribeMountPoint = document.createElement('div')
   shortsSubscribeMountPoint.style.display = 'inline-flex'
+
+  // Ensure Shorts-specific inline styles don't leak when navigating to regular watch pages
+  function resetPlayerButtonStylesForWatchControls() {
+    try {
+      // Remove all inline styles applied on Shorts (absolute positioning etc.)
+      playerButtonMountPoint.removeAttribute('style')
+      // Keep a sane default so it participates in the control bar layout
+      playerButtonMountPoint.style.display = 'inline-flex'
+      playerButtonMountPoint.style.alignItems = 'center'
+      playerButtonMountPoint.style.pointerEvents = 'auto'
+      // Clear any positioning attributes left over just in case
+      ;(playerButtonMountPoint.style as any).position = ''
+      ;(playerButtonMountPoint.style as any).right = ''
+      ;(playerButtonMountPoint.style as any).bottom = ''
+      ;(playerButtonMountPoint.style as any).top = ''
+      ;(playerButtonMountPoint.style as any).left = ''
+      ;(playerButtonMountPoint.style as any).zIndex = ''
+      ;(playerButtonMountPoint.style as any).transform = ''
+    } catch {}
+  }
 
   // Default pill height used as a safe fallback when reference height is not yet measurable
   const DEFAULT_PILL_HEIGHT = 36
@@ -1081,12 +1140,15 @@ import { channelCache } from '../modules/yt/channelCache'
           }
         } else {
           const mountPlayerButtonBefore = settings.buttonVideoPlayer ? document.querySelector(params.source.platform.htmlQueries.mountPoints.mountPlayerButtonBefore) : null
-      if (!mountPlayerButtonBefore) render(<WatchOnOdyseePlayerButton />, playerButtonMountPoint)
-      else {
-        if (playerButtonMountPoint.getAttribute('data-id') !== params.source.id) {
-          mountPlayerButtonBefore.parentElement?.insertBefore(playerButtonMountPoint, mountPlayerButtonBefore)
-          playerButtonMountPoint.setAttribute('data-id', params.source.id)
-        }
+          if (!mountPlayerButtonBefore) {
+            render(<WatchOnOdyseePlayerButton />, playerButtonMountPoint)
+          } else {
+            // Reset any Shorts-specific absolute positioning before inserting into control bar
+            resetPlayerButtonStylesForWatchControls()
+            if (playerButtonMountPoint.getAttribute('data-id') !== params.source.id || playerButtonMountPoint.parentElement !== mountPlayerButtonBefore.parentElement) {
+              mountPlayerButtonBefore.parentElement?.insertBefore(playerButtonMountPoint, mountPlayerButtonBefore)
+              playerButtonMountPoint.setAttribute('data-id', params.source.id)
+            }
             render(<WatchOnOdyseePlayerButton target={params.playerTarget ?? undefined} source={params.source} />, playerButtonMountPoint)
           }
         }
@@ -2160,6 +2222,8 @@ import { channelCache } from '../modules/yt/channelCache'
   // Results page: track per-video renderer compact channel chip + observer
   // Use Map (not WeakMap) for the same reason as above
   const resultsVideoChipState = new Map<HTMLElement, { chip: HTMLElement, mo: MutationObserver | null }>()
+  // Results page: track per-video renderer watcher to detect ID swaps and purge stale pills
+  const resultsWatchPillState = new Map<HTMLElement, { mo: MutationObserver | null, vid: string | null }>()
   // Concurrency/throttle for results video chip refresher
   let resultsVideoChipRunning = false
   let resultsVideoChipPendingRerun = false
@@ -2414,9 +2478,40 @@ import { channelCache } from '../modules/yt/channelCache'
   // Cleanup helper for results watch pills (video renderer)
   async function cleanupResultsWatchPills(): Promise<void> {
     try {
-      const pills = Array.from(document.querySelectorAll('ytd-video-renderer a[data-wol-inline-watch], .ytGridShelfViewModelGridShelfItem a[data-wol-inline-shorts-watch]')) as HTMLElement[]
+      // Disconnect any per-renderer observers watching for videoId swaps
+      try {
+        let idx = 0
+        for (const [vr, st] of resultsWatchPillState.entries()) {
+          try { st?.mo?.disconnect() } catch {}
+          resultsWatchPillState.delete(vr)
+          if ((++idx) % 25 === 0) await idleYield(15)
+        }
+      } catch {}
+      // Be thorough: clear all inline Watch pills injected on /results, including grid/shelf tiles
+      const selectors = [
+        'ytd-video-renderer a[data-wol-inline-watch]',
+        'ytd-grid-video-renderer a[data-wol-inline-watch]',
+        'ytd-rich-item-renderer a[data-wol-inline-watch]',
+        '#contents a[data-wol-inline-watch]', // generic safety net within results content
+        '.ytGridShelfViewModelGridShelfItem a[data-wol-inline-shorts-watch]',
+      ]
+      const pills = Array.from(document.querySelectorAll(selectors.join(', '))) as HTMLElement[]
+      if (WOL_DEBUG) {
+        try { logger.log('[RESULTS][PILL] cleanupResultsWatchPills removing', pills.length, 'pills') } catch {}
+      }
       for (let i = 0; i < pills.length; i++) {
-        try { pills[i].remove() } catch {}
+        try {
+          if (WOL_DEBUG) {
+            const el = pills[i] as HTMLAnchorElement
+            logger.log('[RESULTS][PILL] remove', {
+              id: el.getAttribute('data-wol-id'),
+              href: el.getAttribute('href'),
+              gen: el.getAttribute('data-wol-gen'),
+              nav: el.getAttribute('data-wol-nav'),
+            })
+          }
+          pills[i].remove()
+        } catch {}
         if ((i + 1) % 20 === 0) await idleYield(20)
       }
     } catch {}
@@ -4038,8 +4133,13 @@ import { channelCache } from '../modules/yt/channelCache'
           try { ensureResultsPillsVisibility() } catch {}
           // Use longer delays for mutation-triggered updates to batch more changes
           const enhanceDelay = location.pathname === '/watch' ? 200 : 100
-          overlayDbg(`[DEBUG] Mutation observer detected new videos, scheduling enhancement with ${enhanceDelay}ms delay`)
-          scheduleEnhanceListings(enhanceDelay)
+          const alreadyScheduled = scheduledTasks.has('enhanceListings') || scheduledTasks.has('enhanceListings-retry')
+          if (!alreadyScheduled) {
+            overlayDbg(`[DEBUG] Mutation observer detected new videos, scheduling enhancement with ${enhanceDelay}ms delay`)
+            // On watch pages, bypass throttle to allow follow-up passes as related tiles trickle in
+            const bypass = location.pathname === '/watch'
+            scheduleEnhanceListings(enhanceDelay, bypass)
+          }
         }
         if (shouldRefreshChips && settings.resultsApplySelections && settings.buttonChannelSub) {
           scheduleRefreshResultsChips(150)
@@ -4094,6 +4194,8 @@ import { channelCache } from '../modules/yt/channelCache'
       wolNavigationPollInterval = window.setInterval(() => {
           const currentHref = window.location.href
           if (currentHref !== navigationLastHref) {
+            // Ignore fallback-detected changes briefly after a real navigation
+            if (Date.now() < navigationQuietUntil) { navigationLastHref = currentHref; return }
             navigationLastHref = currentHref
             dbg('Watch on Odysee: Detected location change (fallback polling) to', currentHref)
 
@@ -4108,6 +4210,10 @@ import { channelCache } from '../modules/yt/channelCache'
             if (location.pathname === '/results' && settings.resultsApplySelections && settings.buttonChannelSub) {
               scheduleRefreshResultsChips(120)
               scheduleRefreshChannelButtons(150)
+            }
+            // Proactively clear stale results Watch pills on SPA-detected nav
+            if (location.pathname === '/results') {
+              triggerCleanupResultsWatchPills().catch(() => {})
             }
             scheduleProcessCurrentPage(50)
             try { ensureResultsPillsVisibility() } catch {}
@@ -4132,15 +4238,18 @@ import { channelCache } from '../modules/yt/channelCache'
 
   // Enhance video tiles on listing pages (e.g., /videos, related content) with an Odysee logo link
   async function enhanceVideoTilesOnListings(bypassThrottle: boolean = false) {
-    // CRITICAL FIX: Prevent concurrent runs
+    const myRun = currentEnhanceRun
+    // CRITICAL FIX: Prevent concurrent runs, but queue a follow-up pass
     if (enhancementRunning) {
-      logger.log('⏸️ Enhancement already running, skipping')
+      logger.log('⏸️ Enhancement already running, queueing rerun')
+      try { scheduleEnhanceListings(150, true) } catch {}
       return
     }
     enhancementRunning = true
 
     try {
       const gen = overlayGeneration
+      if (myRun !== currentEnhanceRun) { enhancementRunning = false; return }
       logger.log('🎨 enhanceVideoTilesOnListings START, gen:', gen, 'url:', location.href)
       const runStart = performance.now()
       const runUrl = window.location.href
@@ -4184,7 +4293,7 @@ import { channelCache } from '../modules/yt/channelCache'
          const isWatch = location.pathname === '/watch'
          // CRITICAL FIX: Measure time between completion of enhancements, not start
          // This allows mutation observer to trigger re-enhancement after initial work finishes
-         const minGap = isWatch ? 600 : (isResults ? 400 : 300)
+         const minGap = isWatch ? 1000 : (isResults ? 500 : 300)
          // Allow immediate re-processing if URL changed
          if (now - lastEnhanceTime < minGap && currentUrl === lastEnhanceUrl) {
            const since = now - lastEnhanceTime
@@ -4197,6 +4306,7 @@ import { channelCache } from '../modules/yt/channelCache'
        }
       // Update URL tracking at start to detect navigation
       lastEnhanceUrl = currentUrl
+      if (myRun !== currentEnhanceRun) { enhancementRunning = false; return }
       logger.log('✅ Enhancement running for', currentUrl, bypassThrottle ? '(bypass throttle)' : '')
 
       // Check if overlay buttons are enabled - clean up overlays if disabled but continue for inline buttons
@@ -4702,11 +4812,11 @@ import { channelCache } from '../modules/yt/channelCache'
     const keyOf = (x: {id: string, type: 'video'|'channel'}) => `${x.type}:${x.id}`
     const toResolveItems = normalizedToProcess.filter(x => !resolvedLocal.has(keyOf(x)))
     if (toResolveItems.length > 0) {
-      if (gen !== overlayGeneration) return
+      if (gen !== overlayGeneration || myRun !== currentEnhanceRun) return
       const srcPlatform = getSourcePlatfromSettingsFromHostname(location.hostname)!
       const sources = toResolveItems.map(x => ({ platform: srcPlatform, id: x.id, type: x.type, url: new URL(location.href), time: null }))
       const results = await getTargetsBySources(...sources)
-      if (gen !== overlayGeneration) return
+      if (gen !== overlayGeneration || myRun !== currentEnhanceRun) return
       for (const x of toResolveItems) {
         const t = results[x.id] ?? null
         resolvedLocal.set(keyOf(x), t)
@@ -4829,7 +4939,7 @@ import { channelCache } from '../modules/yt/channelCache'
 
     for (const { a, id, type } of normalizedToProcess) {
       // CRITICAL: Check generation at start of EVERY iteration for fast cancellation
-      if (gen !== overlayGeneration) break
+      if (gen !== overlayGeneration || myRun !== currentEnhanceRun) break
 
       // Yield control back to the browser after every batch
       processedCount++
@@ -4888,19 +4998,42 @@ import { channelCache } from '../modules/yt/channelCache'
         if (type === 'video') {
           try {
             const videoRenderer = a.closest('ytd-video-renderer') as HTMLElement | null
+            const gridVideoRenderer = a.closest('ytd-grid-video-renderer') as HTMLElement | null
             if (videoRenderer) {
               // 1) Inline "Watch on Odysee" pill to the right of the title/menu
               // If an existing pill is present for a different video id, update it in place
-              if (settings.buttonVideoSub && url) {
+              if (settings.buttonVideoSub) {
                 const existingWatch = videoRenderer.querySelector('a[data-wol-inline-watch]') as HTMLAnchorElement | null
                 if (existingWatch) {
-                  const existingId = existingWatch.getAttribute('data-wol-id')
-                  if (existingId && existingId !== id) {
+                  const existingId = existingWatch.getAttribute('data-wol-id') || ''
+                  // Guard: if renderer's current primary video id does not match this pass, remove stale pill
+                  try {
+                    const primaryA = videoRenderer.querySelector('a[href^="/watch?v="]') as HTMLAnchorElement | null
+                    if (primaryA) {
+                      const u = new URL(primaryA.getAttribute('href') || primaryA.href, location.origin)
+                      const currentVid = u.searchParams.get('v') || ''
+                      if (currentVid && currentVid !== id) {
+                        rd('skip-update-vid-mismatch', { currentVid, passVid: id, pillId: existingId })
+                        try { existingWatch.remove() } catch {}
+                        // Clear processed flags to allow reinjection in next pass
+                        videoRenderer.querySelectorAll('a[data-wol-enhanced="done"]').forEach(el => el.removeAttribute('data-wol-enhanced'))
+                        return
+                      }
+                    }
+                  } catch {}
+                  if (!url) {
+                    // If we don't have a mapping for the current tile, never keep a pill
+                    rd('remove-no-url', { id, existingId, href: existingWatch.href, gen: overlayGeneration })
+                    try { existingWatch.remove() } catch {}
+                    if (WOL_DEBUG) dbg('WOL results inline watch removed (no mapping available) for', { id })
+                  } else if (existingId !== id || existingWatch.href !== url.href) {
+                    // Update stale pill in-place to current video mapping
                     try {
+                      rd('update-existing', { fromId: existingId || '(none)', toId: id, fromHref: existingWatch.href, toHref: url.href, gen: overlayGeneration })
                       existingWatch.href = url.href
                       existingWatch.setAttribute('data-wol-id', id)
                       existingWatch.title = `Watch on ${platform.button.platformNameText}`
-                      if (WOL_DEBUG) dbg('WOL results inline watch updated', { from: existingId, to: id })
+                      if (WOL_DEBUG) dbg('WOL results inline watch updated', { from: existingId || '(none)', to: id })
                     } catch {}
                   }
                 }
@@ -4948,7 +5081,7 @@ import { channelCache } from '../modules/yt/channelCache'
                 t.textContent = 'Watch'
                 btn.appendChild(i)
                 btn.appendChild(t)
-                btn.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(url, 'user') })
+                ensureAnchorOpensWithCurrentHref(btn)
                 // Prefer to mount inside the right-side menu so it stays flush-right
                 const menuRenderer = (videoRenderer.querySelector('#menu ytd-menu-renderer') as HTMLElement | null)
                 const menuButtons = (menuRenderer?.querySelector('#flexible-item-buttons') as HTMLElement | null)
@@ -4966,9 +5099,165 @@ import { channelCache } from '../modules/yt/channelCache'
                     else parent.appendChild(btn)
                   }
                 }
-                if (WOL_DEBUG) dbg('WOL results inline watch injected', { videoId: id })
+                try {
+                  btn.setAttribute('data-wol-gen', String(overlayGeneration))
+                  btn.setAttribute('data-wol-nav', location.href)
+                  btn.setAttribute('data-wol-host-vid', id)
+                } catch {}
+                rd('inject', { id, href: url.href, gen: overlayGeneration })
+                if (WOL_DEBUG) dbg('WOL results inline watch injected', { videoId: id, href: url.href })
               }
-              
+
+              // Mark this tile as processed only if we created or updated a pill (i.e., we had a URL or an existing pill)
+              if (settings.buttonVideoSub && (url || videoRenderer.querySelector('a[data-wol-inline-watch]'))) {
+                ;(a as any).dataset.wolEnhanced = 'done'
+                // Install a lightweight watcher for this renderer to purge stale pills if YT swaps the video id
+                try {
+                  const prev = resultsWatchPillState.get(videoRenderer)
+                  const curVid = id
+                  if (prev?.vid !== curVid || !prev?.mo) {
+                    try { prev?.mo?.disconnect() } catch {}
+                    const mo = new MutationObserver(() => {
+                      try {
+                        // Recompute video id from primary anchor
+                        const vA = videoRenderer.querySelector('a[href^="/watch?v="]') as HTMLAnchorElement | null
+                        if (!vA) return
+                        const u = new URL(vA.getAttribute('href') || vA.href, location.origin)
+                        const newId = u.searchParams.get('v') || null
+                        const state = resultsWatchPillState.get(videoRenderer)
+                        const oldId = state?.vid || null
+                        if (newId && oldId && newId !== oldId) {
+                          // Remove any stale pill and clear enhancement flag so next pass can re-inject
+                          const pill = videoRenderer.querySelector('a[data-wol-inline-watch]') as HTMLElement | null
+                          if (pill) {
+                            rd('vr-id-changed-remove', { fromId: oldId, toId: newId })
+                            try { pill.remove() } catch {}
+                          }
+                          // Clear processed flag for any anchors in this renderer
+                          videoRenderer.querySelectorAll('a[data-wol-enhanced="done"]').forEach(el => el.removeAttribute('data-wol-enhanced'))
+                          // Update stored vid and schedule a quick enhancement pass
+                          resultsWatchPillState.set(videoRenderer, { mo, vid: newId })
+                          scheduleEnhanceListings(0, true)
+                        }
+                      } catch {}
+                    })
+                    mo.observe(videoRenderer, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] })
+                    resultsWatchPillState.set(videoRenderer, { mo, vid: curVid })
+                  }
+                } catch {}
+              }
+            } else if (gridVideoRenderer) {
+              // Fallback for shelf/grid tiles on results (e.g., "People also watched"): inject a compact Watch pill
+              // Place near the menu/title area if present; otherwise append to the dismissible container
+              if (settings.buttonVideoSub && url) {
+                const menuRenderer = (gridVideoRenderer.querySelector('#menu ytd-menu-renderer') as HTMLElement | null)
+                const menuButtons = (menuRenderer?.querySelector('#flexible-item-buttons') as HTMLElement | null)
+                  || (menuRenderer?.querySelector('#top-level-buttons-computed') as HTMLElement | null)
+                const meta = (gridVideoRenderer.querySelector('#meta') as HTMLElement | null) || (gridVideoRenderer.querySelector('#dismissible') as HTMLElement | null) || gridVideoRenderer
+                const existing = gridVideoRenderer.querySelector('a[data-wol-inline-watch]') as HTMLAnchorElement | null
+                if (existing) {
+                  const existingId = existing.getAttribute('data-wol-id') || ''
+                  // Guard: if renderer's current primary video id does not match this pass, remove stale pill
+                  try {
+                    const primaryA = gridVideoRenderer.querySelector('a[href^="/watch?v="]') as HTMLAnchorElement | null
+                    if (primaryA) {
+                      const u = new URL(primaryA.getAttribute('href') || primaryA.href, location.origin)
+                      const currentVid = u.searchParams.get('v') || ''
+                      if (currentVid && currentVid !== id) {
+                        rd('skip-update-grid-vid-mismatch', { currentVid, passVid: id, pillId: existingId })
+                        try { existing.remove() } catch {}
+                        gridVideoRenderer.querySelectorAll('a[data-wol-enhanced="done"]').forEach(el => el.removeAttribute('data-wol-enhanced'))
+                        return
+                      }
+                    }
+                  } catch {}
+                  if (!url) {
+                    rd('remove-no-url-grid', { id, existingId, href: existing.href, gen: overlayGeneration })
+                    try { existing.remove() } catch {}
+                  } else if (existingId !== id || existing.href !== url.href) {
+                    try {
+                      rd('update-existing-grid', { fromId: existingId || '(none)', toId: id, fromHref: existing.href, toHref: url.href, gen: overlayGeneration })
+                      existing.href = url.href; existing.setAttribute('data-wol-id', id)
+                    } catch {}
+                  }
+                  ensureAnchorOpensWithCurrentHref(existing)
+                  if (url) ;(a as any).dataset.wolEnhanced = 'done'
+                } else {
+                  const btn = document.createElement('a')
+                  btn.setAttribute('data-wol-inline-watch', '1')
+                  btn.setAttribute('data-wol-id', id)
+                  btn.href = url.href
+                  btn.target = '_blank'
+                  btn.title = `Watch on ${platform.button.platformNameText}`
+                  btn.style.display = 'inline-flex'
+                  btn.style.alignItems = 'center'
+                  btn.style.justifyContent = 'center'
+                  btn.style.gap = '6px'
+                  btn.style.marginLeft = '8px'
+                  btn.style.height = '24px'
+                  btn.style.lineHeight = '24px'
+                  btn.style.padding = '0 8px'
+                  btn.style.borderRadius = '12px'
+                  btn.style.fontSize = '12px'
+                  btn.style.fontWeight = '500'
+                  btn.style.boxSizing = 'border-box'
+                  btn.style.whiteSpace = 'nowrap'
+                  btn.style.textDecoration = 'none'
+                  btn.style.color = 'whitesmoke'
+                  btn.style.background = platform.theme
+                  const i = document.createElement('img')
+                  i.src = platform.button.icon
+                  i.style.width = '18px'
+                  i.style.height = '18px'
+                  i.style.pointerEvents = 'none'
+                  const t = document.createElement('span')
+                  t.textContent = 'Watch'
+                  btn.appendChild(i)
+                  btn.appendChild(t)
+                  ensureAnchorOpensWithCurrentHref(btn)
+                  let mounted = false
+                  try {
+                    if (menuButtons) { menuButtons.insertAdjacentElement('afterbegin', btn); mounted = true }
+                    else if (menuRenderer) { menuRenderer.appendChild(btn); mounted = true }
+                  } catch {}
+                  if (!mounted && meta) meta.appendChild(btn)
+                  try {
+                    btn.setAttribute('data-wol-gen', String(overlayGeneration))
+                    btn.setAttribute('data-wol-nav', location.href)
+                    btn.setAttribute('data-wol-host-vid', id)
+                  } catch {}
+                  rd('inject-grid', { id, href: url.href, gen: overlayGeneration })
+                  ;(a as any).dataset.wolEnhanced = 'done'
+                  // Install a watcher for grid renderer id swaps
+                  try {
+                    const prev = resultsWatchPillState.get(gridVideoRenderer)
+                    const curVid = id
+                    if (prev?.vid !== curVid || !prev?.mo) {
+                      try { prev?.mo?.disconnect() } catch {}
+                      const mo = new MutationObserver(() => {
+                        try {
+                          const vA = gridVideoRenderer.querySelector('a[href^="/watch?v="]') as HTMLAnchorElement | null
+                          if (!vA) return
+                          const u = new URL(vA.getAttribute('href') || vA.href, location.origin)
+                          const newId = u.searchParams.get('v') || null
+                          const state = resultsWatchPillState.get(gridVideoRenderer)
+                          const oldId = state?.vid || null
+                          if (newId && oldId && newId !== oldId) {
+                            const pill = gridVideoRenderer.querySelector('a[data-wol-inline-watch]') as HTMLElement | null
+                            if (pill) { rd('grid-id-changed-remove', { fromId: oldId, toId: newId }); try { pill.remove() } catch {} }
+                            gridVideoRenderer.querySelectorAll('a[data-wol-enhanced="done"]').forEach(el => el.removeAttribute('data-wol-enhanced'))
+                            resultsWatchPillState.set(gridVideoRenderer, { mo, vid: newId })
+                            scheduleEnhanceListings(0, true)
+                          }
+                        } catch {}
+                      })
+                      mo.observe(gridVideoRenderer, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] })
+                      resultsWatchPillState.set(gridVideoRenderer, { mo, vid: curVid })
+                    }
+                  } catch {}
+                }
+              }
+            
               // Channel chips beside video results are handled by refreshResultsVideoChannelChips()
             }
             // Handle Shorts in grid shelf rows: add a bottom-right Watch pill
@@ -5013,13 +5302,16 @@ import { channelCache } from '../modules/yt/channelCache'
                 st.textContent = 'Watch'
                 sbtn.appendChild(si)
                 sbtn.appendChild(st)
-                sbtn.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(url, 'user') })
+            ensureAnchorOpensWithCurrentHref(sbtn)
                 hostEl.appendChild(sbtn)
                 if (WOL_DEBUG) dbg('WOL results shorts shelf watch added (grid item container)', { videoId: id })
               } catch (e) { if (WOL_DEBUG) dbg('WOL results shorts shelf watch error', e) }
             }
           } catch (e) { logger.warn('WOL results inline inject failed', e) }
-          ;(a as any).dataset.wolEnhanced = 'done'
+          // Only mark as processed if we injected or updated something; otherwise leave for a later pass
+          if (settings.buttonVideoSub && (url || (a.closest('ytd-video-renderer, ytd-grid-video-renderer') as HTMLElement | null)?.querySelector('a[data-wol-inline-watch]'))) {
+            ;(a as any).dataset.wolEnhanced = 'done'
+          }
           continue
         }
         // For channel items on results we keep existing channel renderer injection below

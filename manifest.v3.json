@@ -18,12 +18,7 @@
       "assets/icons/internal/odysee-logo.svg"
     ],
     "matches": [
-      "https://www.youtube.com/*",
-      "https://yewtu.be/*",
-      "https://vid.puffyan.us/*",
-      "https://invidio.xamh.de/*",
-      "https://invidious.kavin.rocks/*",
-      "https://newpipe.net/*"
+      "https://www.youtube.com/*"
     ]
   }],
   "action": {
@@ -33,12 +28,7 @@
   "content_scripts": [
     {
       "matches": [
-        "https://www.youtube.com/*",
-        "https://yewtu.be/*",
-        "https://vid.puffyan.us/*",
-        "https://invidio.xamh.de/*",
-        "https://invidious.kavin.rocks/*",
-        "https://newpipe.net/*"
+        "https://www.youtube.com/*"
       ],
       "js": [
         "scripts/ytContent.js"

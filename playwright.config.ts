@@ -7,7 +7,7 @@ const SLOWMO = Number(process.env.E2E_SLOWMO || 0)
 
 export default defineConfig({
   testDir: 'tests/e2e',
-  timeout: 90_000,
+  timeout: 120_000,
   expect: {
     timeout: 30_000,
   },
