@@ -44,6 +44,10 @@ import { channelCache } from '../modules/yt/channelCache'
   let lastResolveAt = 0
   let lastVideoPageChannelId: string | null = null
   let lastShortsChannelId: string | null = null
+  let shortsNavigatedAt: number = 0
+  let shortsDomRetried: boolean = false
+  let lastShortsHandleFromDom: string | null = null
+  let shortsUpdateButtonsRetriedFor: string | null = null
   // Track current channel page UC to aggressively invalidate per-page resolution state
   let lastChannelPageUC: string | null = null
   // Track previous channel page's resolved mapping to detect suspicious carry-over
@@ -246,18 +250,18 @@ import { channelCache } from '../modules/yt/channelCache'
         /* Keep overlays above inline preview layers without fighting container-gating */
         [data-wol-overlay] {
           position: absolute;
-          z-index: 2147483647 !important;
+          z-index: 1500 !important;
           pointer-events: auto;
           /* Prevent overlays from being hidden during hover animations */
           opacity: 1 !important;
           visibility: visible !important;
         }
-        
+
         /* Results page specific - more aggressive positioning */
         ytd-video-renderer [data-wol-overlay],
         ytd-grid-video-renderer [data-wol-overlay] {
           position: absolute !important;
-          z-index: 2147483647 !important;
+          z-index: 1500 !important;
           pointer-events: auto !important;
           opacity: 1 !important;
           visibility: visible !important;
@@ -426,6 +430,9 @@ import { channelCache } from '../modules/yt/channelCache'
         lastResolveAt = 0
         lastVideoPageChannelId = null
         lastShortsChannelId = null
+        shortsNavigatedAt = 0
+        shortsDomRetried = false
+        lastShortsHandleFromDom = null
         // DON'T clear ucResolvePageCache, handleResolvePageCache, and ytUrlResolvePageCache - these are cross-page caches
         // that help speed up repeated searches. They're keyed by globally-unique UC/handle IDs or YT URLs.
         // Only trim them if they get too large (memory management)
@@ -1040,7 +1047,26 @@ import { channelCache } from '../modules/yt/channelCache'
                 width: 'auto',
           ...target.platform.button.style?.button,
         }}
-              onClick={(e: any) => { e.preventDefault(); e.stopPropagation(); openNewTab(url, 'user'); findVideoElementAwait(source).then((videoElement) => { videoElement.pause() }) }}
+              onClick={(e: any) => {
+                // Allow middle-click and modified clicks (Ctrl/Cmd/Shift+click) to open naturally
+                if (e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey) {
+                  e.stopPropagation();
+                  findVideoElementAwait(source).then((videoElement) => { videoElement.pause() })
+                  return;
+                }
+                // Regular left-click: use custom handler
+                e.preventDefault();
+                e.stopPropagation();
+                openNewTab(url, 'user');
+                findVideoElementAwait(source).then((videoElement) => { videoElement.pause() })
+              }}
+              onAuxClick={(e: any) => {
+                // Handle middle-click explicitly
+                if (e.button === 1) {
+                  e.stopPropagation();
+                  findVideoElementAwait(source).then((videoElement) => { videoElement.pause() })
+                }
+              }}
             >
               {isChannel ? (
                 h(Fragment, null,
@@ -1066,22 +1092,62 @@ import { channelCache } from '../modules/yt/channelCache'
 
     // Minimized control-bar button (e.g., YouTube control bar)
     if (minimized) {
-      return <button
+      return <a
+        href={`${url.href}`}
+        target='_blank'
         className="ytp-button"
-        style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '36px', height: '36px', border: 0, background: 'transparent', verticalAlign: 'middle', cursor: 'pointer' }}
-        onClick={(e: any) => { e.preventDefault(); e.stopPropagation(); openNewTab(url, 'user'); findVideoElementAwait(source).then(v => v.pause()) }}
+        style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: '36px', height: '36px', border: 0, background: 'transparent', verticalAlign: 'middle', cursor: 'pointer', textDecoration: 'none' }}
+        onClick={(e: any) => {
+          // Allow middle-click and modified clicks to open naturally
+          if (e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey) {
+            e.stopPropagation();
+            findVideoElementAwait(source).then(v => v.pause())
+            return;
+          }
+          // Regular left-click: use custom handler
+          e.preventDefault();
+          e.stopPropagation();
+          openNewTab(url, 'user');
+          findVideoElementAwait(source).then(v => v.pause())
+        }}
+        onAuxClick={(e: any) => {
+          // Handle middle-click explicitly
+          if (e.button === 1) {
+            e.stopPropagation();
+            findVideoElementAwait(source).then(v => v.pause())
+          }
+        }}
         aria-label={`Watch on ${target.platform.button.platformNameText}`}
         title={`Watch on ${target.platform.button.platformNameText}`}
       >
         <img src={target.platform.button.icon} height={20} style={{ display: 'block', ...target.platform.button.style?.icon }} />
-      </button>
+      </a>
     }
 
     // Non-minimized: simple bar with logo (original working style)
     return <div style={{ display: 'flex', height: '48px', alignContent: 'center', justifyContent: 'center' }}>
       <a href={`${url.href}`} target='_blank' role='button'
         style={{ display: 'flex', alignItems: 'center', gap: '7px', borderRadius: '2px', paddingRight: '10px', fontWeight: 'bold', border: '0', color: 'whitesmoke', fontSize: '14px', textDecoration: 'none', ...target.platform.button.style?.button }}
-        onClick={(e: any) => { e.preventDefault(); e.stopPropagation(); openNewTab(url, 'user'); findVideoElementAwait(source).then((videoElement) => { videoElement.pause() }) }}
+        onClick={(e: any) => {
+          // Allow middle-click and modified clicks to open naturally
+          if (e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey) {
+            e.stopPropagation();
+            findVideoElementAwait(source).then((videoElement) => { videoElement.pause() })
+            return;
+          }
+          // Regular left-click: use custom handler
+          e.preventDefault();
+          e.stopPropagation();
+          openNewTab(url, 'user');
+          findVideoElementAwait(source).then((videoElement) => { videoElement.pause() })
+        }}
+        onAuxClick={(e: any) => {
+          // Handle middle-click explicitly
+          if (e.button === 1) {
+            e.stopPropagation();
+            findVideoElementAwait(source).then((videoElement) => { videoElement.pause() })
+          }
+        }}
       >
         <img src={target.platform.button.icon} height={24} style={{ ...target.platform.button.style?.icon }} />
       </a>
@@ -1099,6 +1165,7 @@ import { channelCache } from '../modules/yt/channelCache'
       dbg(`[CHANNEL-DEBUG] updateButtons: clearing buttons (no params)`)
       render(<WatchOnOdyseeButtons />, buttonMountPoint)
       render(<WatchOnOdyseePlayerButton />, playerButtonMountPoint)
+      render(<WatchOnOdyseeButtons />, shortsSubscribeMountPoint)
       return
     }
 
@@ -1217,11 +1284,27 @@ import { channelCache } from '../modules/yt/channelCache'
             const shortsSubscribe = (channelBar?.querySelector('yt-subscribe-button-view-model') as HTMLElement | null)
               || (document.querySelector('ytd-reel-player-overlay-renderer yt-subscribe-button-view-model') as HTMLElement | null)
 
+            const channelTargets = (params.buttonTargets ?? []).filter(t => t.type === 'channel')
+
             if (channelBar && channelName) {
-              if (shortsSubscribeMountPoint.getAttribute('data-id') !== params.source.id || shortsSubscribeMountPoint.parentElement !== channelBar) {
+              // Reset retry flag on successful DOM find
+              if (shortsUpdateButtonsRetriedFor === params.source.id) {
+                shortsUpdateButtonsRetriedFor = null
+              }
+
+              // Check if mount point got disconnected (YouTube rebuilt DOM) - force re-insertion
+              const mountPointDisconnected = !shortsSubscribeMountPoint.isConnected && shortsSubscribeMountPoint.children.length > 0
+
+              if (shortsSubscribeMountPoint.getAttribute('data-id') !== params.source.id || shortsSubscribeMountPoint.parentElement !== channelBar || mountPointDisconnected) {
+                if (mountPointDisconnected) {
+                  dbg(`[SHORTS] Detected disconnected mount point, re-inserting for ${params.source.id}`)
+                }
                 shortsSubscribeMountPoint.setAttribute('data-id', params.source.id)
                 // Insert to the right of channel name
                 channelName.insertAdjacentElement('afterend', shortsSubscribeMountPoint)
+                dbg(`[SHORTS] Inserted mount point, isConnected:`, shortsSubscribeMountPoint.isConnected, 'parentElement:', shortsSubscribeMountPoint.parentElement?.tagName)
+              } else {
+                dbg(`[SHORTS] Mount point already in place, isConnected:`, shortsSubscribeMountPoint.isConnected, 'parentElement:', shortsSubscribeMountPoint.parentElement?.tagName)
               }
               // Keep layout consistent and height synced to Shorts Subscribe
               shortsSubscribeMountPoint.style.display = 'inline-flex'
@@ -1230,11 +1313,41 @@ import { channelCache } from '../modules/yt/channelCache'
               shortsSubscribeMountPoint.style.marginRight = '0'
               // Sync height to the actual subscribe element when it settles
               try { syncContainerHeightToReference(shortsSubscribeMountPoint, shortsSubscribe || channelName) } catch {}
-              const channelTargets = (params.buttonTargets ?? []).filter(t => t.type === 'channel')
+
               if (channelTargets.length > 0) {
+                dbg(`[SHORTS] Rendering channel button for ${params.source.id}, targets:`, channelTargets.length)
                 render(<WatchOnOdyseeButtons targets={channelTargets} source={params.source} />, shortsSubscribeMountPoint)
                 try { lockButtonWidthsIn(shortsSubscribeMountPoint) } catch {}
+                // Verify mount point is still connected after render - YouTube sometimes rebuilds the DOM
+                setTimeout(() => {
+                  const stillConnected = shortsSubscribeMountPoint.isConnected
+                  const hasContent = shortsSubscribeMountPoint.children.length > 0
+                  dbg(`[SHORTS] Post-render check for ${params.source.id}, isConnected:`, stillConnected, 'hasChildren:', hasContent)
+
+                  // If mount point got disconnected but has content, YouTube rebuilt the DOM - re-insert it
+                  if (!stillConnected && hasContent && location.pathname === params.source.url.pathname) {
+                    dbg(`[SHORTS] Mount point disconnected, re-inserting for ${params.source.id}`)
+                    // Force re-insertion by clearing the data-id
+                    shortsSubscribeMountPoint.setAttribute('data-id', '')
+                    updateButtons(params)
+                  }
+                }, 100)
+              } else {
+                // Clear any stale channel button from previous video
+                dbg(`[SHORTS] No channel targets for ${params.source.id}, clearing button`)
+                render(<WatchOnOdyseeButtons />, shortsSubscribeMountPoint)
               }
+            } else if (channelTargets.length > 0 && shortsUpdateButtonsRetriedFor !== params.source.id) {
+              // DOM elements not found but we have targets - retry once after delay
+              dbg(`[SHORTS] Channel bar/name not found for ${params.source.id}, will retry in 500ms`)
+              shortsUpdateButtonsRetriedFor = params.source.id
+              setTimeout(() => {
+                // Only retry if still on same video
+                if (location.pathname === params.source.url.pathname) {
+                  dbg(`[SHORTS] Retrying updateButtons for ${params.source.id}`)
+                  updateButtons(params)
+                }
+              }, 500)
             }
           }
           // Done with shorts subscribe handling
@@ -1568,11 +1681,8 @@ import { channelCache } from '../modules/yt/channelCache'
       if (pr?.channelId) document.documentElement.setAttribute('data-wol-channel-id', pr.channelId)
       if (lastLoggedHref !== url.href) logger.log('ytInitialPlayerResponse.videoDetails present:', !!pr)
     }
-    // Also capture channelId early on Shorts pages
-    if (url.pathname.startsWith('/shorts/')) {
-      const pr = (window as any)?.ytInitialPlayerResponse?.videoDetails
-      if (pr?.channelId) document.documentElement.setAttribute('data-wol-channel-id', pr.channelId)
-    }
+    // Don't capture channelId early on Shorts pages - ytInitialPlayerResponse may have stale data during navigation
+    // We'll get it later when we actually need it, after proper clearing
     if (url.pathname === '/watch' && url.searchParams.has('v')) {
       // Try multiple strategies and cache as a data- attribute
       let cid: string | null = null
@@ -3589,7 +3699,25 @@ import { channelCache } from '../modules/yt/channelCache'
               inline.style.background = 'transparent'
               inline.style.overflow = 'hidden'
               if (!(inline as any).dataset.wolClick) {
-                inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(url!, 'user') })
+                inline.addEventListener('click', (e) => {
+                  try {
+                    // Allow middle-click and modified clicks to open naturally
+                    if (e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey) {
+                      e.stopPropagation()
+                      return
+                    }
+                    // Regular left-click: use custom handler
+                    e.preventDefault()
+                    e.stopPropagation()
+                  } catch {}
+                  openNewTab(url!, 'user')
+                })
+                inline.addEventListener('auxclick', (e) => {
+                  // Handle middle-click explicitly
+                  if (e.button === 1) {
+                    try { e.stopPropagation() } catch {}
+                  }
+                })
                 ;(inline as any).dataset.wolClick = '1'
               }
               let icon = inline.querySelector('img') as HTMLImageElement | null
@@ -3890,7 +4018,25 @@ import { channelCache } from '../modules/yt/channelCache'
             inline.style.background = 'transparent'
             inline.style.overflow = 'hidden'
             if (!(inline as any).dataset.wolClick) {
-              inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+              inline.addEventListener('click', (e) => {
+                try {
+                  // Allow middle-click and modified clicks to open naturally
+                  if (e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey) {
+                    e.stopPropagation()
+                    return
+                  }
+                  // Regular left-click: use custom handler
+                  e.preventDefault()
+                  e.stopPropagation()
+                } catch {}
+                openNewTab(chUrl!, 'user')
+              })
+              inline.addEventListener('auxclick', (e) => {
+                // Handle middle-click explicitly
+                if (e.button === 1) {
+                  try { e.stopPropagation() } catch {}
+                }
+              })
               ;(inline as any).dataset.wolClick = '1'
             }
             let icon = inline.querySelector('img') as HTMLImageElement | null
@@ -3982,7 +4128,25 @@ import { channelCache } from '../modules/yt/channelCache'
           inline.style.background = 'transparent'
           inline.style.overflow = 'hidden'
           if (!(inline as any).dataset.wolClick) {
-            inline.addEventListener('click', (e) => { try { e.preventDefault(); e.stopPropagation() } catch {}; openNewTab(chUrl!, 'user') })
+            inline.addEventListener('click', (e) => {
+              try {
+                // Allow middle-click and modified clicks to open naturally
+                if (e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey) {
+                  e.stopPropagation()
+                  return
+                }
+                // Regular left-click: use custom handler
+                e.preventDefault()
+                e.stopPropagation()
+              } catch {}
+              openNewTab(chUrl!, 'user')
+            })
+            inline.addEventListener('auxclick', (e) => {
+              // Handle middle-click explicitly
+              if (e.button === 1) {
+                try { e.stopPropagation() } catch {}
+              }
+            })
             ;(inline as any).dataset.wolClick = '1'
           }
           // Ensure we have a single icon child, sized to fill
@@ -5709,7 +5873,7 @@ import { channelCache } from '../modules/yt/channelCache'
       mount.setAttribute('aria-label', `Watch on ${platform.button.platformNameText}`)
       mount.title = `Watch on ${platform.button.platformNameText}`
       mount.style.position = 'absolute'
-      mount.style.zIndex = '2147483647' // Stay above previews and overlays
+      mount.style.zIndex = '1500' // Above video content but below YouTube UI chrome
       mount.style.display = 'inline-block'
       mount.style.cursor = 'pointer'
       mount.style.pointerEvents = 'auto'
@@ -5806,15 +5970,32 @@ import { channelCache } from '../modules/yt/channelCache'
 
       // Prevent the overlay from interfering with the underlying YouTube link
       mount.addEventListener('click', (e) => {
+        // Allow modified clicks to open in new tab naturally
+        if (e.ctrlKey || e.metaKey || e.shiftKey) {
+          e.stopPropagation()
+          window.open(url.href, '_blank')
+          return
+        }
+        // Regular left-click: use custom handler
         e.preventDefault()
         e.stopPropagation()
         openNewTab(url, 'user')
       })
 
+      // Handle middle-click explicitly (auxclick event)
+      mount.addEventListener('auxclick', (e) => {
+        if (e.button === 1) {
+          // Middle-click: open in new tab
+          e.preventDefault()
+          e.stopPropagation()
+          window.open(url.href, '_blank')
+        }
+      })
+
       // Add hover handling to ensure overlay stays visible during video preview
       const ensureOverlayVisibility = () => {
         try { mount.style.setProperty('opacity', '1', 'important') } catch { mount.style.opacity = '1' }
-        try { mount.style.setProperty('z-index', '2147483647', 'important') } catch { mount.style.zIndex = '2147483647' }
+        try { mount.style.setProperty('z-index', '1500', 'important') } catch { mount.style.zIndex = '1500' }
         try { mount.style.setProperty('display', 'inline-block', 'important') } catch { mount.style.display = 'inline-block' }
         try { mount.style.setProperty('visibility', 'visible', 'important') } catch { mount.style.visibility = 'visible' }
         try { mount.style.setProperty('background-color', 'transparent', 'important') } catch { mount.style.backgroundColor = 'transparent' }
@@ -5972,7 +6153,7 @@ import { channelCache } from '../modules/yt/channelCache'
           }
           
           // Raise stack order during hover previews
-          ;(host as HTMLElement).style.zIndex = (host as HTMLElement).style.zIndex || '2147483646'
+          ;(host as HTMLElement).style.zIndex = (host as HTMLElement).style.zIndex || '1400'
           if (mount.parentElement !== host && !isResultsPage) host.appendChild(mount)
         } catch {}
         ensureOverlayVisibility()
@@ -6057,7 +6238,7 @@ import { channelCache } from '../modules/yt/channelCache'
           mount.style.setProperty('margin', '0', 'important')
           mount.style.setProperty('box-sizing', 'border-box', 'important')
           mount.style.setProperty('transform', 'none', 'important')
-          mount.style.setProperty('z-index', '2147483647', 'important')
+          mount.style.setProperty('z-index', '1500', 'important')
           mount.style.setProperty('opacity', '1', 'important')
           mount.style.setProperty('visibility', 'visible', 'important')
           mount.style.setProperty('pointer-events', 'auto', 'important')
@@ -6499,10 +6680,19 @@ import { channelCache } from '../modules/yt/channelCache'
         if (currentShortsId && currentShortsId !== lastShortsChannelId) {
           lastShortsChannelId = currentShortsId
           lastVideoPageChannelId = null
+          lastRenderContext = null
           document.documentElement.removeAttribute('data-wol-channel-id')
           settingsDirty = true
           lastResolveSig = null
           lastResolved = {}
+          shortsNavigatedAt = Date.now()
+          shortsDomRetried = false
+          // Don't clear lastShortsHandleFromDom - we need it to detect stale data
+          // IMMEDIATELY clear the Shorts channel button mount point
+          try {
+            render(<WatchOnOdyseeButtons />, shortsSubscribeMountPoint)
+            shortsSubscribeMountPoint.removeAttribute('data-id')
+          } catch {}
         }
       } else if (urlNow.pathname === '/watch') {
         const currentVideoId = urlNow.searchParams.get('v')
@@ -6563,12 +6753,131 @@ import { channelCache } from '../modules/yt/channelCache'
       // If we are on a video page, also resolve the channel and show a channel button (if present)
       let channelIdForVideoPage: string | null = null
       if (source.type === 'video') {
-        let channelId: string | null = (document.documentElement.getAttribute('data-wol-channel-id') || null)
-        if (!channelId) {
-          channelId = document.querySelector<HTMLMetaElement>('meta[itemprop="channelId"]')?.content || null
-          if (!channelId) channelId = await getWatchPageChannelId()
+        let channelId: string | null = null
+
+        // For Shorts, try ytInitialPlayerResponse (rarely available) then fall back to DOM cache
+        if (source.url.pathname.startsWith('/shorts/')) {
+          try {
+            const pr = (window as any)?.ytInitialPlayerResponse?.videoDetails
+            // Only trust if videoId matches current video (prevents stale data during navigation)
+            if (pr?.channelId && pr?.videoId === source.id) {
+              channelId = pr.channelId
+              dbg(`[SHORTS] Got channel ID from ytInitialPlayerResponse for video ${source.id}:`, channelId)
+            }
+            // Otherwise fall through to DOM cache lookup below
+          } catch (e) {
+            dbg(`[SHORTS] Error reading ytInitialPlayerResponse:`, e)
+          }
+        } else {
+          // For regular watch pages, can use data attribute and meta tag (they update correctly)
+          channelId = (document.documentElement.getAttribute('data-wol-channel-id') || null)
+          if (!channelId) {
+            channelId = document.querySelector<HTMLMetaElement>('meta[itemprop="channelId"]')?.content || null
+          }
+          // For regular watch pages, try getWatchPageChannelId which uses multiple strategies
+          if (!channelId) {
+            channelId = await getWatchPageChannelId()
+          }
         }
-        if (!channelId) {
+        // Use DOM selectors as last resort
+        // For Shorts after navigation: Try handle-based cache lookup ONLY (don't fetch)
+        const isShorts = source.url.pathname.startsWith('/shorts/')
+        if (!channelId && isShorts && shortsNavigatedAt > 0) {
+          // Try to get handle from DOM and check persistent + in-memory cache
+          const shortsChannelEl = document.querySelector('ytd-reel-player-overlay-renderer yt-reel-channel-bar-view-model a[href^="/@"]')
+          const channelHref = shortsChannelEl?.getAttribute('href')
+          if (channelHref) {
+            // Extract handle: "/@WhiteHouse/shorts" -> "WhiteHouse"
+            const handleMatch = channelHref.match(/\/@([^\/]+)/)
+            if (handleMatch) {
+              const handle = handleMatch[1]
+              dbg(`[SHORTS] Checking handle from DOM: "${handle}"`)
+
+              // Validate: reject if same handle as previous video within 2 seconds of navigation
+              const timeSinceNav = Date.now() - shortsNavigatedAt
+              if (handle === lastShortsHandleFromDom && timeSinceNav < 2000) {
+                dbg(`[SHORTS] Rejecting handle "${handle}" - same as previous video ${timeSinceNav}ms after navigation (likely stale)`)
+                if (!shortsDomRetried) {
+                  // Retry after more time for DOM to update
+                  shortsDomRetried = true
+                  dbg(`[SHORTS] Will retry after longer delay`)
+                  setTimeout(() => {
+                    if (location.pathname === source.url.pathname) {
+                      dbg(`[SHORTS] Retrying after DOM update delay`)
+                      scheduleProcessCurrentPage(0)
+                    }
+                  }, 1500)
+                  return
+                } else {
+                  dbg(`[SHORTS] Already retried, giving up`)
+                }
+              } else {
+                dbg(`[SHORTS] Handle validation passed (different handle or enough time elapsed: ${timeSinceNav}ms)`)
+              }
+
+              try {
+                // Try persistent cache first (survives page reloads)
+                const cachedUcId = await channelCache.getHandle(handle)
+                if (cachedUcId) {
+                  dbg(`[SHORTS] Found UC from persistent cache for handle "${handle}":`, cachedUcId)
+                  // Check if this UC has an Odysee URL (Target)
+                  let target = ucResolvePageCache.get(cachedUcId)
+                  if (!target) {
+                    // Not in memory, check persistent UC cache
+                    target = await channelCache.getUC(cachedUcId) || null
+                    if (target) {
+                      ucResolvePageCache.set(cachedUcId, target)
+                      dbg(`[SHORTS] Loaded Target from persistent UC cache`)
+                    }
+                  }
+                  if (target) {
+                    channelId = cachedUcId
+                    lastShortsHandleFromDom = handle
+                    dbg(`[SHORTS] Using cached channel "${handle}" → UC ${channelId}`)
+                  } else {
+                    dbg(`[SHORTS] UC ${cachedUcId} has no Odysee URL`)
+                  }
+                } else if (cachedUcId === null) {
+                  dbg(`[SHORTS] Handle "${handle}" cached as null (no Odysee channel)`)
+                } else {
+                  // Not in persistent cache, try in-memory
+                  if (handleResolvePageCache.has(handle)) {
+                    const handleTarget = handleResolvePageCache.get(handle)
+                    if (handleTarget) {
+                      // Find the UC ID for this handle from in-memory cache
+                      for (const [uc, target] of ucResolvePageCache.entries()) {
+                        if (target === handleTarget && uc.startsWith('UC')) {
+                          channelId = uc
+                          lastShortsHandleFromDom = handle
+                          dbg(`[SHORTS] Using in-memory cached channel "${handle}" → UC ${channelId}`)
+                          break
+                        }
+                      }
+                    }
+                  } else {
+                    dbg(`[SHORTS] Handle "${handle}" not in any cache`)
+                  }
+                }
+              } catch (e) {
+                dbg(`[SHORTS] Error checking cache for handle "${handle}":`, e)
+              }
+            }
+          } else if (!shortsDomRetried) {
+            // DOM element not found yet - retry once after a short delay
+            shortsDomRetried = true
+            dbg(`[SHORTS] Channel element not in DOM yet for video ${source.id}, will retry once`)
+            setTimeout(() => {
+              if (location.pathname === source.url.pathname) {
+                dbg(`[SHORTS] Retrying after DOM load for ${source.id}`)
+                scheduleProcessCurrentPage(0)
+              }
+            }, 500)
+            return
+          }
+          if (!channelId) {
+            dbg(`[SHORTS] No cached channel found for video ${source.id}`)
+          }
+        } else if (!channelId) {
           const ownerSelectors = [
             'ytd-channel-name#channel-name a[href^="/channel/"]',
             'ytd-channel-name#channel-name a[href^="/@"]',
@@ -6578,6 +6887,9 @@ import { channelCache } from '../modules/yt/channelCache'
             '#owner a[href^="/@"]',
             '#watch-header a[href^="/channel/"]',
             '.ytd-video-owner-renderer a[href^="/channel/"]',
+            // Shorts-specific selectors
+            'ytd-reel-player-overlay-renderer yt-reel-channel-bar-view-model a[href^="/channel/"]',
+            'ytd-reel-player-overlay-renderer yt-reel-channel-bar-view-model a[href^="/@"]',
           ]
           for (const selector of ownerSelectors) {
             const ownerHref = document.querySelector<HTMLAnchorElement>(selector)?.href
@@ -6597,39 +6909,118 @@ import { channelCache } from '../modules/yt/channelCache'
                   }
                   // For handle URLs, we need to upgrade to UC for sourcesToResolve
                   if (p[1]?.startsWith('@')) {
-                    // Try handle cache first
+                    // Try persistent + in-memory handle cache first
                     const handle = p[1].substring(1)
-                    if (handleResolvePageCache.has(handle)) {
-                      // Look for UC in ucResolvePageCache by iterating (since we need the key)
-                      for (const [uc, target] of ucResolvePageCache.entries()) {
-                        if (target && handleResolvePageCache.get(handle) === target && uc.startsWith('UC')) {
-                          channelId = uc
-                          if (WOL_DEBUG) dbg('[VIDEO] Found channel UC from handle cache:', channelId)
+                    try {
+                      // Try persistent cache
+                      let cachedUcId = await channelCache.getHandle(handle)
+                      if (cachedUcId) {
+                        let target = ucResolvePageCache.get(cachedUcId)
+                        if (!target) {
+                          target = await channelCache.getUC(cachedUcId) || null
+                          if (target) ucResolvePageCache.set(cachedUcId, target)
+                        }
+                        if (target) {
+                          channelId = cachedUcId
+                          if (WOL_DEBUG) dbg('[VIDEO] Found channel UC from persistent cache (ytUrl cache check):', channelId)
                           break
                         }
                       }
-                      if (channelId) break
+
+                      // Try in-memory cache
+                      if (!channelId && handleResolvePageCache.has(handle)) {
+                        const handleTarget = handleResolvePageCache.get(handle)
+                        if (handleTarget) {
+                          for (const [uc, target] of ucResolvePageCache.entries()) {
+                            if (target === handleTarget && uc.startsWith('UC')) {
+                              channelId = uc
+                              if (WOL_DEBUG) dbg('[VIDEO] Found channel UC from in-memory cache:', channelId)
+                              break
+                            }
+                          }
+                        }
+                        if (channelId) break
+                      }
+                    } catch (e) {
+                      dbg('[VIDEO] Error checking cache:', e)
                     }
                   }
                 }
 
                 // If not in cache, extract UC ID the normal way
                 const p = u.pathname.split('/')
-                if (p[1] === 'channel' && p[2]?.startsWith('UC')) { channelId = p[2]; break }
+                if (p[1] === 'channel' && p[2]?.startsWith('UC')) {
+                  channelId = p[2]
+                  dbg(`[VIDEO] Found channel UC from DOM selector "${selector}":`, channelId)
+                  break
+                }
                 if (p[1]?.startsWith('@')) {
+                  // For @handles: Check persistent + in-memory cache FIRST before fetching
+                  const handle = p[1].substring(1)
+                  dbg(`[VIDEO] Checking handle "${handle}" from DOM href:`, ownerHref)
+
+                  try {
+                    // Try persistent cache first
+                    let cachedUcId = await channelCache.getHandle(handle)
+                    if (cachedUcId) {
+                      // Verify this UC has a Target
+                      let target = ucResolvePageCache.get(cachedUcId)
+                      if (!target) {
+                        target = await channelCache.getUC(cachedUcId) || null
+                        if (target) ucResolvePageCache.set(cachedUcId, target)
+                      }
+                      if (target) {
+                        channelId = cachedUcId
+                        dbg(`[VIDEO] Found channel UC from persistent cache:`, channelId, 'for handle:', handle)
+                        break
+                      }
+                    } else if (cachedUcId === null) {
+                      dbg(`[VIDEO] Handle "${handle}" cached as null (no Odysee)`)
+                    }
+
+                    // Try in-memory cache
+                    if (!channelId && handleResolvePageCache.has(handle)) {
+                      const handleTarget = handleResolvePageCache.get(handle)
+                      if (handleTarget) {
+                        for (const [uc, target] of ucResolvePageCache.entries()) {
+                          if (target === handleTarget && uc.startsWith('UC')) {
+                            channelId = uc
+                            dbg(`[VIDEO] Found channel UC from in-memory cache:`, channelId, 'for handle:', handle)
+                            break
+                          }
+                        }
+                      }
+                      if (channelId) break
+                    }
+                  } catch (e) {
+                    dbg(`[VIDEO] Error checking cache for handle "${handle}":`, e)
+                  }
+
+                  if (channelId) break
+                  dbg(`[VIDEO] Handle "${handle}" not in cache, will fetch`)
+                  // Not in cache, fetch the handle page
                   const html = await (await fetch(ownerHref, { credentials: 'same-origin' })).text()
                   const m = html.match(/\"channelId\"\s*:\s*\"([^\"]+)\"/) || html.match(/feeds\/videos\.xml\?channel_id=([A-Za-z0-9_-]+)/)
-                  if (m?.[1]?.startsWith('UC')) { channelId = m[1]; break }
+                  if (m?.[1]?.startsWith('UC')) {
+                    channelId = m[1]
+                    dbg(`[VIDEO] Found channel UC from DOM @handle fetch:`, channelId)
+                    break
+                  }
                 }
               } catch { }
             }
           }
         }
         if (channelId) {
+          const videoType = source.url.pathname.startsWith('/shorts/') ? 'SHORTS' : 'VIDEO'
+          dbg(`[${videoType}] Found channel ID for video ${source.id}:`, channelId)
           const channelSource: Source = { platform: source.platform, id: channelId, type: 'channel', url: urlNow, time: null }
           sourcesToResolve.push(channelSource)
           channelIdForVideoPage = channelId
           lastVideoPageChannelId = channelId
+        } else {
+          const videoType = source.url.pathname.startsWith('/shorts/') ? 'SHORTS' : 'VIDEO'
+          dbg(`[${videoType}] No channel ID found for video ${source.id}`)
         }
       }
       // If we are on a channel page using a @handle URL, try to derive its UC id from DOM and include it
@@ -6762,7 +7153,9 @@ import { channelCache } from '../modules/yt/channelCache'
                   // No anchor visible; fall back to current path if it's a handle URL
                   const p = location.pathname
                   if (p.startsWith('/@') && target) {
-                    const handle = p.slice(2)
+                    // Extract just the handle name: "/@WhiteHouse/shorts" -> "WhiteHouse"
+                    const pathAfterAt = p.slice(2)
+                    const handle = pathAfterAt.split('/')[0]
                     handleResolvePageCache.set(handle, target)
                     const handleUrl = `/@${handle}`
                     ytUrlResolvePageCache.set(handleUrl, target)
